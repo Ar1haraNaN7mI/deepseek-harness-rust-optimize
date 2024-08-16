@@ -1,0 +1,57 @@
+# Build artifacts
+/target/
+**/target/
+target/dsh-build2/
+
+# Rust / cargo
+**/*.rs.bk
+*.pdb
+Cargo.lock.bak
+
+# Secrets & local env (NEVER commit)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.env
+**/credentials.env
+
+# Local outer-layer / workspace overlays
+.dsh-rust/
+**/.dsh-rust/
+!.dsh-rust/.gitkeep
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.fleet/
+.cursor/
+
+# OS junk
+.DS_Store
+Thumbs.db
+Desktop.ini
+ehthumbs.db
+
+# Logs & temp
+*.log
+*.tmp
+*.temp
+*.bak
+*.orig
+.cache/
+
+# Test / coverage
+coverage/
+lcov.info
+*.profraw
+
+# Misc local
+*.local
+local/
+dist/
+out/

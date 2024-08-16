@@ -1,0 +1,20 @@
+id: echo
+name: Echo Plugin
+version: 0.1.0
+description: Sample outer-layer plugin that echoes input via Rhai sandbox.
+entry: main.rhai
+tags:
+  - utility
+  - example
+skills:
+  - skills/echo-assist
+tools:
+  - name: echo
+    description: Echo the provided input string.
+    rhai_fn: echo
+    parameters:
+      type: object
+      properties:
+        input:
+          type: string
+      required: [input]

@@ -1,0 +1,17 @@
+[package]
+name = "dsh-tools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Tool registry and guarded execution pipeline"
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+indexmap.workspace = true

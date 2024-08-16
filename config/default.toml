@@ -1,0 +1,46 @@
+[llm]
+base_url = "https://api.deepseek.com"
+model = "deepseek-v4-pro"
+# Alternative: deepseek-v4-flash
+thinking = true
+max_tokens = 8192
+temperature = 0.2
+
+[paths]
+# Outer layer root (user/home overlay). Empty = ~/.dsh-rust
+outer_home = ""
+# Workspace overlay under cwd
+workspace_outer = ".dsh-rust"
+
+[guard]
+deny_core_writes = true
+deny_patterns = [
+  "crates/**",
+  "target/**",
+  "Cargo.toml",
+  "Cargo.lock",
+  "config/default.toml",
+]
+
+[agent]
+max_steps_per_turn = 24
+tool_timeout_secs = 120
+tool_result_max_chars = 16000
+skill_prompt_topk = 4
+plugin_prompt_topk = 3
+
+[ctm]
+enabled = true
+max_ticks = 6
+min_ticks = 2
+history_len = 12
+halt_confidence = 0.78
+halt_entropy = 1.15
+inactive_decay = 0.92
+
+[learn]
+enabled = true
+
+[tui]
+show_thinking = true
+sidebar = true

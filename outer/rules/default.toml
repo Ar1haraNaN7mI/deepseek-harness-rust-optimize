@@ -1,0 +1,17 @@
+# Example execpolicy rules (Codex-compatible preview)
+# Usage: dsh execpolicy check --rules ~/.dsh-rust/rules/default.toml -- pretty -- rm -rf /
+
+[[rules]]
+pattern = "rm -rf"
+decision = "deny"
+reason = "destructive recursive delete"
+
+[[rules]]
+pattern = "git push --force"
+decision = "prompt"
+reason = "force push needs confirmation"
+
+[[rules]]
+pattern = "cargo "
+decision = "allow"
+reason = "local build tooling"

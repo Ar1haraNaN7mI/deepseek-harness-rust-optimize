@@ -1,0 +1,65 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/dsh-core",
+    "crates/dsh-llm",
+    "crates/dsh-tools",
+    "crates/dsh-fs",
+    "crates/dsh-plugin",
+    "crates/dsh-skill",
+    "crates/dsh-tui",
+    "crates/dsh-cli",
+]
+default-members = ["crates/dsh-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["dsh-rust"]
+repository = "https://github.com/local/dsh-rust"
+
+[workspace.dependencies]
+anyhow = "1"
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive", "env"] }
+clap_complete = "4"
+crossterm = "0.28"
+dirs = "6"
+futures = "0.3"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+rhai = { version = "1.21", features = ["sync"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+ratatui = "0.29"
+eventsource-stream = "0.2"
+bytes = "1"
+walkdir = "2"
+notify = "7"
+sha2 = "0.10"
+hex = "0.4"
+parking_lot = "0.12"
+indexmap = { version = "2", features = ["serde"] }
+
+dsh-core = { path = "crates/dsh-core" }
+dsh-llm = { path = "crates/dsh-llm" }
+dsh-tools = { path = "crates/dsh-tools" }
+dsh-fs = { path = "crates/dsh-fs" }
+dsh-plugin = { path = "crates/dsh-plugin" }
+dsh-skill = { path = "crates/dsh-skill" }
+dsh-tui = { path = "crates/dsh-tui" }
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+strip = true

@@ -8,29 +8,34 @@
 
 ## 30 秒上手
 
+推荐直接用 Cargo 启动（会自动编译）：
+
 ```bash
-# 1. 克隆并编译
 git clone https://github.com/Ar1haraNaN7mI/deepseek-harness-rust-optimize.git
 cd deepseek-harness-rust-optimize
-cargo build -p dsh-cli --release
 
-# 2. 配置 API Key（任选一种）
-./target/release/dsh login
-# 或在 TUI 里输入：/apikey sk-...
+# 配置 API Key（任选）：在 TUI 里 /apikey sk-...，或先跑：
+cargo run -p dsh-cli -- login
 
-# 3. 启动
-./target/release/dsh
+# 启动 TUI（最常用）
+cargo run -p dsh-cli
 ```
 
-Windows（PowerShell）：
+Windows（PowerShell）同样：
 
 ```powershell
-cargo build -p dsh-cli --release
-.\target\release\dsh.exe login
-.\target\release\dsh.exe
+cargo run -p dsh-cli -- login
+cargo run -p dsh-cli
 ```
 
 没有 Key 也能先打开界面；真正发消息前再用 `/apikey` 配置即可。
+
+需要独立可执行文件时再编译 release：
+
+```bash
+cargo build -p dsh-cli --release
+./target/release/dsh          # Windows: .\target\release\dsh.exe
+```
 
 ---
 
@@ -38,11 +43,11 @@ cargo build -p dsh-cli --release
 
 | 场景 | 怎么用 |
 |------|--------|
-| 交互改代码 | `dsh` 进入 TUI，直接打字 |
-| 一次性任务 / CI | `dsh exec "修复 lint 错误"` |
-| 继续上次对话 | `dsh resume --last` |
-| 代码审查 | `dsh review --uncommitted` |
-| 诊断环境 | `dsh doctor` |
+| 交互改代码 | `cargo run -p dsh-cli` 进入 TUI，直接打字 |
+| 一次性任务 / CI | `cargo run -p dsh-cli -- exec "修复 lint 错误"` |
+| 继续上次对话 | `cargo run -p dsh-cli -- resume --last` |
+| 代码审查 | `cargo run -p dsh-cli -- review --uncommitted` |
+| 诊断环境 | `cargo run -p dsh-cli -- doctor` |
 
 TUI 里常用：
 
@@ -119,7 +124,7 @@ dsh-rust/
 
 Key 存放位置（**不要提交到 Git**）：
 
-- `~/.dsh-rust/credentials.env`（推荐：`dsh login`）
+- `~/.dsh-rust/credentials.env`（推荐：`cargo run -p dsh-cli -- login`）
 - 或环境变量 `DEEPSEEK_API_KEY`
 - 或本地 `.env`（已在 `.gitignore`）
 
@@ -127,24 +132,26 @@ Key 存放位置（**不要提交到 Git**）：
 
 ## 常用命令
 
+开发时用 `cargo run -p dsh-cli -- …`；若已 `cargo build --release`，把前缀换成 `./target/release/dsh`（Windows：`.\target\release\dsh.exe`）即可。
+
 ```bash
-dsh                          # 交互 TUI（默认）
-dsh "帮我看看这个仓库"         # 启动并自动发送第一句
-dsh exec "列出所有 TODO"      # 非交互（别名：dsh e）
-dsh exec --json "..."        # NDJSON 事件流
-dsh resume --last            # 恢复最近会话
-dsh session list             # 列出会话
-dsh skill list
-dsh plugin list
-dsh doctor                   # 环境自检
-dsh -h                       # 完整 CLI 帮助
+cargo run -p dsh-cli                                    # 交互 TUI（默认）
+cargo run -p dsh-cli -- "帮我看看这个仓库"               # 启动并自动发送第一句
+cargo run -p dsh-cli -- exec "列出所有 TODO"            # 非交互（别名：e）
+cargo run -p dsh-cli -- exec --json "..."               # NDJSON 事件流
+cargo run -p dsh-cli -- resume --last                   # 恢复最近会话
+cargo run -p dsh-cli -- session list
+cargo run -p dsh-cli -- skill list
+cargo run -p dsh-cli -- plugin list
+cargo run -p dsh-cli -- doctor                          # 环境自检
+cargo run -p dsh-cli -- -h                              # 完整 CLI 帮助
 ```
 
 全局旗标（对齐 Codex）：
 
 ```bash
-dsh -m deepseek-v4-flash -s workspace-write -a on-request "小改动"
-dsh --yolo exec "在沙箱外放开手脚跑（慎用）"
+cargo run -p dsh-cli -- -m deepseek-v4-flash -s workspace-write -a on-request "小改动"
+cargo run -p dsh-cli -- --yolo exec "在沙箱外放开手脚跑（慎用）"
 ```
 
 | 旗标 | 含义 |
@@ -213,9 +220,10 @@ dsh plugin marketplace add owner/repo
 ## 开发
 
 ```bash
-cargo build -p dsh-cli
-cargo run -p dsh-cli
+cargo run -p dsh-cli              # 日常启动（推荐）
 cargo run -p dsh-cli -- doctor
+cargo build -p dsh-cli            # 仅编译
+cargo build -p dsh-cli --release  # 发布产物
 ```
 
 Workspace crates：`dsh-core` · `dsh-llm` · `dsh-tools` · `dsh-fs` · `dsh-skill` · `dsh-plugin` · `dsh-tui` · `dsh-cli`

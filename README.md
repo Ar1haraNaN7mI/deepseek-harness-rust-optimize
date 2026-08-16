@@ -55,22 +55,59 @@ TUI 里常用：
 
 ## 两层架构（为什么更稳）
 
+```mermaid
+flowchart TB
+  subgraph outer [OuterLayer_Writable]
+    Plugins[PluginRegistry]
+    Skills[SkillCatalog]
+    Overlay[cordis_patch_yml]
+    SelfMod[SelfModificationTools]
+  end
+  subgraph core [CoreKernel_ReadOnly]
+    Loop[AgentLoop]
+    Session[SessionLog]
+    Tools[ToolPipeline]
+    LLM[DeepSeekV4Client]
+    Guard[PathGuard]
+  end
+  TUI[TUI] --> Loop
+  Loop --> Session
+  Loop --> LLM
+  Loop --> Tools
+  Tools --> Guard
+  SelfMod --> Plugins
+  SelfMod --> Skills
+  Plugins --> Tools
+  Skills --> Loop
+  Guard -->|"deny core crate paths"| Blocked[RejectWrite]
+  Guard -->|"allow outer home and cwd"| Allowed[ApplyChange]
+```
+
+| 层 | 内容 | 可变性 |
+|---|---|---|
+| **Core** | agent-loop、session 事件日志、tools waterfall、LLM 客户端、PathGuard、内置工具（read/edit/shell/skill） | 编译进二进制；运行时 **禁止** 模型改 `crates/`、`Cargo.toml`、可执行文件自身 |
+| **Outer** | `~/.dsh-rust/` 与工作区 `.dsh-rust/`：plugins、skills、`patch.yml`、自动标签索引 | 模型可通过工具增删改；热加载；失败隔离 |
+
 ```text
-┌─────────────────────────────────────┐
-│  Outer（可写）                       │
-│  ~/.dsh-rust  ·  .dsh-rust/         │
-│  plugins / skills / sessions / learn │
-└──────────────────▲──────────────────┘
-                   │ 模型只能改外层
-┌──────────────────┴──────────────────┐
-│  Core（运行时只读）                   │
-│  agent loop · session · PathGuard   │
-│  builtin tools · DeepSeek client    │
-└─────────────────────────────────────┘
+dsh-rust/
+  Cargo.toml
+  crates/
+    dsh-core/      # session, events, agent-loop, system-prompt
+    dsh-llm/       # DeepSeek V4 streaming + tools
+    dsh-tools/     # tool registry + pre/execute/post waterfall
+    dsh-fs/        # fs + PathGuard
+    dsh-plugin/    # outer plugin load/unload/hot-reload + tags
+    dsh-skill/     # dual-format skill discovery + progressive load
+    dsh-tui/       # ratatui chat / tools / plugins pane
+    dsh-cli/       # `dsh` binary: tui | headless | plugin | skill
+  outer/           # seeded outer templates (safe defaults)
+  config/default.toml
+  README.md
 ```
 
 - **内核**不会被模型改坏：`crates/`、`Cargo.toml` 等写入会被 PathGuard 拒绝。
 - **外层**可热扩展：插件（Rhai）、Skills（OpenAI `SKILL.md` + DeepSeek 风格）、会话、学习权重都在用户目录。
+- 外层变更先写入临时目录 → 校验 → 原子替换；失败则保留上一版。插件在 **Rhai 沙箱**中执行，危险能力只能经 core 已注册宿主工具代理。
 
 ---
 

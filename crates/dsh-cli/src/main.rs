@@ -180,7 +180,7 @@ enum Commands {
     Web {
         #[arg(long, default_value_t = 8770)]
         port: u16,
-        /// Override the built frontend asset directory
+        /// Override frontend assets (default: installed share/dsh/web, then ./web/dist)
         #[arg(long)]
         assets: Option<PathBuf>,
     },
@@ -990,11 +990,10 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Some(Commands::Update) => {
             println!("dsh-rust does not self-update.");
-            println!("Update with one of:");
-            println!("  cargo install --path crates/dsh-cli --force");
+            println!("From your source checkout, run:");
             println!("  git pull");
-            println!("  cargo build -p dsh-cli --release");
-            println!("Or rebuild from your clone after fetching the latest commits.");
+            println!("  python scripts/install_dsh.py");
+            println!("This updates both the installed command and its Harness web assets.");
         }
         Some(Commands::Sandbox { command }) => {
             let (_config, _outer_home, _workspace_outer) =

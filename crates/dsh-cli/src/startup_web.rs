@@ -66,17 +66,9 @@ pub async fn serve_harness(
     assets: Option<PathBuf>,
     startup_override: Option<bool>,
 ) -> Result<()> {
-    let assets = assets.unwrap_or_else(|| PathBuf::from("web/dist"));
-    let assets = assets.canonicalize().with_context(|| {
-        format!(
-            "Harness assets missing at {}; run npm --prefix web run build or use --assets",
-            assets.display()
-        )
-    })?;
-    anyhow::ensure!(
-        assets.is_dir() && assets.join("index.html").is_file(),
-        "Harness assets must contain index.html"
-    );
+    let cwd = std::env::current_dir().context("locate the current directory for Harness assets")?;
+    let executable = std::env::current_exe().ok();
+    let assets = resolve_harness_assets(assets.as_deref(), executable.as_deref(), &cwd)?;
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
         .await
         .context("bind Harness web host (choose another --port if it is in use)")?;
@@ -99,6 +91,48 @@ pub async fn serve_harness(
         startup_override,
     });
     accept_connections(listener, host).await
+}
+
+fn validate_harness_assets(path: &Path) -> Result<PathBuf> {
+    let assets = path
+        .canonicalize()
+        .with_context(|| format!("Harness assets unavailable at {}", path.display()))?;
+    anyhow::ensure!(
+        assets.is_dir() && assets.join("index.html").is_file(),
+        "Harness assets at {} must be a directory containing index.html",
+        path.display()
+    );
+    Ok(assets)
+}
+
+fn resolve_harness_assets(
+    explicit: Option<&Path>,
+    executable: Option<&Path>,
+    cwd: &Path,
+) -> Result<PathBuf> {
+    // An explicit override must fail visibly, even when other assets exist.
+    if let Some(path) = explicit {
+        return validate_harness_assets(&cwd.join(path));
+    }
+
+    let mut candidates = Vec::new();
+    if let Some(root) = executable.and_then(Path::parent).and_then(Path::parent) {
+        // Cargo-style install: <root>/bin/dsh and <root>/share/dsh/web.
+        candidates.push(root.join("share/dsh/web"));
+    }
+    candidates.push(cwd.join("web/dist"));
+
+    let mut failures = Vec::new();
+    for candidate in candidates {
+        match validate_harness_assets(&candidate) {
+            Ok(assets) => return Ok(assets),
+            Err(error) => failures.push(format!("{error:#}")),
+        }
+    }
+    bail!(
+        "Harness frontend was not found. Install the frontend alongside dsh, run npm --prefix web run build in the repository, or use --assets. Checked:\n{}",
+        failures.join("\n")
+    )
 }
 
 async fn accept_connections(listener: TcpListener, host: Arc<Host>) -> Result<()> {
@@ -550,6 +584,87 @@ async fn handle(mut socket: TcpStream, host: Arc<Host>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct AssetFixture(PathBuf);
+
+    impl AssetFixture {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!("dsh-harness-assets-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&root).unwrap();
+            Self(root.canonicalize().unwrap())
+        }
+
+        fn frontend(&self, relative: &str) -> PathBuf {
+            let path = self.0.join(relative);
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(path.join("index.html"), "<html>fixture</html>").unwrap();
+            path.canonicalize().unwrap()
+        }
+    }
+
+    impl Drop for AssetFixture {
+        fn drop(&mut self) {
+            assert_eq!(self.0.parent(), Some(std::env::temp_dir().canonicalize().unwrap().as_path()));
+            assert!(self.0.file_name().unwrap().to_string_lossy().starts_with("dsh-harness-assets-"));
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn harness_assets_explicit_override_wins_and_is_relative_to_cwd() {
+        let fixture = AssetFixture::new();
+        fixture.frontend("installation/share/dsh/web");
+        fixture.frontend("workspace/web/dist");
+        let custom = fixture.frontend("workspace/custom");
+        let executable = fixture.0.join("installation/bin/dsh.exe");
+        let cwd = fixture.0.join("workspace");
+        assert_eq!(
+            resolve_harness_assets(Some(Path::new("custom")), Some(&executable), &cwd).unwrap(),
+            custom
+        );
+        assert_eq!(
+            resolve_harness_assets(Some(&custom), None, &cwd).unwrap(),
+            custom
+        );
+    }
+
+    #[test]
+    fn harness_assets_installed_frontend_precedes_cwd_development_fallback() {
+        let fixture = AssetFixture::new();
+        let installed = fixture.frontend("installation/share/dsh/web");
+        let development = fixture.frontend("workspace/web/dist");
+        let executable = fixture.0.join("installation/bin/dsh.exe");
+        let cwd = fixture.0.join("workspace");
+        assert_eq!(resolve_harness_assets(None, Some(&executable), &cwd).unwrap(), installed);
+        // The install is also usable from a workspace with no checkout/assets.
+        assert_eq!(
+            resolve_harness_assets(None, Some(&executable), &fixture.0.join("another-workspace")).unwrap(),
+            installed
+        );
+        std::fs::remove_file(installed.join("index.html")).unwrap();
+        assert_eq!(resolve_harness_assets(None, Some(&executable), &cwd).unwrap(), development);
+        assert_eq!(resolve_harness_assets(None, None, &cwd).unwrap(), development);
+    }
+
+    #[test]
+    fn harness_assets_missing_and_invalid_explicit_paths_fail_with_diagnostics() {
+        let fixture = AssetFixture::new();
+        let executable = fixture.0.join("installation/bin/dsh.exe");
+        let cwd = fixture.0.join("workspace");
+        let error = resolve_harness_assets(None, Some(&executable), &cwd).unwrap_err().to_string();
+        assert!(error.contains(&fixture.0.join("installation/share/dsh/web").display().to_string()));
+        assert!(error.contains(&cwd.join("web/dist").display().to_string()));
+        assert!(error.contains("--assets"));
+
+        fixture.frontend("installation/share/dsh/web");
+        fixture.frontend("workspace/web/dist");
+        let empty = cwd.join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        for path in [Path::new("missing"), Path::new("empty")] {
+            let error = resolve_harness_assets(Some(path), Some(&executable), &cwd).unwrap_err().to_string();
+            assert!(error.contains(&cwd.join(path).display().to_string()));
+        }
+    }
 
     struct TestHost {
         host: Arc<Host>,

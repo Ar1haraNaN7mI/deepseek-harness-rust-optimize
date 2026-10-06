@@ -6,6 +6,10 @@ React、TypeScript 与 Vite 构建的本机 Harness 界面，复用 Rust Runtime
 
 需要 Node.js 22.12+（已在 22.13.1 验证）及仓库 Rust 工具链。
 
+日常使用推荐在仓库执行 `python scripts/install_dsh.py`，一次安装 CLI 与网页资源。安装后在任何项目目录直接运行 `dsh web --startup`；当前目录作为工作区，网页资源从安装目录的 `share/dsh/web` 读取。
+
+只在源码目录开发时，可手动构建并指定资源：
+
 ```powershell
 cd web
 npm ci
@@ -15,6 +19,8 @@ cargo run -p dsh-cli -- web --assets web/dist
 ```
 
 打开 `http://127.0.0.1:8770/`。`web/dist` 为本机生成目录，不提交到 Git。后端需要同时提供原动画与 `/api/harness/*`；`vite preview` 只能预览静态产物，不能独立运行 Harness。
+
+不传 `--assets` 时依次查找已安装资源、当前目录 `web/dist`。安装版的网页不会随工作目录切换；`--assets <路径>` 可以显式选择开发构建，指定路径无效会报错。
 
 若 npm 10.9.2 在安装时抛出 Arborist `edgesOut` 内部错误，可使用 `npx --yes npm@11.6.2 ci`。此操作不改系统全局 npm。
 

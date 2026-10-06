@@ -12,6 +12,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import socket
 import subprocess
@@ -90,7 +91,9 @@ def fixture_config(endpoint: str, outer: Path) -> str:
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, default=Path("target/debug/dsh.exe" if os.name == "nt" else "target/debug/dsh"))
-    parser.add_argument("--assets", type=Path, help="Built frontend for browser QA; default is a minimal static fixture")
+    assets_group = parser.add_mutually_exclusive_group()
+    assets_group.add_argument("--assets", type=Path, help="Built frontend for browser QA; default is a minimal static fixture")
+    assets_group.add_argument("--installed-assets", action="store_true", help="Test installed web discovery from an unrelated workspace without --assets")
     parser.add_argument("--output", type=Path, default=Path("target/harness-web-qa"))
     parser.add_argument("--port", type=int, default=0)
     parser.add_argument("--serve", action="store_true", help="Keep the isolated tested host alive until Ctrl+C")
@@ -114,7 +117,9 @@ def main():
         plugin = outer / "plugins" / "http-fixture"
         plugin.mkdir(parents=True)
         (plugin / "plugin.json").write_text(json.dumps({"id": "http-fixture", "name": "HTTP Fixture Plugin", "version": "1.0", "tools": [{"name": "echo", "description": "Fixture definition"}]}), encoding="utf-8")
-        if args.assets:
+        if args.installed_assets:
+            assets = None
+        elif args.assets:
             assets = args.assets.resolve(strict=True)
         else:
             assets = root / "dist"
@@ -135,7 +140,10 @@ def main():
         })
         port = args.port or available_port()
         log = (output / "host.log").open("w", encoding="utf-8")
-        command = [str(binary), "--config", str(config), "--workspace", str(workspace), "--silent", "web", "--port", str(port), "--assets", str(assets)]
+        # Use the process working directory, as an installed `dsh web` does.
+        command = [str(binary), "--config", str(config), "--silent", "web", "--port", str(port)]
+        if assets is not None:
+            command += ["--assets", str(assets)]
         process = subprocess.Popen(command, cwd=workspace, env=environment, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
                                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
         token = None
@@ -222,11 +230,19 @@ def main():
         inventory = request("POST", "/api/load", {})[1]
         assert inventory["inventory_mode"] == "mounted" and inventory["type"] == "complete"
         assert (outer / "startup-next.txt").read_text(encoding="utf-8").strip() == "on"
-        assert request("GET", "/")[0] == 200
+        page_status, page = request("GET", "/")
+        assert page_status == 200
+        if args.installed_assets:
+            assert isinstance(page, str) and 'id="root"' in page, "Installed Harness index missing"
+            scripts = re.findall(r'<script\b[^>]*\bsrc="([^"]+)"', page)
+            assert scripts, "Installed frontend scripts missing"
+            for asset in scripts:
+                assert asset.startswith("/assets/") and request("GET", asset)[0] == 200, asset
         for path in ["/../secret.txt", "/%2e%2e/secret.txt", "/%252e%252e/secret.txt", "/assets/%5c..%5csecret.txt"]:
             assert request("GET", path)[0] == 403, path
         report = {"passed": True, "url": f"http://127.0.0.1:{port}/", "session_id": session_id, "mock_requests": len(mock.requests),
                   "stream_events": len(received), "fixture_workspace": str(workspace), "next_cli_marker_unconsumed": True,
+                  "installed_assets": args.installed_assets,
                   "checks": ["token", "actual inventory", "two streamed turns", "event pagination", "persisted history", "profile", "next CLI", "static traversal"]}
         (output / "report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
         print(json.dumps(report), flush=True)

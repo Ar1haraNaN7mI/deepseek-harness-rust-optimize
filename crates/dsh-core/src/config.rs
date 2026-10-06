@@ -220,13 +220,19 @@ impl AppConfig {
     }
 
     pub fn load_default(workspace_root: &Path) -> Result<Self> {
-        let candidates = [
-            workspace_root.join("config/default.toml"),
-            PathBuf::from("config/default.toml"),
-        ];
-        for c in candidates {
-            if c.exists() {
-                return Self::load(c);
+        // A dedicated workspace config is always intentional and stays strict.
+        let dedicated = workspace_root.join(".dsh-rust/config.toml");
+        if dedicated.exists() {
+            return Self::load(dedicated);
+        }
+        // Keep the repository's legacy path, without mistaking another app's
+        // config/default.toml for DSH or importing a different caller's config.
+        let legacy = workspace_root.join("config/default.toml");
+        if legacy.exists() {
+            let text = fs::read_to_string(&legacy)
+                .with_context(|| format!("read config {}", legacy.display()))?;
+            if looks_like_dsh_config(&text) {
+                return Self::load(legacy);
             }
         }
         Ok(Self::builtin_default())
@@ -343,6 +349,168 @@ impl AppConfig {
             extra_body,
             fallbacks,
         }
+    }
+}
+
+fn looks_like_dsh_config(text: &str) -> bool {
+    let has_section =
+        |value: &toml::Value, name: &str| value.get(name).is_some_and(toml::Value::is_table);
+    if let Ok(value) = toml::from_str::<toml::Value>(text) {
+        return has_section(&value, "llm") && has_section(&value, "paths");
+    }
+
+    // Recognize intact section headers even when a DSH value has invalid TOML,
+    // so an edited/broken DSH config reports its error instead of using defaults.
+    let mut llm = false;
+    let mut paths = false;
+    for line in text
+        .lines()
+        .filter(|line| line.trim_start().starts_with('['))
+    {
+        if let Ok(value) = toml::from_str::<toml::Value>(line) {
+            llm |= has_section(&value, "llm");
+            paths |= has_section(&value, "paths");
+        }
+    }
+    llm && paths
+}
+
+#[cfg(test)]
+mod discovery_tests {
+    use super::*;
+
+    const EXAMPLE: &str = include_str!("../../../config/default.toml");
+
+    struct Workspace(PathBuf);
+
+    impl Workspace {
+        fn new() -> Self {
+            let root =
+                std::env::temp_dir().join(format!("dsh-config-discovery-{}", uuid::Uuid::new_v4()));
+            fs::create_dir_all(&root).unwrap();
+            Self(root.canonicalize().unwrap())
+        }
+
+        fn write(&self, relative: &str, contents: &str) -> PathBuf {
+            let path = self.0.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, contents).unwrap();
+            path
+        }
+    }
+
+    impl Drop for Workspace {
+        fn drop(&mut self) {
+            assert_eq!(
+                self.0.parent(),
+                Some(std::env::temp_dir().canonicalize().unwrap().as_path())
+            );
+            assert!(self
+                .0
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("dsh-config-discovery-"));
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn unrelated_legacy_configs_are_ignored_but_explicit_load_is_strict() {
+        let workspace = Workspace::new();
+        for source in [
+            "app_name = 'another-project'\n",
+            "[llm]\nmodel = 'another-project'\n",
+            "app_name = [invalid TOML\n",
+            "description = '''\n[llm]\n[paths]\n'''\n",
+        ] {
+            let path = workspace.write("config/default.toml", source);
+            assert_eq!(
+                AppConfig::load_default(&workspace.0).unwrap().llm.model,
+                AppConfig::builtin_default().llm.model
+            );
+            assert!(AppConfig::load(path).is_err());
+        }
+    }
+
+    #[test]
+    fn recognizable_legacy_config_preserves_repo_compatibility_and_validation() {
+        let workspace = Workspace::new();
+        let customized = EXAMPLE.replace("model = \"deepseek-v4-pro\"", "model = \"legacy-model\"");
+        workspace.write("config/default.toml", &customized);
+        assert_eq!(
+            AppConfig::load_default(&workspace.0).unwrap().llm.model,
+            "legacy-model"
+        );
+        for invalid in [
+            "[llm]\nmodel = 'incomplete'\n[paths]\n",
+            "[llm]\nmodel = [invalid TOML\n[paths]\n",
+            "[ 'llm' ] # quoted section\nmodel = [invalid TOML\n[ \"paths\" ]\n",
+        ] {
+            workspace.write("config/default.toml", invalid);
+            assert!(AppConfig::load_default(&workspace.0).is_err(), "{invalid}");
+        }
+        workspace.write(
+            "config/default.toml",
+            &customized.replace("speed = 1.0", "speed = 0.0"),
+        );
+        assert!(AppConfig::load_default(&workspace.0).is_err());
+    }
+
+    #[test]
+    fn dedicated_config_takes_priority_and_never_silently_falls_back() {
+        let workspace = Workspace::new();
+        workspace.write("config/default.toml", EXAMPLE);
+        workspace.write(
+            ".dsh-rust/config.toml",
+            &EXAMPLE.replace("model = \"deepseek-v4-pro\"", "model = \"dedicated-model\""),
+        );
+        assert_eq!(
+            AppConfig::load_default(&workspace.0).unwrap().llm.model,
+            "dedicated-model"
+        );
+        for invalid in ["app_name = 'not-dsh'\n", "invalid = [\n"] {
+            workspace.write(".dsh-rust/config.toml", invalid);
+            assert!(AppConfig::load_default(&workspace.0).is_err());
+        }
+    }
+
+    #[test]
+    fn selected_workspace_does_not_import_callers_configuration() {
+        const CHILD_WORKSPACE: &str = "DSH_CONFIG_DISCOVERY_TEST_WORKSPACE";
+        if let Some(workspace) = std::env::var_os(CHILD_WORKSPACE) {
+            assert_eq!(
+                AppConfig::load_default(Path::new(&workspace))
+                    .unwrap()
+                    .llm
+                    .model,
+                AppConfig::builtin_default().llm.model
+            );
+            return;
+        }
+        let caller = Workspace::new();
+        caller.write(
+            "config/default.toml",
+            &EXAMPLE.replace("model = \"deepseek-v4-pro\"", "model = \"caller-model\""),
+        );
+        let selected = Workspace::new();
+        // Use a child so the test never changes the other test threads' cwd.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "config::discovery_tests::selected_workspace_does_not_import_callers_configuration",
+            ])
+            .current_dir(&caller.0)
+            .env(CHILD_WORKSPACE, &selected.0)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
     }
 }
 

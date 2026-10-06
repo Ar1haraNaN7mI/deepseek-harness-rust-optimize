@@ -73,7 +73,9 @@ impl CellKind {
             CellKind::Thinking => Style::default()
                 .fg(Color::DarkGray)
                 .add_modifier(Modifier::ITALIC),
-            CellKind::Ctm => Style::default().fg(Color::Magenta).add_modifier(Modifier::DIM),
+            CellKind::Ctm => Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::DIM),
             CellKind::Error => Style::default().fg(Color::Red),
             CellKind::System => Style::default().fg(Color::DarkGray),
             _ => Style::default().fg(Color::Rgb(200, 200, 200)),
@@ -106,13 +108,7 @@ pub fn categorize_tool(name: &str) -> CellKind {
     }
     if matches!(
         lower.as_str(),
-        "read_file"
-            | "write_file"
-            | "edit_file"
-            | "apply_patch"
-            | "list_dir"
-            | "glob"
-            | "grep"
+        "read_file" | "write_file" | "edit_file" | "apply_patch" | "list_dir" | "glob" | "grep"
     ) {
         return CellKind::Filesystem;
     }
@@ -186,10 +182,7 @@ pub fn running_glyph(kind: CellKind, tick: u64) -> &'static str {
 /// Animated trailing activity for streaming assistant / thinking.
 pub fn stream_caret(tick: u64, on: bool) -> (&'static str, Style) {
     if !on {
-        return (
-            " ",
-            Style::default(),
-        );
+        return (" ", Style::default());
     }
     let frames = ["▍", "▍", "▍", " "];
     let ch = frames[(tick as usize / 2) % frames.len()];
@@ -205,7 +198,11 @@ pub fn stream_caret(tick: u64, on: bool) -> (&'static str, Style) {
 pub fn activity_bar(tick: u64, width: usize) -> String {
     let width = width.clamp(6, 16);
     let pos = (tick as usize) % (width.saturating_mul(2).saturating_sub(2).max(1));
-    let head = if pos < width { pos } else { width * 2 - 2 - pos };
+    let head = if pos < width {
+        pos
+    } else {
+        width * 2 - 2 - pos
+    };
     let mut out = String::with_capacity(width);
     for i in 0..width {
         if i == head {
@@ -239,10 +236,7 @@ pub fn cursor_block(visible: bool) -> (&'static str, Style) {
                 .add_modifier(Modifier::BOLD),
         )
     } else {
-        (
-            "▏",
-            Style::default().fg(Color::Rgb(60, 80, 100)),
-        )
+        ("▏", Style::default().fg(Color::Rgb(60, 80, 100)))
     }
 }
 

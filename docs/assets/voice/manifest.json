@@ -1,0 +1,183 @@
+{
+  "method": "reference-conditioned voice cloning (inference, not fine-tuning)",
+  "model": "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+  "model_revision": "fd4b254389122332181a7c3db7f27e918eec64e3",
+  "model_url": "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base/tree/fd4b254389122332181a7c3db7f27e918eec64e3",
+  "model_license": "Apache-2.0",
+  "reference_repository": "https://github.com/6shenhonghong9/dsh-startup-screen",
+  "reference_revision": "4a2cfe642867fac013fdef90095981544a819a2a",
+  "reference_assets": [
+    {
+      "url": "https://raw.githubusercontent.com/6shenhonghong9/dsh-startup-screen/4a2cfe642867fac013fdef90095981544a819a2a/lib/assets/line-1.mp3",
+      "sha256": "ec3afe38d6df4664a8948b4046e4c124c534f27092e97dfc3948e11ff8212934",
+      "transcript": "Access permission required."
+    },
+    {
+      "url": "https://raw.githubusercontent.com/6shenhonghong9/dsh-startup-screen/4a2cfe642867fac013fdef90095981544a819a2a/lib/assets/line-2.mp3",
+      "sha256": "8d045168d150ff57c5f15af14644eaaba0d244694e3fae0ba31313a2c57c6d44",
+      "transcript": "ID confirmed."
+    },
+    {
+      "url": "https://raw.githubusercontent.com/6shenhonghong9/dsh-startup-screen/4a2cfe642867fac013fdef90095981544a819a2a/lib/assets/line-3.mp3",
+      "sha256": "c490d5218f36f51680e9b9e02bdb6ca285ef0e0ca13f04c491a53e1308470680",
+      "transcript": "Request received."
+    },
+    {
+      "url": "https://raw.githubusercontent.com/6shenhonghong9/dsh-startup-screen/4a2cfe642867fac013fdef90095981544a819a2a/lib/assets/line-4.mp3",
+      "sha256": "bbfa0d757843451df6e7d306630bf582657dea36f2c4952bb2773496dd5d4637",
+      "transcript": "Start processing."
+    },
+    {
+      "url": "https://raw.githubusercontent.com/6shenhonghong9/dsh-startup-screen/4a2cfe642867fac013fdef90095981544a819a2a/lib/assets/line-5.mp3",
+      "sha256": "97be9c44591af6f3ef0b7b8788f960e07df684e41236661dd9d2294639f2ae31",
+      "transcript": "Permission authorized."
+    }
+  ],
+  "reference_transcript": "Access permission required. ID confirmed. Request received. Start processing. Permission authorized.",
+  "reference_sha256": "eea22af1be82531047c5b0f2ef2633f9f4369c7435c4f10d1bef2330b67d90fe",
+  "reference_transcript_check": "faster-whisper small, English, beam_size=5; actual reference audio transcription",
+  "qwen_tts_version": "0.1.1",
+  "transformers_version": "4.57.3",
+  "torch_version": "2.7.1+cu118",
+  "python_version": "3.13.5",
+  "gpu": "NVIDIA GeForce RTX 3080 Laptop GPU",
+  "attention": "sdpa",
+  "dtype": "bfloat16",
+  "seed": 20261007,
+  "postprocess": "24 kHz mono PCM16, 24 Hz high-pass, padding trim, -2.16 dBFS peak, 6 ms fades; no time stretching",
+  "total_seconds": 72.741,
+  "clips": [
+    {
+      "file": "phase-0.wav",
+      "sample_rate": 24000,
+      "channels": 1,
+      "format": "PCM_16",
+      "frames": 80640,
+      "duration_seconds": 3.36,
+      "peak": 0.78,
+      "sha256": "b4a882caaf6ce312afe73cb732de988dda7f4d4257120309769cd38cff6988cf",
+      "text": "D. S. H. Startup sequence initiated.",
+      "seed": 20261007,
+      "processing_seconds": 11.384,
+      "reused_cached_raw": false
+    },
+    {
+      "file": "phase-1.wav",
+      "sample_rate": 24000,
+      "channels": 1,
+      "format": "PCM_16",
+      "frames": 48000,
+      "duration_seconds": 2.0,
+      "peak": 0.78,
+      "sha256": "5411b8c66a7c7e017539779027b42c698b15d97aee35f12a3782a25c6f62fb60",
+      "text": "Preparing the local workspace.",
+      "seed": 20261008,
+      "processing_seconds": 6.126,
+      "reused_cached_raw": false
+    },
+    {
+      "file": "phase-2.wav",
+      "sample_rate": 24000,
+      "channels": 1,
+      "format": "PCM_16",
+      "frames": 51840,
+      "duration_seconds": 2.16,
+      "peak": 0.78,
+      "sha256": "bafaedfe1ce586c24c2df27ce9e79ccf330e2fa0d2f1fc2ab937788b2a067e3d",
+      "text": "Operator profile confirmed.",
+      "seed": 20261009,
+      "processing_seconds": 7.103,
+      "reused_cached_raw": false
+    },
+    {
+      "file": "phase-3.wav",
+      "sample_rate": 24000,
+      "channels": 1,
+      "format": "PCM_16",
+      "frames": 51840,
+      "duration_seconds": 2.16,
+      "peak": 0.78,
+      "sha256": "c3bf045c5d1bb9281351551b63be2d1938b90b23d0aead1c189ce162b9366d1f",
+      "text": "Loading local skills and plugins.",
+      "seed": 20261010,
+      "processing_seconds": 9.286,
+      "reused_cached_raw": false
+    },
+    {
+      "file": "phase-3-mounted.wav",
+      "sample_rate": 24000,
+      "channels": 1,
+      "format": "PCM_16",
+      "frames": 59520,
+      "duration_seconds": 2.48,
+      "peak": 0.78,
+      "sha256": "0af955a12c41a3aecc8348a5c3c585e2af6ae9b7e2c65809b6b3f99ea20d0a86",
+      "text": "Reviewing local skills and plugins.",
+      "seed": 20261011,
+      "processing_seconds": 8.484,
+      "reused_cached_raw": false
+    },
+    {
+      "file": "phase-4.wav",
+      "sample_rate": 24000,
+      "channels": 1,
+      "format": "PCM_16",
+      "frames": 45927,
+      "duration_seconds": 1.913625,
+      "peak": 0.78,
+      "sha256": "a8fdefbc7f9b64288c85c92a5af3ed2c05363d22fcb0e1d4896549a49cd2672c",
+      "text": "Local resources loaded.",
+      "seed": 20261012,
+      "processing_seconds": 6.257,
+      "reused_cached_raw": false
+    },
+    {
+      "file": "phase-5.wav",
+      "sample_rate": 24000,
+      "channels": 1,
+      "format": "PCM_16",
+      "frames": 36480,
+      "duration_seconds": 1.52,
+      "peak": 0.78,
+      "sha256": "aa9e2b90cac1a2502f0b129fd5a8a1de692b08ac521236b634c40374c16e2257",
+      "text": "Welcome, Operator.",
+      "seed": 20261013,
+      "processing_seconds": 0.015,
+      "reused_cached_raw": true
+    },
+    {
+      "file": "load-warning.wav",
+      "sample_rate": 24000,
+      "channels": 1,
+      "format": "PCM_16",
+      "frames": 69120,
+      "duration_seconds": 2.88,
+      "peak": 0.78,
+      "sha256": "a5979aadcb4068d92c91a5cb788884a47805fb308ff5de9c4f6de0d56f36dca4",
+      "text": "Some local resources require attention.",
+      "seed": 20261014,
+      "processing_seconds": 8.594,
+      "reused_cached_raw": false
+    },
+    {
+      "file": "load-unavailable.wav",
+      "sample_rate": 24000,
+      "channels": 1,
+      "format": "PCM_16",
+      "frames": 55680,
+      "duration_seconds": 2.32,
+      "peak": 0.78,
+      "sha256": "f56f70dea8414c82cb11d6563c6058abe67bdc3e4af6d43d55bfffaa4765a070",
+      "text": "Local resources could not be loaded.",
+      "seed": 20261015,
+      "processing_seconds": 8.283,
+      "reused_cached_raw": false
+    }
+  ],
+  "verification": {
+    "report": "verification.json",
+    "method": "independent faster-whisper small ASR plus PCM format, RMS, peak, clipping and tail-silence checks",
+    "passed": true,
+    "subjective_listening_performed": false
+  }
+}

@@ -1,17 +1,7 @@
 //! Codex-inspired TUI: transcript cells + bottom composer + semantic category colors.
 
-use anyhow::Result;
-use crossterm::cursor::{Hide, Show};
-use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseButton,
-    MouseEventKind,
-};
-use crossterm::execute;
-use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
-};
 use crate::commands::{
-    autocomplete_slash, handle_slash, matching_commands, UiLine, SlashCtx, SlashEffect,
+    autocomplete_slash, handle_slash, matching_commands, SlashCtx, SlashEffect, UiLine,
 };
 use crate::keymap::{map_key, KeyAction};
 use crate::theme::{
@@ -19,6 +9,8 @@ use crate::theme::{
     composer_title_style, cursor_block, dim_style, running_glyph, running_suffix, spinner_frame,
     stream_caret, CellKind,
 };
+use anyhow::Result;
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, MouseButton, MouseEventKind};
 use dsh_core::{AgentEvent, AgentHandle, AgentLoop, Runtime, Session};
 use parking_lot::RwLock;
 use ratatui::backend::CrosstermBackend;
@@ -27,7 +19,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::Terminal;
-use std::io::{stdout, Stdout};
+use std::io::{stdin, stdout, IsTerminal, Stdout};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -44,6 +36,10 @@ pub struct TuiOptions {
     pub has_api_key: bool,
     /// When set, auto-start a turn after the first draw (Codex positional prompt).
     pub initial_prompt: Option<String>,
+    /// Per-invocation opt-in, including when the queued one-shot preference is off.
+    pub startup_enabled: bool,
+    /// Highest-priority per-invocation opt-out, including a queued one-shot intro.
+    pub startup_disabled: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,6 +95,8 @@ struct AppState {
     raw_mode: bool,
     /// Waiting for y/n on AgentEvent::ApprovalNeeded.
     awaiting_approval: bool,
+    /// Request id used to resolve the exact approval when multiple runs wait.
+    awaiting_approval_request_id: Option<String>,
     /// Optional auto-send prompt after first draw.
     initial_prompt: Option<String>,
     /// @mention fuzzy file candidates.
@@ -118,11 +116,87 @@ struct AppState {
     panes: PaneLayout,
 }
 
+/// Resolve presentation only after terminal and session setup succeeds. Explicit
+/// choices override the queued preference, but an eligible launch still consumes it.
+fn startup_enabled_for_launch(
+    outer_home: &Path,
+    configured: bool,
+    available: bool,
+    requested: bool,
+    disabled: bool,
+) -> Result<bool> {
+    if !available {
+        return Ok(false);
+    }
+    let pending = dsh_core::take_next_startup(outer_home)?;
+    Ok((requested || pending.unwrap_or(configured)) && !disabled)
+}
+
+#[cfg(test)]
+mod startup_launch_tests {
+    use super::startup_enabled_for_launch;
+    use std::path::PathBuf;
+
+    struct TemporaryHome(PathBuf);
+
+    impl TemporaryHome {
+        fn new() -> Self {
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            Self(std::env::temp_dir().join(format!(
+                "dsh-startup-launch-{}-{stamp}",
+                std::process::id()
+            )))
+        }
+    }
+
+    impl Drop for TemporaryHome {
+        fn drop(&mut self) {
+            for name in ["startup-next.txt", ".startup-next.lock"] {
+                let _ = std::fs::remove_file(self.0.join(name));
+            }
+            let _ = std::fs::remove_dir(&self.0);
+        }
+    }
+
+    #[test]
+    fn explicit_startup_choices_override_and_consume_the_pending_choice_once() {
+        let home = TemporaryHome::new();
+        for (configured, pending, requested, disabled, expected) in [
+            (false, None, false, false, false),
+            (true, None, false, false, true),
+            (false, Some(true), false, false, true),
+            (true, Some(false), false, false, false),
+            (false, Some(false), true, false, true),
+            (true, Some(true), false, true, false),
+            (true, Some(true), true, true, false),
+        ] {
+            if let Some(pending) = pending {
+                dsh_core::set_next_startup(&home.0, pending).unwrap();
+            }
+            let selected = startup_enabled_for_launch(
+                &home.0, configured, true, requested, disabled,
+            ).unwrap();
+            assert_eq!(selected, expected);
+            assert_eq!(dsh_core::take_next_startup(&home.0).unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn startup_opt_in_does_not_consume_a_choice_for_an_ineligible_terminal() {
+        let home = TemporaryHome::new();
+        dsh_core::set_next_startup(&home.0, false).unwrap();
+        assert!(!startup_enabled_for_launch(&home.0, true, false, true, false).unwrap());
+        assert_eq!(dsh_core::take_next_startup(&home.0).unwrap(), Some(false));
+    }
+}
+
 pub async fn run_tui(runtime: Arc<Runtime>, opts: TuiOptions) -> Result<()> {
-    enable_raw_mode()?;
-    let mut stdout = stdout();
-    execute!(stdout, EnterAlternateScreen, Hide, EnableMouseCapture)?;
-    let backend = CrosstermBackend::new(stdout);
+    anyhow::ensure!(stdin().is_terminal() && stdout().is_terminal(), "TUI requires an interactive terminal; use `dsh exec <prompt>` for redirected input/output.");
+    let _terminal_guard = crate::terminal::TerminalGuard::enter()?;
+    let backend = CrosstermBackend::new(stdout());
     let mut terminal = Terminal::new(backend)?;
 
     let settings = runtime.settings.read().clone();
@@ -135,6 +209,54 @@ pub async fn run_tui(runtime: Arc<Runtime>, opts: TuiOptions) -> Result<()> {
         runtime.sessions.create()
     };
     let session_id = session.read().id.clone();
+    let mut startup = runtime.config.tui.startup.clone();
+    startup.enabled = startup_enabled_for_launch(
+        &runtime.outer_home,
+        startup.enabled,
+        crate::startup::available(),
+        opts.startup_enabled,
+        opts.startup_disabled,
+    )?;
+    let startup_context = if startup.enabled && crate::startup::available() {
+        // Snapshot already mounted inventories; animation never runs discovery or plugins.
+        let skills = runtime.skills.read().clone();
+        let plugins = runtime.plugins.read().clone();
+        let profile = dsh_core::load_startup_profile(&runtime.outer_home).unwrap_or_else(|error| {
+            tracing::warn!(%error, "startup profile unavailable; using local defaults");
+            dsh_core::StartupProfile::default()
+        });
+        crate::StartupContext {
+            profile,
+            inventory_loaded: skills.is_some() && plugins.is_some(),
+            skill_names: skills
+                .as_ref()
+                .map(|catalog| catalog.list().into_iter().map(|s| s.name).collect())
+                .unwrap_or_default(),
+            plugin_names: plugins
+                .as_ref()
+                .map(|registry| {
+                    registry
+                        .routing_summaries()
+                        .into_iter()
+                        .map(|p| {
+                            if p.name == p.id {
+                                p.name
+                            } else {
+                                format!("{} ({})", p.name, p.id)
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+        }
+    } else {
+        crate::StartupContext::default()
+    };
+    if crate::startup::play(&mut terminal, &startup, &startup_context).await?
+        == crate::startup::Outcome::Quit
+    {
+        return Ok(());
+    }
     let agent = AgentLoop::new(runtime.clone());
     let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(256);
 
@@ -229,6 +351,7 @@ pub async fn run_tui(runtime: Arc<Runtime>, opts: TuiOptions) -> Result<()> {
         vim_insert: !settings.vim_mode,
         raw_mode: settings.raw_mode,
         awaiting_approval: false,
+        awaiting_approval_request_id: None,
         initial_prompt: opts.initial_prompt,
         mention_candidates: Vec::new(),
         mention_index: 0,
@@ -250,14 +373,6 @@ pub async fn run_tui(runtime: Arc<Runtime>, opts: TuiOptions) -> Result<()> {
     )
     .await;
 
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        DisableMouseCapture,
-        LeaveAlternateScreen,
-        Show
-    )?;
-    terminal.show_cursor()?;
     result
 }
 
@@ -414,7 +529,11 @@ async fn run_loop(
                     if app.awaiting_approval {
                         match key.code {
                             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                                app.runtime.resolve_approval(true);
+                                if let Some(request_id) = app.awaiting_approval_request_id.take() {
+                                    app.runtime.resolve_approval_request(&request_id, true);
+                                } else {
+                                    app.runtime.resolve_approval(true);
+                                }
                                 app.awaiting_approval = false;
                                 app.status = "tool approved".into();
                                 app.lines.push(UiLine {
@@ -426,7 +545,11 @@ async fn run_loop(
                                 });
                             }
                             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                                app.runtime.resolve_approval(false);
+                                if let Some(request_id) = app.awaiting_approval_request_id.take() {
+                                    app.runtime.resolve_approval_request(&request_id, false);
+                                } else {
+                                    app.runtime.resolve_approval(false);
+                                }
                                 app.awaiting_approval = false;
                                 app.status = "tool denied".into();
                                 app.lines.push(UiLine {
@@ -446,390 +569,392 @@ async fn run_loop(
                         continue;
                     };
                     match action {
-                    KeyAction::Quit => break,
-                    KeyAction::Cancel => {
-                        // Esc while browsing transcript → return to composer (friendlier UX).
-                        if !app.busy
-                            && app.focus == FocusPane::Transcript
-                            && app.input.is_empty()
-                        {
-                            app.focus = FocusPane::Composer;
-                            app.status = "composer focused".into();
-                            continue;
+                        KeyAction::Quit => break,
+                        KeyAction::Cancel => {
+                            // Esc while browsing transcript → return to composer (friendlier UX).
+                            if !app.busy
+                                && app.focus == FocusPane::Transcript
+                                && app.input.is_empty()
+                            {
+                                app.focus = FocusPane::Composer;
+                                app.status = "composer focused".into();
+                                continue;
+                            }
+                            // EscEsc with empty composer: fork from last user message (Codex).
+                            if app.input.is_empty() {
+                                let now = Instant::now();
+                                let double = app
+                                    .last_esc
+                                    .map(|t| now.duration_since(t) < Duration::from_millis(600))
+                                    .unwrap_or(false);
+                                app.last_esc = Some(now);
+                                if double {
+                                    let forked_opt = session.read().fork_from_last_user();
+                                    if let Some((forked, text)) = forked_opt {
+                                        let s = app.runtime.sessions.insert(forked);
+                                        session = s;
+                                        rebuild_from_session(app, &session);
+                                        app.input = text;
+                                        app.cursor = app.input.chars().count();
+                                        app.focus = FocusPane::Composer;
+                                        app.status =
+                                            "forked from last user message · edit and Enter".into();
+                                        app.last_esc = None;
+                                        continue;
+                                    }
+                                }
+                            } else if app.vim_mode && app.vim_insert {
+                                app.vim_insert = false;
+                                app.status = "vim NORMAL".into();
+                                continue;
+                            }
+                            if let Some(h) = &app.handle {
+                                h.cancel();
+                            }
+                            app.status = "cancel requested · EscEsc empty = edit last".into();
                         }
-                        // EscEsc with empty composer: fork from last user message (Codex).
-                        if app.input.is_empty() {
-                            let now = Instant::now();
-                            let double = app
-                                .last_esc
-                                .map(|t| now.duration_since(t) < Duration::from_millis(600))
-                                .unwrap_or(false);
-                            app.last_esc = Some(now);
-                            if double {
-                                let forked_opt = session.read().fork_from_last_user();
-                                if let Some((forked, text)) = forked_opt {
-                                    let s = app.runtime.sessions.insert(forked);
-                                    session = s;
-                                    rebuild_from_session(app, &session);
-                                    app.input = text;
+                        KeyAction::ClearView => {
+                            // Ctrl+L: clear view only (Codex) — keep session.
+                            app.lines.clear();
+                            app.lines.push(UiLine {
+                                kind: CellKind::System,
+                                text: format!(
+                                    "view cleared · session {} still active",
+                                    &app.session_id[..8.min(app.session_id.len())]
+                                ),
+                                header: Some("ui".into()),
+                                running: false,
+                                ok: None,
+                            });
+                        }
+                        KeyAction::NewChat => {
+                            let effect = dispatch_slash(app, &session, "/new");
+                            if let SlashEffect::SwitchSession(s) = effect {
+                                session = s;
+                                rebuild_from_session(app, &session);
+                            }
+                        }
+                        KeyAction::CopyLast => {
+                            let _ = dispatch_slash(app, &session, "/copy");
+                        }
+                        KeyAction::PermissionsHelp => {
+                            let _ = dispatch_slash(app, &session, "/permissions");
+                        }
+                        KeyAction::HistorySearch => {
+                            // Ctrl+R: jump into draft history (Codex-style history search entry).
+                            if !app.draft_history.is_empty() {
+                                let next = app.draft_history.len().saturating_sub(1);
+                                app.draft_index = Some(next);
+                                app.input = app.draft_history[next].clone();
+                                app.cursor = app.input.chars().count();
+                                app.status = "history search · ↑/↓ to browse".into();
+                            } else {
+                                app.status = "history search · (empty)".into();
+                            }
+                        }
+                        KeyAction::GoalHelp => {
+                            let _ = dispatch_slash(app, &session, "/goal");
+                        }
+                        KeyAction::Newline => insert_char(app, '\n'),
+                        KeyAction::Send => {
+                            if in_mention_mode(app) && !app.mention_candidates.is_empty() {
+                                insert_mention_selection(app);
+                                continue;
+                            }
+                            if in_slash_mode(app) {
+                                let matches = matching_commands(app.input.trim());
+                                if let Some(cmd) = matches.get(app.slash_index).copied() {
+                                    app.input = format!("{cmd} ");
                                     app.cursor = app.input.chars().count();
-                                    app.focus = FocusPane::Composer;
-                                    app.status =
-                                        "forked from last user message · edit and Enter".into();
-                                    app.last_esc = None;
+                                    app.slash_index = 0;
                                     continue;
                                 }
                             }
-                        } else if app.vim_mode && app.vim_insert {
-                            app.vim_insert = false;
-                            app.status = "vim NORMAL".into();
-                            continue;
-                        }
-                        if let Some(h) = &app.handle {
-                            h.cancel();
-                        }
-                        app.status = "cancel requested · EscEsc empty = edit last".into();
-                    }
-                    KeyAction::ClearView => {
-                        // Ctrl+L: clear view only (Codex) — keep session.
-                        app.lines.clear();
-                        app.lines.push(UiLine {
-                            kind: CellKind::System,
-                            text: format!(
-                                "view cleared · session {} still active",
-                                &app.session_id[..8.min(app.session_id.len())]
-                            ),
-                            header: Some("ui".into()),
-                            running: false,
-                            ok: None,
-                        });
-                    }
-                    KeyAction::NewChat => {
-                        let effect = dispatch_slash(app, &session, "/new");
-                        if let SlashEffect::SwitchSession(s) = effect {
-                            session = s;
-                            rebuild_from_session(app, &session);
-                        }
-                    }
-                    KeyAction::CopyLast => {
-                        let _ = dispatch_slash(app, &session, "/copy");
-                    }
-                    KeyAction::PermissionsHelp => {
-                        let _ = dispatch_slash(app, &session, "/permissions");
-                    }
-                    KeyAction::HistorySearch => {
-                        // Ctrl+R: jump into draft history (Codex-style history search entry).
-                        if !app.draft_history.is_empty() {
-                            let next = app.draft_history.len().saturating_sub(1);
-                            app.draft_index = Some(next);
-                            app.input = app.draft_history[next].clone();
-                            app.cursor = app.input.chars().count();
-                            app.status = "history search · ↑/↓ to browse".into();
-                        } else {
-                            app.status = "history search · (empty)".into();
-                        }
-                    }
-                    KeyAction::GoalHelp => {
-                        let _ = dispatch_slash(app, &session, "/goal");
-                    }
-                    KeyAction::Newline => insert_char(app, '\n'),
-                    KeyAction::Send => {
-                        if in_mention_mode(app) && !app.mention_candidates.is_empty() {
-                            insert_mention_selection(app);
-                            continue;
-                        }
-                        if in_slash_mode(app) {
-                            let matches = matching_commands(app.input.trim());
-                            if let Some(cmd) = matches.get(app.slash_index).copied() {
-                                app.input = format!("{cmd} ");
-                                app.cursor = app.input.chars().count();
-                                app.slash_index = 0;
-                                continue;
-                            }
-                        }
-                        let text = app.input.trim().to_string();
-                        if text.is_empty() {
-                            continue;
-                        }
-                        // While busy: Enter injects; Tab queues (handled separately).
-                        if app.busy {
-                            app.pending_queue.push(text.clone());
-                            app.input.clear();
-                            app.cursor = 0;
-                            app.status = format!(
-                                "queued ({}) · will run after current turn",
-                                app.pending_queue.len()
-                            );
-                            app.lines.push(UiLine {
-                                kind: CellKind::System,
-                                text: format!("queued: {}", text.chars().take(120).collect::<String>()),
-                                header: Some("queue".into()),
-                                running: false,
-                                ok: None,
-                            });
-                            continue;
-                        }
-                        app.input.clear();
-                        app.cursor = 0;
-                        app.draft_index = None;
-                        app.last_esc = None;
-                        app.mention_candidates.clear();
-                        if !text.starts_with('/') && !text.starts_with('!') {
-                            app.draft_history.push(text.clone());
-                        }
-                        // !cmd — local shell under current permissions (Codex).
-                        if let Some(cmd) = text.strip_prefix('!').map(str::trim) {
-                            if cmd.is_empty() {
-                                continue;
-                            }
-                            match app.runtime.bg.spawn(cmd, Path::new(&app.cwd)) {
-                                Ok(id) => {
-                                    app.lines.push(UiLine {
-                                        kind: CellKind::Terminal,
-                                        text: format!("bg #{id} started: {cmd}"),
-                                        header: Some("shell".into()),
-                                        running: false,
-                                        ok: Some(true),
-                                    });
-                                }
-                                Err(e) => app.lines.push(UiLine {
-                                    kind: CellKind::Error,
-                                    text: format!("shell failed: {e}"),
-                                    header: Some("shell".into()),
-                                    running: false,
-                                    ok: Some(false),
-                                }),
-                            }
-                            continue;
-                        }
-                        // @path — mention file into prompt (Codex).
-                        let text = if let Some(rest) = text.strip_prefix('@') {
-                            let path = rest.trim();
-                            if path.is_empty() {
-                                text
-                            } else {
-                                format!("Please inspect this file/path: {path}\n\n(Attached via @mention)")
-                            }
-                        } else {
-                            text
-                        };
-                        if text.starts_with('/') {
-                            let effect = dispatch_slash(app, &session, &text);
-                            match effect {
-                                SlashEffect::Quit => break,
-                                SlashEffect::SwitchSession(s) => {
-                                    session = s;
-                                    if text.starts_with("/clear") {
-                                        // keep current cleared banner
-                                    } else {
-                                        rebuild_from_session(app, &session);
-                                    }
-                                }
-                                SlashEffect::QueuePrompt(prompt) => {
-                                    if let Err(e) =
-                                        start_turn(app, agent, &session, &event_tx, prompt).await
-                                    {
-                                        app.lines.push(UiLine {
-                                            kind: CellKind::Error,
-                                            text: format!("{e}"),
-                                            header: Some("error".into()),
-                                            running: false,
-                                            ok: Some(false),
-                                        });
-                                    }
-                                }
-                                SlashEffect::None => {}
-                            }
-                            continue;
-                        }
-                        if let Err(e) = start_turn(app, agent, &session, &event_tx, text).await {
-                            app.lines.push(UiLine {
-                                kind: CellKind::Error,
-                                text: format!("{e}"),
-                                header: Some("error".into()),
-                                running: false,
-                                ok: Some(false),
-                            });
-                        }
-                    }
-                    KeyAction::SlashComplete => {
-                        // Tab while busy queues the composer contents (Codex).
-                        if app.busy && !app.input.trim().is_empty() {
                             let text = app.input.trim().to_string();
-                            app.pending_queue.push(text.clone());
-                            app.input.clear();
-                            app.cursor = 0;
-                            app.status = format!("queued ({})", app.pending_queue.len());
-                            app.lines.push(UiLine {
-                                kind: CellKind::System,
-                                text: format!("queued: {text}"),
-                                header: Some("queue".into()),
-                                running: false,
-                                ok: None,
-                            });
-                            continue;
-                        }
-                        if in_mention_mode(app) && !app.mention_candidates.is_empty() {
-                            insert_mention_selection(app);
-                            continue;
-                        }
-                        let before = app.input.clone();
-                        if let Some(completed) = autocomplete_slash(&before) {
-                            app.input = completed;
-                            app.cursor = app.input.chars().count();
-                        } else {
-                            let matches = matching_commands(before.trim());
-                            if let Some(cmd) = matches.get(app.slash_index).copied() {
-                                app.input = format!("{cmd} ");
-                                app.cursor = app.input.chars().count();
-                                app.slash_index = 0;
-                            } else if !matches.is_empty() {
+                            if text.is_empty() {
+                                continue;
+                            }
+                            // While busy: Enter injects; Tab queues (handled separately).
+                            if app.busy {
+                                app.pending_queue.push(text.clone());
+                                app.input.clear();
+                                app.cursor = 0;
+                                app.status = format!(
+                                    "queued ({}) · will run after current turn",
+                                    app.pending_queue.len()
+                                );
                                 app.lines.push(UiLine {
                                     kind: CellKind::System,
-                                    text: matches.join("  "),
-                                    header: Some("slash".into()),
+                                    text: format!(
+                                        "queued: {}",
+                                        text.chars().take(120).collect::<String>()
+                                    ),
+                                    header: Some("queue".into()),
                                     running: false,
                                     ok: None,
                                 });
+                                continue;
                             }
-                        }
-                    }
-                    KeyAction::Backspace => {
-                        delete_before_cursor(app);
-                        refresh_completions(app);
-                    }
-                    KeyAction::Delete => {
-                        delete_at_cursor(app);
-                        refresh_completions(app);
-                    }
-                    KeyAction::CursorLeft => {
-                        if app.cursor > 0 {
-                            app.cursor -= 1;
-                        }
-                    }
-                    KeyAction::CursorRight => {
-                        let len = app.input.chars().count();
-                        if app.cursor < len {
-                            app.cursor += 1;
-                        }
-                    }
-                    KeyAction::CursorHome => app.cursor = 0,
-                    KeyAction::CursorEnd => app.cursor = app.input.chars().count(),
-                    KeyAction::InsertChar(c) => {
-                        app.draft_index = None;
-                        // Minimal vim: normal mode hjkl / i / a / 0 / $
-                        if app.vim_mode && !app.vim_insert && !app.busy {
-                            match c {
-                                'i' => {
-                                    app.vim_insert = true;
-                                    app.status = "vim INSERT".into();
+                            app.input.clear();
+                            app.cursor = 0;
+                            app.draft_index = None;
+                            app.last_esc = None;
+                            app.mention_candidates.clear();
+                            if !text.starts_with('/') && !text.starts_with('!') {
+                                app.draft_history.push(text.clone());
+                            }
+                            // !cmd — local shell under current permissions (Codex).
+                            if let Some(cmd) = text.strip_prefix('!').map(str::trim) {
+                                if cmd.is_empty() {
+                                    continue;
                                 }
-                                'a' => {
-                                    app.vim_insert = true;
-                                    let len = app.input.chars().count();
-                                    if app.cursor < len {
-                                        app.cursor += 1;
+                                match app.runtime.bg.spawn(cmd, Path::new(&app.cwd)) {
+                                    Ok(id) => {
+                                        app.lines.push(UiLine {
+                                            kind: CellKind::Terminal,
+                                            text: format!("bg #{id} started: {cmd}"),
+                                            header: Some("shell".into()),
+                                            running: false,
+                                            ok: Some(true),
+                                        });
                                     }
-                                    app.status = "vim INSERT".into();
-                                }
-                                'h' => {
-                                    if app.cursor > 0 {
-                                        app.cursor -= 1;
-                                    }
-                                }
-                                'l' => {
-                                    let len = app.input.chars().count();
-                                    if app.cursor < len {
-                                        app.cursor += 1;
-                                    }
-                                }
-                                '0' => app.cursor = 0,
-                                '$' => app.cursor = app.input.chars().count(),
-                                _ => {}
-                            }
-                            continue;
-                        }
-                        insert_char(app, c);
-                        refresh_completions(app);
-                    }
-                    KeyAction::ScrollUp => {
-                        if in_mention_mode(app) && !app.mention_candidates.is_empty() {
-                            if app.mention_index > 0 {
-                                app.mention_index -= 1;
-                            }
-                            continue;
-                        }
-                        if in_slash_mode(app) {
-                            if app.slash_index > 0 {
-                                app.slash_index -= 1;
-                            }
-                            continue;
-                        }
-                        // Transcript focus (or empty composer with no draft hist): scroll chat.
-                        if app.focus == FocusPane::Transcript
-                            || (app.focus == FocusPane::Composer
-                                && app.input.is_empty()
-                                && app.draft_index.is_none()
-                                && app.draft_history.is_empty())
-                        {
-                            scroll_transcript(app, -1);
-                            continue;
-                        }
-                        if app.focus == FocusPane::Composer
-                            && (app.input.is_empty() || app.draft_index.is_some())
-                            && !app.draft_history.is_empty()
-                        {
-                            let next = match app.draft_index {
-                                None => app.draft_history.len().saturating_sub(1),
-                                Some(0) => 0,
-                                Some(i) => i.saturating_sub(1),
-                            };
-                            app.draft_index = Some(next);
-                            app.input = app.draft_history[next].clone();
-                            app.cursor = app.input.chars().count();
-                            continue;
-                        }
-                        scroll_transcript(app, -1);
-                    }
-                    KeyAction::ScrollDown => {
-                        if in_mention_mode(app) && !app.mention_candidates.is_empty() {
-                            let max = app.mention_candidates.len().saturating_sub(1);
-                            if app.mention_index < max {
-                                app.mention_index += 1;
-                            }
-                            continue;
-                        }
-                        if in_slash_mode(app) {
-                            let n = matching_commands(app.input.trim()).len();
-                            if n > 0 && app.slash_index + 1 < n {
-                                app.slash_index += 1;
-                            }
-                            continue;
-                        }
-                        if app.focus == FocusPane::Composer {
-                            if let Some(i) = app.draft_index {
-                                if i + 1 >= app.draft_history.len() {
-                                    app.draft_index = None;
-                                    app.input.clear();
-                                    app.cursor = 0;
-                                } else {
-                                    app.draft_index = Some(i + 1);
-                                    app.input = app.draft_history[i + 1].clone();
-                                    app.cursor = app.input.chars().count();
+                                    Err(e) => app.lines.push(UiLine {
+                                        kind: CellKind::Error,
+                                        text: format!("shell failed: {e}"),
+                                        header: Some("shell".into()),
+                                        running: false,
+                                        ok: Some(false),
+                                    }),
                                 }
                                 continue;
                             }
+                            // @path — mention file into prompt (Codex).
+                            let text = if let Some(rest) = text.strip_prefix('@') {
+                                let path = rest.trim();
+                                if path.is_empty() {
+                                    text
+                                } else {
+                                    format!("Please inspect this file/path: {path}\n\n(Attached via @mention)")
+                                }
+                            } else {
+                                text
+                            };
+                            if text.starts_with('/') {
+                                let effect = dispatch_slash(app, &session, &text);
+                                match effect {
+                                    SlashEffect::Quit => break,
+                                    SlashEffect::SwitchSession(s) => {
+                                        session = s;
+                                        if text.starts_with("/clear") {
+                                            // keep current cleared banner
+                                        } else {
+                                            rebuild_from_session(app, &session);
+                                        }
+                                    }
+                                    SlashEffect::QueuePrompt(prompt) => {
+                                        if let Err(e) =
+                                            start_turn(app, agent, &session, &event_tx, prompt)
+                                                .await
+                                        {
+                                            app.lines.push(UiLine {
+                                                kind: CellKind::Error,
+                                                text: format!("{e}"),
+                                                header: Some("error".into()),
+                                                running: false,
+                                                ok: Some(false),
+                                            });
+                                        }
+                                    }
+                                    SlashEffect::None => {}
+                                }
+                                continue;
+                            }
+                            if let Err(e) = start_turn(app, agent, &session, &event_tx, text).await
+                            {
+                                app.lines.push(UiLine {
+                                    kind: CellKind::Error,
+                                    text: format!("{e}"),
+                                    header: Some("error".into()),
+                                    running: false,
+                                    ok: Some(false),
+                                });
+                            }
                         }
-                        scroll_transcript(app, 1);
-                    }
-                    KeyAction::PageUp => {
-                        scroll_transcript(app, -(app.transcript_view_h.max(1) as i32));
-                        app.focus = FocusPane::Transcript;
-                    }
-                    KeyAction::PageDown => {
-                        scroll_transcript(app, app.transcript_view_h.max(1) as i32);
-                        app.focus = FocusPane::Transcript;
-                    }
+                        KeyAction::SlashComplete => {
+                            // Tab while busy queues the composer contents (Codex).
+                            if app.busy && !app.input.trim().is_empty() {
+                                let text = app.input.trim().to_string();
+                                app.pending_queue.push(text.clone());
+                                app.input.clear();
+                                app.cursor = 0;
+                                app.status = format!("queued ({})", app.pending_queue.len());
+                                app.lines.push(UiLine {
+                                    kind: CellKind::System,
+                                    text: format!("queued: {text}"),
+                                    header: Some("queue".into()),
+                                    running: false,
+                                    ok: None,
+                                });
+                                continue;
+                            }
+                            if in_mention_mode(app) && !app.mention_candidates.is_empty() {
+                                insert_mention_selection(app);
+                                continue;
+                            }
+                            let before = app.input.clone();
+                            if let Some(completed) = autocomplete_slash(&before) {
+                                app.input = completed;
+                                app.cursor = app.input.chars().count();
+                            } else {
+                                let matches = matching_commands(before.trim());
+                                if let Some(cmd) = matches.get(app.slash_index).copied() {
+                                    app.input = format!("{cmd} ");
+                                    app.cursor = app.input.chars().count();
+                                    app.slash_index = 0;
+                                } else if !matches.is_empty() {
+                                    app.lines.push(UiLine {
+                                        kind: CellKind::System,
+                                        text: matches.join("  "),
+                                        header: Some("slash".into()),
+                                        running: false,
+                                        ok: None,
+                                    });
+                                }
+                            }
+                        }
+                        KeyAction::Backspace => {
+                            delete_before_cursor(app);
+                            refresh_completions(app);
+                        }
+                        KeyAction::Delete => {
+                            delete_at_cursor(app);
+                            refresh_completions(app);
+                        }
+                        KeyAction::CursorLeft => {
+                            if app.cursor > 0 {
+                                app.cursor -= 1;
+                            }
+                        }
+                        KeyAction::CursorRight => {
+                            let len = app.input.chars().count();
+                            if app.cursor < len {
+                                app.cursor += 1;
+                            }
+                        }
+                        KeyAction::CursorHome => app.cursor = 0,
+                        KeyAction::CursorEnd => app.cursor = app.input.chars().count(),
+                        KeyAction::InsertChar(c) => {
+                            app.draft_index = None;
+                            // Minimal vim: normal mode hjkl / i / a / 0 / $
+                            if app.vim_mode && !app.vim_insert && !app.busy {
+                                match c {
+                                    'i' => {
+                                        app.vim_insert = true;
+                                        app.status = "vim INSERT".into();
+                                    }
+                                    'a' => {
+                                        app.vim_insert = true;
+                                        let len = app.input.chars().count();
+                                        if app.cursor < len {
+                                            app.cursor += 1;
+                                        }
+                                        app.status = "vim INSERT".into();
+                                    }
+                                    'h' if app.cursor > 0 => app.cursor -= 1,
+                                    'h' => {}
+                                    'l' => {
+                                        let len = app.input.chars().count();
+                                        if app.cursor < len {
+                                            app.cursor += 1;
+                                        }
+                                    }
+                                    '0' => app.cursor = 0,
+                                    '$' => app.cursor = app.input.chars().count(),
+                                    _ => {}
+                                }
+                                continue;
+                            }
+                            insert_char(app, c);
+                            refresh_completions(app);
+                        }
+                        KeyAction::ScrollUp => {
+                            if in_mention_mode(app) && !app.mention_candidates.is_empty() {
+                                if app.mention_index > 0 {
+                                    app.mention_index -= 1;
+                                }
+                                continue;
+                            }
+                            if in_slash_mode(app) {
+                                if app.slash_index > 0 {
+                                    app.slash_index -= 1;
+                                }
+                                continue;
+                            }
+                            // Transcript focus (or empty composer with no draft hist): scroll chat.
+                            if app.focus == FocusPane::Transcript
+                                || (app.focus == FocusPane::Composer
+                                    && app.input.is_empty()
+                                    && app.draft_index.is_none()
+                                    && app.draft_history.is_empty())
+                            {
+                                scroll_transcript(app, -1);
+                                continue;
+                            }
+                            if app.focus == FocusPane::Composer
+                                && (app.input.is_empty() || app.draft_index.is_some())
+                                && !app.draft_history.is_empty()
+                            {
+                                let next = match app.draft_index {
+                                    None => app.draft_history.len().saturating_sub(1),
+                                    Some(0) => 0,
+                                    Some(i) => i.saturating_sub(1),
+                                };
+                                app.draft_index = Some(next);
+                                app.input = app.draft_history[next].clone();
+                                app.cursor = app.input.chars().count();
+                                continue;
+                            }
+                            scroll_transcript(app, -1);
+                        }
+                        KeyAction::ScrollDown => {
+                            if in_mention_mode(app) && !app.mention_candidates.is_empty() {
+                                let max = app.mention_candidates.len().saturating_sub(1);
+                                if app.mention_index < max {
+                                    app.mention_index += 1;
+                                }
+                                continue;
+                            }
+                            if in_slash_mode(app) {
+                                let n = matching_commands(app.input.trim()).len();
+                                if n > 0 && app.slash_index + 1 < n {
+                                    app.slash_index += 1;
+                                }
+                                continue;
+                            }
+                            if app.focus == FocusPane::Composer {
+                                if let Some(i) = app.draft_index {
+                                    if i + 1 >= app.draft_history.len() {
+                                        app.draft_index = None;
+                                        app.input.clear();
+                                        app.cursor = 0;
+                                    } else {
+                                        app.draft_index = Some(i + 1);
+                                        app.input = app.draft_history[i + 1].clone();
+                                        app.cursor = app.input.chars().count();
+                                    }
+                                    continue;
+                                }
+                            }
+                            scroll_transcript(app, 1);
+                        }
+                        KeyAction::PageUp => {
+                            scroll_transcript(app, -(app.transcript_view_h.max(1) as i32));
+                            app.focus = FocusPane::Transcript;
+                        }
+                        KeyAction::PageDown => {
+                            scroll_transcript(app, app.transcript_view_h.max(1) as i32);
+                            app.focus = FocusPane::Transcript;
+                        }
                     }
                 }
                 _ => {}
@@ -839,11 +964,7 @@ async fn run_loop(
     Ok(())
 }
 
-fn dispatch_slash(
-    app: &mut AppState,
-    session: &Arc<RwLock<Session>>,
-    text: &str,
-) -> SlashEffect {
+fn dispatch_slash(app: &mut AppState, session: &Arc<RwLock<Session>>, text: &str) -> SlashEffect {
     let mut ctx = SlashCtx {
         runtime: &app.runtime,
         session,
@@ -939,9 +1060,7 @@ fn max_transcript_scroll(app: &AppState) -> usize {
 
 fn clamp_transcript_scroll(app: &mut AppState) {
     let max = max_transcript_scroll(app);
-    if app.stick_to_bottom {
-        app.transcript_scroll = max;
-    } else if app.transcript_scroll > max {
+    if app.stick_to_bottom || app.transcript_scroll > max {
         app.transcript_scroll = max;
     }
 }
@@ -964,7 +1083,10 @@ fn scroll_transcript(app: &mut AppState, delta: i32) {
 }
 
 fn rect_contains(r: Rect, col: u16, row: u16) -> bool {
-    col >= r.x && col < r.x.saturating_add(r.width) && row >= r.y && row < r.y.saturating_add(r.height)
+    col >= r.x
+        && col < r.x.saturating_add(r.width)
+        && row >= r.y
+        && row < r.y.saturating_add(r.height)
 }
 
 fn handle_mouse(app: &mut AppState, mouse: crossterm::event::MouseEvent) {
@@ -987,19 +1109,17 @@ fn handle_mouse(app: &mut AppState, mouse: crossterm::event::MouseEvent) {
                 app.status = "sidebar focused".into();
             }
         }
-        MouseEventKind::ScrollUp => {
+        MouseEventKind::ScrollUp
             if rect_contains(app.panes.transcript, col, row)
-                || app.focus == FocusPane::Transcript
-            {
-                scroll_transcript(app, -3);
-            }
+                || app.focus == FocusPane::Transcript =>
+        {
+            scroll_transcript(app, -3);
         }
-        MouseEventKind::ScrollDown => {
+        MouseEventKind::ScrollDown
             if rect_contains(app.panes.transcript, col, row)
-                || app.focus == FocusPane::Transcript
-            {
-                scroll_transcript(app, 3);
-            }
+                || app.focus == FocusPane::Transcript =>
+        {
+            scroll_transcript(app, 3);
         }
         _ => {}
     }
@@ -1071,13 +1191,15 @@ fn apply_event(app: &mut AppState, ev: AgentEvent) {
             });
         }
         AgentEvent::ToolFinished {
-            name,
-            ok,
-            preview,
-            ..
+            name, ok, preview, ..
         } => {
             let kind = categorize_tool(&name);
-            if let Some(last) = app.lines.iter_mut().rev().find(|l| l.running && l.kind == kind) {
+            if let Some(last) = app
+                .lines
+                .iter_mut()
+                .rev()
+                .find(|l| l.running && l.kind == kind)
+            {
                 last.running = false;
                 last.ok = Some(ok);
                 last.text = format!("{name}: {preview}");
@@ -1102,6 +1224,8 @@ fn apply_event(app: &mut AppState, ev: AgentEvent) {
             });
             app.busy = false;
             app.streaming = false;
+            app.awaiting_approval = false;
+            app.awaiting_approval_request_id = None;
             app.status = "error".into();
         }
         AgentEvent::Done | AgentEvent::TurnEnded(_) => {
@@ -1110,6 +1234,8 @@ fn apply_event(app: &mut AppState, ev: AgentEvent) {
             }
             app.busy = false;
             app.streaming = false;
+            app.awaiting_approval = false;
+            app.awaiting_approval_request_id = None;
             let perm = *app.runtime.permissions.read();
             app.status = format!("{} · {} · {}", app.model, perm.label(), app.cwd);
             app.handle = None;
@@ -1129,11 +1255,13 @@ fn apply_event(app: &mut AppState, ev: AgentEvent) {
             app.streaming = false;
         }
         AgentEvent::ApprovalNeeded {
+            request_id,
             call_id,
             name,
             summary,
         } => {
             app.awaiting_approval = true;
+            app.awaiting_approval_request_id = Some(request_id);
             app.lines.push(UiLine {
                 kind: CellKind::Error,
                 text: format!("approve tool {name}? [y/n]  {summary}  ({call_id})"),
@@ -1250,11 +1378,7 @@ fn draw_transcript(f: &mut ratatui::Frame, area: Rect, app: &mut AppState) {
                     l.text
                 ))))
             } else {
-                ListItem::new(render_cell(
-                    l,
-                    tick,
-                    streaming && global_idx == last_global,
-                ))
+                ListItem::new(render_cell(l, tick, streaming && global_idx == last_global))
             }
         })
         .collect();
@@ -1271,7 +1395,10 @@ fn draw_transcript(f: &mut ratatui::Frame, area: Rect, app: &mut AppState) {
         Line::from(vec![
             Span::styled(format!(" {spin} "), Style::default().fg(Color::Yellow)),
             Span::styled("dsh ", accent_style()),
-            Span::styled(format!("· {bar} · {pos} "), Style::default().fg(Color::Yellow)),
+            Span::styled(
+                format!("· {bar} · {pos} "),
+                Style::default().fg(Color::Yellow),
+            ),
             if focused {
                 Span::styled("● focused ", Style::default().fg(Color::Cyan))
             } else {
@@ -1283,7 +1410,10 @@ fn draw_transcript(f: &mut ratatui::Frame, area: Rect, app: &mut AppState) {
             Span::styled(" dsh ", accent_style()),
             Span::styled(format!("· transcript {pos} "), dim_style()),
             if focused {
-                Span::styled("● focused · wheel/↑↓ scroll ", Style::default().fg(Color::Cyan))
+                Span::styled(
+                    "● focused · wheel/↑↓ scroll ",
+                    Style::default().fg(Color::Cyan),
+                )
             } else {
                 Span::styled("click to focus · wheel scroll ", dim_style())
             },
@@ -1374,7 +1504,10 @@ fn render_cell(line: &UiLine, tick: u64, show_stream_caret: bool) -> Line<'stati
                     .fg(if line.running {
                         other.accent()
                     } else if line.text.starts_with("──")
-                        || line.text.chars().all(|c| c.is_ascii_uppercase() || c == ' ')
+                        || line
+                            .text
+                            .chars()
+                            .all(|c| c.is_ascii_uppercase() || c == ' ')
                             && line.text.len() < 24
                             && !line.text.is_empty()
                     {
@@ -1418,7 +1551,10 @@ fn draw_composer(f: &mut ratatui::Frame, area: Rect, app: &AppState) {
             Span::styled(" › ", accent_style()),
             Span::styled("message ", composer_title_style(false)),
             if focused {
-                Span::styled("· ● focused · Enter send ", Style::default().fg(Color::Cyan))
+                Span::styled(
+                    "· ● focused · Enter send ",
+                    Style::default().fg(Color::Cyan),
+                )
             } else {
                 Span::styled("· click to focus · Enter send ", dim_style())
             },
@@ -1519,10 +1655,7 @@ fn draw_status(f: &mut ratatui::Frame, area: Rect, app: &AppState) {
         Span::styled(" · ", dim_style()),
         Span::styled(perm.label().to_string(), Style::default().fg(Color::Yellow)),
         Span::styled(" · ", dim_style()),
-        Span::styled(
-            format!("focus:{focus}"),
-            Style::default().fg(Color::Cyan),
-        ),
+        Span::styled(format!("focus:{focus}"), Style::default().fg(Color::Cyan)),
         Span::styled(" · ", dim_style()),
         Span::styled(cwd_short, dim_style()),
         Span::styled(" · ", dim_style()),
@@ -1603,10 +1736,7 @@ fn draw_sidebar(f: &mut ratatui::Frame, area: Rect, app: &AppState) {
         " tips ",
         Style::default().add_modifier(Modifier::BOLD),
     )));
-    lines.push(Line::from(Span::styled(
-        " click pane = focus",
-        dim_style(),
-    )));
+    lines.push(Line::from(Span::styled(" click pane = focus", dim_style())));
     lines.push(Line::from(Span::styled(
         " wheel = scroll chat",
         dim_style(),
@@ -1712,7 +1842,7 @@ fn draw_slash_popup(f: &mut ratatui::Frame, area: Rect, app: &AppState) {
         return;
     }
     let height = (matches.len() as u16).clamp(1, 8).saturating_add(2);
-    let width = area.width.min(48).max(20);
+    let width = area.width.clamp(20, 48);
     let popup = Rect {
         x: area.x.saturating_add(1),
         y: area.y.saturating_add(area.height.saturating_sub(height)),
@@ -1748,7 +1878,7 @@ fn draw_mention_popup(f: &mut ratatui::Frame, area: Rect, app: &AppState) {
     let height = (app.mention_candidates.len() as u16)
         .clamp(1, 8)
         .saturating_add(2);
-    let width = area.width.min(64).max(24);
+    let width = area.width.clamp(24, 64);
     let popup = Rect {
         x: area.x.saturating_add(1),
         y: area.y.saturating_add(area.height.saturating_sub(height)),

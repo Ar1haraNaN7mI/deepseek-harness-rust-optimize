@@ -457,24 +457,41 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
 
 [[package]]
+name = "dsh-app-client"
+version = "0.1.0"
+dependencies = [
+ "dsh-protocol",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "dsh-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "chrono",
  "clap",
  "clap_complete",
  "dirs",
  "dotenvy",
+ "dsh-app-client",
  "dsh-core",
  "dsh-fs",
  "dsh-llm",
  "dsh-plugin",
+ "dsh-protocol",
  "dsh-skill",
  "dsh-tools",
  "dsh-tui",
+ "hex",
+ "parking_lot",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "toml",
  "tracing",
@@ -493,8 +510,10 @@ dependencies = [
  "dsh-fs",
  "dsh-llm",
  "dsh-plugin",
+ "dsh-protocol",
  "dsh-skill",
  "dsh-tools",
+ "fs2",
  "indexmap",
  "parking_lot",
  "reqwest",
@@ -563,6 +582,16 @@ dependencies = [
  "tokio",
  "tracing",
  "walkdir",
+]
+
+[[package]]
+name = "dsh-protocol"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "uuid",
 ]
 
 [[package]]
@@ -677,6 +706,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
 dependencies = [
  "percent-encoding",
+]
+
+[[package]]
+name = "fs2"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9564fc758e15025b46aa6643b1b77d047d1a56a1aea6e01002ac0c7026876213"
+dependencies = [
+ "libc",
+ "winapi",
 ]
 
 [[package]]

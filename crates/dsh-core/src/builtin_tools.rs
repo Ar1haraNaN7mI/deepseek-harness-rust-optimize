@@ -70,8 +70,14 @@ impl ToolHandler for ReadFileTool {
             .get("path")
             .and_then(|v| v.as_str())
             .ok_or_else(|| ToolError::Message("path required".into()))?;
-        let offset = args.get("offset").and_then(|v| v.as_u64()).map(|n| n as usize);
-        let limit = args.get("limit").and_then(|v| v.as_u64()).map(|n| n as usize);
+        let offset = args
+            .get("offset")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as usize);
+        let limit = args
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as usize);
         let resolved = resolve_path(ctx, path);
         self.fs
             .read_range(&resolved, offset, limit)
@@ -179,7 +185,7 @@ impl ToolHandler for ApplyPatchTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition::builtin(
             "apply_patch",
-            "Apply multi-hunk SEARCH/REPLACE patch. Format:\n*** Update File: path\n<<<<<<< SEARCH\nold\n=======\nnew\n>>>>>>> REPLACE",
+            "Apply multi-hunk SEARCH/REPLACE patch. Supports *** Update/Add/Delete File headers.",
             json!({
                 "type": "object",
                 "properties": {
@@ -211,20 +217,16 @@ fn rewrite_patch_paths(patch: &str, cwd: &Path) -> String {
     for line in patch.lines() {
         if let Some(rest) = line.strip_prefix("*** Update File:") {
             let p = PathBuf::from(rest.trim());
-            let abs = if p.is_absolute() {
-                p
-            } else {
-                cwd.join(p)
-            };
+            let abs = if p.is_absolute() { p } else { cwd.join(p) };
             out.push_str(&format!("*** Update File: {}\n", abs.display()));
         } else if let Some(rest) = line.strip_prefix("*** Add File:") {
             let p = PathBuf::from(rest.trim());
-            let abs = if p.is_absolute() {
-                p
-            } else {
-                cwd.join(p)
-            };
+            let abs = if p.is_absolute() { p } else { cwd.join(p) };
             out.push_str(&format!("*** Add File: {}\n", abs.display()));
+        } else if let Some(rest) = line.strip_prefix("*** Delete File:") {
+            let p = PathBuf::from(rest.trim());
+            let abs = if p.is_absolute() { p } else { cwd.join(p) };
+            out.push_str(&format!("*** Delete File: {}\n", abs.display()));
         } else {
             out.push_str(line);
             out.push('\n');
@@ -460,9 +462,8 @@ async fn run_shell_cancellable(ctx: &ToolContext, command: &str) -> Result<Strin
 
 fn looks_like_core_mutation(command: &str) -> bool {
     let lower = command.to_lowercase();
-    let hits_core = lower.contains("crates/")
-        || lower.contains("cargo.toml")
-        || lower.contains("\\crates\\");
+    let hits_core =
+        lower.contains("crates/") || lower.contains("cargo.toml") || lower.contains("\\crates\\");
     let mutates = lower.contains("rm ")
         || lower.contains("del ")
         || lower.contains("remove-item")

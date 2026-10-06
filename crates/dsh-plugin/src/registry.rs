@@ -1,11 +1,9 @@
-use crate::loader::{
-    install_plugin_from_path, load_plugin_dir, plugin_skill_paths, LoadedPlugin,
-};
+use crate::loader::{install_plugin_from_path, load_plugin_dir, plugin_skill_paths, LoadedPlugin};
 use crate::meta::auto_tag_plugin;
 use crate::runtime::{HostBridge, PluginSandbox};
 use async_trait::async_trait;
-use dsh_skill::{SkillCatalog, SkillSource};
-use dsh_tools::{ToolContext, ToolDefinition, ToolError, ToolHandler, ToolRegistry};
+use dsh_skill::{SkillCatalog, SkillLoadEvent, SkillSource};
+use dsh_tools::{ToolContext, ToolDefinition, ToolError, ToolHandler, ToolMetadata, ToolRegistry};
 use parking_lot::RwLock;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -20,6 +18,27 @@ pub struct RoutingSummary {
     pub description: String,
     pub tools: Vec<String>,
     pub tags: Vec<String>,
+}
+
+/// Completed operations from the actual plugin registry and attached skill catalog.
+#[derive(Debug, Clone)]
+pub enum PluginLoadEvent {
+    Loaded {
+        id: String,
+        name: String,
+        path: PathBuf,
+    },
+    Error {
+        name: String,
+        path: PathBuf,
+        message: String,
+    },
+    Skipped {
+        name: String,
+        path: PathBuf,
+        message: String,
+    },
+    Skill(SkillLoadEvent),
 }
 
 pub struct PluginRegistry {
@@ -60,40 +79,79 @@ impl PluginRegistry {
     }
 
     pub fn discover_and_load(&self, roots: &[PathBuf]) {
+        self.discover_and_load_observed(roots, |_| {});
+    }
+
+    /// Observe real parse/compile/mount results without starting a watcher or
+    /// executing any plugin tool. Earlier roots retain their existing priority.
+    pub fn discover_and_load_observed(
+        &self,
+        roots: &[PathBuf],
+        mut observe: impl FnMut(PluginLoadEvent),
+    ) {
         *self.watch_roots.write() = roots.to_vec();
         for root in roots {
-            if !root.exists() {
-                continue;
-            }
-            let Ok(entries) = std::fs::read_dir(root) else {
-                continue;
+            let entries = match std::fs::read_dir(root) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    observe(plugin_error(
+                        root,
+                        format!("read plugin directory {}: {error}", root.display()),
+                    ));
+                    continue;
+                }
             };
-            for entry in entries.flatten() {
-                let path = entry.path();
+            let mut paths = Vec::new();
+            for entry in entries {
+                match entry {
+                    Ok(entry) => paths.push(entry.path()),
+                    Err(error) => observe(plugin_error(
+                        root,
+                        format!("read plugin directory entry: {error}"),
+                    )),
+                }
+            }
+            paths.sort();
+            for path in paths {
                 if path.is_dir() {
                     let name = path
                         .file_name()
                         .and_then(|s| s.to_str())
                         .unwrap_or_default();
                     if name.starts_with('.') {
+                        observe(PluginLoadEvent::Skipped {
+                            name: name.into(),
+                            path: path.clone(),
+                            message: "hidden plugin directory ignored".into(),
+                        });
                         continue;
                     }
                     // Higher-priority roots are scanned first; skip duplicate ids.
-                    let provisional = match load_plugin_dir(&path) {
-                        Ok(p) => p.manifest.id,
+                    let loaded = match load_plugin_dir(&path) {
+                        Ok(plugin) => plugin,
                         Err(e) => {
                             tracing::warn!(
                                 path = %path.display(),
                                 error = %e,
                                 "skip plugin mount"
                             );
+                            observe(plugin_error(&path, format!("{e:#}")));
                             continue;
                         }
                     };
-                    if self.plugins.read().contains_key(&provisional) {
+                    if self.plugins.read().contains_key(&loaded.manifest.id) {
+                        observe(PluginLoadEvent::Skipped {
+                            name: loaded.manifest.name.clone(),
+                            path: path.clone(),
+                            message: format!(
+                                "duplicate plugin id {}; retained earlier mount",
+                                loaded.manifest.id
+                            ),
+                        });
                         continue;
                     }
-                    match self.mount_dir(&path) {
+                    match self.mount_loaded_observed(loaded, &mut observe) {
                         Ok(id) => tracing::info!(plugin = %id, "mounted plugin"),
                         Err(e) => tracing::warn!(
                             path = %path.display(),
@@ -107,28 +165,119 @@ impl PluginRegistry {
     }
 
     pub fn mount_dir(&self, path: &Path) -> anyhow::Result<String> {
-        let loaded = load_plugin_dir(path)?;
+        self.mount_dir_observed(path, |_| {})
+    }
+
+    pub fn mount_dir_observed(
+        &self,
+        path: &Path,
+        mut observe: impl FnMut(PluginLoadEvent),
+    ) -> anyhow::Result<String> {
+        let loaded = load_plugin_dir(path).map_err(|error| {
+            observe(plugin_error(path, format!("{error:#}")));
+            error
+        })?;
+        self.mount_loaded_observed(loaded, &mut observe)
+    }
+
+    fn mount_loaded_observed(
+        &self,
+        loaded: LoadedPlugin,
+        observe: &mut dyn FnMut(PluginLoadEvent),
+    ) -> anyhow::Result<String> {
         if let Some(script) = &loaded.entry_script {
-            self.sandbox
-                .validate_script(script)
-                .map_err(|e| anyhow::anyhow!("plugin {} Rhai validate failed: {e}", loaded.manifest.id))?;
+            self.sandbox.validate_script(script).map_err(|e| {
+                let error =
+                    anyhow::anyhow!("plugin {} Rhai validate failed: {e}", loaded.manifest.id);
+                observe(PluginLoadEvent::Error {
+                    name: loaded.manifest.name.clone(),
+                    path: loaded.root.clone(),
+                    message: error.to_string(),
+                });
+                error
+            })?;
+        } else if let Some(entry) = &loaded.manifest.entry {
+            observe(PluginLoadEvent::Error {
+                name: loaded.manifest.name.clone(),
+                path: loaded.root.join(entry),
+                message: "declared entry is missing; compatibility mount has no executable script"
+                    .into(),
+            });
         }
         let id = loaded.manifest.id.clone();
+        let name = loaded.manifest.name.clone();
+        let path = loaded.root.clone();
         let meta = auto_tag_plugin(&loaded, &self.meta_dir);
         self.tools.unregister_plugin(&id);
-        self.register_tools(&loaded)?;
-        self.mount_plugin_skills(&loaded);
+        self.register_tools(&loaded).map_err(|error| {
+            observe(PluginLoadEvent::Error {
+                name: name.clone(),
+                path: path.clone(),
+                message: format!("{error:#}"),
+            });
+            error
+        })?;
+        self.mount_plugin_skills_observed(&loaded, observe);
         self.metas.write().insert(id.clone(), meta);
         self.plugins.write().insert(id.clone(), loaded);
+        observe(PluginLoadEvent::Loaded {
+            id: id.clone(),
+            name,
+            path,
+        });
         Ok(id)
     }
 
-    fn mount_plugin_skills(&self, plugin: &LoadedPlugin) {
+    fn mount_plugin_skills_observed(
+        &self,
+        plugin: &LoadedPlugin,
+        observe: &mut dyn FnMut(PluginLoadEvent),
+    ) {
         let Some(catalog) = self.skills.read().clone() else {
             return;
         };
+        // The resolver keeps its tolerant mounting semantics. Report declared
+        // paths it cannot resolve instead of silently hiding these local issues.
+        for declared in &plugin.manifest.skills {
+            let path = plugin.root.join(declared);
+            let resolved = if path.is_dir() {
+                path.join("SKILL.md")
+            } else {
+                path
+            };
+            if !resolved.is_file() {
+                observe(PluginLoadEvent::Skill(SkillLoadEvent {
+                    name: declared.clone(),
+                    path: resolved,
+                    source: SkillSource::Plugin,
+                    status: dsh_skill::SkillLoadStatus::Error,
+                    message: Some(format!(
+                        "plugin {} declared skill path could not be resolved",
+                        plugin.manifest.id
+                    )),
+                }));
+            }
+        }
+        let skills_root = plugin.root.join("skills");
+        if skills_root.is_dir() {
+            for error in walkdir::WalkDir::new(&skills_root)
+                .max_depth(3)
+                .into_iter()
+                .filter_map(Result::err)
+            {
+                observe(PluginLoadEvent::Skill(SkillLoadEvent {
+                    name: plugin.manifest.id.clone(),
+                    path: error.path().unwrap_or(&skills_root).to_path_buf(),
+                    source: SkillSource::Plugin,
+                    status: dsh_skill::SkillLoadStatus::Error,
+                    message: Some(format!("plugin skill discovery failed: {error}")),
+                }));
+            }
+        }
         for path in plugin_skill_paths(plugin) {
-            match catalog.mount_path(&path, SkillSource::Plugin) {
+            match catalog.mount_path_observed(&path, SkillSource::Plugin, |event| {
+                observe(PluginLoadEvent::Skill(event))
+            }) {
                 Ok(name) => tracing::info!(
                     plugin = %plugin.manifest.id,
                     skill = %name,
@@ -207,9 +356,7 @@ impl PluginRegistry {
                         Ok(Ok(event)) => {
                             let meaningful = matches!(
                                 event.kind,
-                                EventKind::Create(_)
-                                    | EventKind::Modify(_)
-                                    | EventKind::Remove(_)
+                                EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
                             );
                             if meaningful {
                                 // Ignore staging/backup dirs
@@ -326,6 +473,7 @@ impl PluginRegistry {
                     description: format!("[plugin:{}] {}", plugin.manifest.id, tool.description),
                     parameters: tool.parameters.clone(),
                     plugin_id: Some(plugin.manifest.id.clone()),
+                    metadata: ToolMetadata::plugin_default(),
                     tags: {
                         let mut t = plugin.manifest.tags.clone();
                         t.push("plugin".into());
@@ -340,6 +488,18 @@ impl PluginRegistry {
             self.tools.register(handler);
         }
         Ok(())
+    }
+}
+
+fn plugin_error(path: &Path, message: String) -> PluginLoadEvent {
+    PluginLoadEvent::Error {
+        name: path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned(),
+        path: path.to_path_buf(),
+        message,
     }
 }
 
@@ -379,5 +539,164 @@ impl ToolHandler for PluginToolHandler {
         .await
         .map_err(|e| ToolError::Message(e.to_string()))?
         .map_err(|e| ToolError::Message(e.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod observed_tests {
+    use super::*;
+    use dsh_skill::SkillLoadStatus;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct Fixture(PathBuf);
+
+    impl Fixture {
+        fn new() -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let name = format!(
+                "dsh-plugin-observed-{}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            );
+            let path = std::env::temp_dir().join(name);
+            std::fs::create_dir(&path).unwrap();
+            Self(path.canonicalize().unwrap())
+        }
+
+        fn write(&self, relative: &str, body: &str) -> PathBuf {
+            let path = self.0.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, body).unwrap();
+            path
+        }
+
+        fn plugin(&self, relative: &str, id: &str, script: &str) -> PathBuf {
+            self.write(
+                &format!("{relative}/plugin.json"),
+                &json!({
+                    "id": id, "name": relative, "version": "1.0.0", "entry": "main.rhai",
+                    "tools": [{"name":"echo", "description":"fixture echo"}]
+                })
+                .to_string(),
+            );
+            self.write(&format!("{relative}/main.rhai"), script);
+            self.0.join(relative)
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let temp = std::env::temp_dir().canonicalize().unwrap();
+            assert_eq!(self.0.parent(), Some(temp.as_path()));
+            assert!(self
+                .0
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("dsh-plugin-observed-"));
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn missing_and_empty_roots_do_not_seed_plugins_or_start_watching() {
+        let fixture = Fixture::new();
+        let empty = fixture.0.join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        let registry = PluginRegistry::new(Arc::new(ToolRegistry::new()), fixture.0.join("meta"));
+        let mut events = Vec::new();
+        registry.discover_and_load_observed(&[empty, fixture.0.join("missing")], |event| {
+            events.push(event)
+        });
+        assert!(events.is_empty());
+        assert!(registry.ids().is_empty());
+        assert!(registry.tools.definitions().is_empty());
+        assert!(registry.watcher.inner.read().is_none());
+        assert!(!fixture.0.join("missing").exists());
+    }
+
+    #[test]
+    fn only_compiles_scripts_and_keeps_first_duplicate_mount() {
+        let fixture = Fixture::new();
+        let first = fixture.plugin(
+            "first/a",
+            "shared",
+            "throw \"must not execute\"; fn echo(args) { args }",
+        );
+        let duplicate = fixture.plugin("later/b", "shared", "fn echo(args) { args }");
+        let invalid = fixture.plugin("first/invalid", "invalid", "fn echo( {");
+        fixture.write("first/malformed/plugin.json", "{");
+        let registry = PluginRegistry::new(Arc::new(ToolRegistry::new()), fixture.0.join("meta"));
+        let mut events = Vec::new();
+        registry.discover_and_load_observed(
+            &[fixture.0.join("first"), fixture.0.join("later")],
+            |event| {
+                if let PluginLoadEvent::Loaded { id, .. } = &event {
+                    assert!(registry.ids().contains(id));
+                    assert!(registry
+                        .tools
+                        .definitions()
+                        .iter()
+                        .any(|tool| tool.plugin_id.as_ref() == Some(id)));
+                }
+                events.push(event);
+            },
+        );
+        assert_eq!(registry.ids(), ["shared"]);
+        assert_eq!(registry.plugins.read()["shared"].root, first);
+        assert!(events.iter().any(
+            |event| matches!(event, PluginLoadEvent::Skipped {path,..} if *path == duplicate)
+        ));
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, PluginLoadEvent::Error {path,..} if *path == invalid)));
+        assert!(events.iter().any(
+            |event| matches!(event, PluginLoadEvent::Error {path,..} if path.ends_with("malformed"))
+        ));
+        assert_eq!(registry.tools.definitions().len(), 1);
+        assert!(registry.watcher.inner.read().is_none());
+    }
+
+    #[test]
+    fn attached_skill_mounts_and_failures_are_observed() {
+        let fixture = Fixture::new();
+        let previous = fixture.write("initial.md", "---\nname: shared\n---\ninitial");
+        fixture.write(
+            "plugins/pack/plugin.json",
+            &json!({
+                "id":"pack", "name":"Pack", "version":"1.0.0", "entry":"absent.rhai",
+                "skills":["skills/shared", "missing.md"]
+            })
+            .to_string(),
+        );
+        let mounted = fixture.write(
+            "plugins/pack/skills/shared/SKILL.md",
+            "---\nname: shared\n---\nmounted",
+        );
+        let invalid = fixture.write(
+            "plugins/pack/skills/invalid/SKILL.md",
+            "---\nname: INVALID!\n---\nbody",
+        );
+        let skills = Arc::new(SkillCatalog::new(fixture.0.join("meta")));
+        skills
+            .mount_path(&previous, SkillSource::ProjectDsh)
+            .unwrap();
+        let registry = PluginRegistry::new(Arc::new(ToolRegistry::new()), fixture.0.join("meta"));
+        registry.attach_skills(skills.clone());
+        let mut events = Vec::new();
+        registry
+            .discover_and_load_observed(&[fixture.0.join("plugins")], |event| events.push(event));
+        assert_eq!(registry.ids(), ["pack"]);
+        assert_eq!(skills.get("shared").unwrap().summary.path, mounted);
+        assert!(events.iter().any(|event| matches!(event, PluginLoadEvent::Skill(e) if e.path == previous && e.status == SkillLoadStatus::Skipped)));
+        for path in [invalid, fixture.0.join("plugins/pack/missing.md")] {
+            assert!(events.iter().any(|event| matches!(event, PluginLoadEvent::Skill(e) if e.path == path && e.status == SkillLoadStatus::Error)));
+        }
+        assert!(events.iter().any(|event| matches!(event, PluginLoadEvent::Error {path,..} if path.ends_with("absent.rhai"))));
+        assert!(matches!(events.last(), Some(PluginLoadEvent::Loaded {id,..}) if id == "pack"));
     }
 }

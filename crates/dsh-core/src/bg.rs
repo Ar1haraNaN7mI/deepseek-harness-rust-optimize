@@ -78,7 +78,7 @@ impl BgTerminals {
                 let mut e = String::new();
                 let _ = err.read_to_string(&mut e);
                 if !e.is_empty() {
-                    buf.push_str("\n");
+                    buf.push('\n');
                     buf.push_str(&e);
                 }
             }
@@ -127,7 +127,14 @@ impl BgTerminals {
             .iter()
             .map(|(id, j)| {
                 let tail = j.output.lock().clone();
-                let tail: String = tail.chars().rev().take(800).collect::<String>().chars().rev().collect();
+                let tail: String = tail
+                    .chars()
+                    .rev()
+                    .take(800)
+                    .collect::<String>()
+                    .chars()
+                    .rev()
+                    .collect();
                 BgJobInfo {
                     id: *id,
                     command: j.command.clone(),
@@ -178,7 +185,15 @@ impl BgTerminals {
             let state = if j.running { "RUN" } else { "DONE" };
             lines.push(format!("  #{:<3} [{state}] {}", j.id, j.command));
             if !j.output_tail.trim().is_empty() {
-                for line in j.output_tail.lines().rev().take(4).collect::<Vec<_>>().into_iter().rev() {
+                for line in j
+                    .output_tail
+                    .lines()
+                    .rev()
+                    .take(4)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                {
                     lines.push(format!("      | {line}"));
                 }
             }

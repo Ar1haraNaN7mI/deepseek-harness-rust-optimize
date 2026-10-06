@@ -50,9 +50,7 @@ pub fn save_hooks(outer_home: &Path, cfg: &HooksConfig) -> Result<PathBuf> {
 impl HooksConfig {
     pub fn summary(&self) -> String {
         if self.hooks.is_empty() {
-            return format!(
-                "hooks: (none)\nconfig: ~/.dsh-rust/hooks.toml\nevents: session_start, turn_start, turn_end, tool_pre, tool_post"
-            );
+            return "hooks: (none)\nconfig: ~/.dsh-rust/hooks.toml\nevents: session_start, turn_start, turn_end, tool_pre, tool_post".to_string();
         }
         let mut lines = vec![format!("hooks ({}):", self.hooks.len())];
         for h in &self.hooks {
@@ -95,7 +93,11 @@ impl HooksConfig {
                 continue;
             }
             match run_hook_cmd(&h.command, cwd) {
-                Ok(s) => out.push(format!("hook `{}` ok: {}", h.name, s.chars().take(200).collect::<String>())),
+                Ok(s) => out.push(format!(
+                    "hook `{}` ok: {}",
+                    h.name,
+                    s.chars().take(200).collect::<String>()
+                )),
                 Err(e) => out.push(format!("hook `{}` err: {e}", h.name)),
             }
         }

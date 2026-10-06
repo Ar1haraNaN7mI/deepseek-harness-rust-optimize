@@ -5,6 +5,47 @@ model = "deepseek-v4-pro"
 thinking = true
 max_tokens = 8192
 temperature = 0.2
+# All supported presets use the OpenAI-compatible chat-completions protocol.
+# Use ollama, llama_cpp, vllm, sglang, litellm, localai, tgi, mlx_lm, or
+# lm_studio for local/open-source servers, and set base_url to that server's
+# /v1 endpoint when needed.
+backend = "deepseek"
+# Optional provider-specific JSON fields. These are merged additively into
+# /chat/completions requests; reserved fields remain controlled by dsh-rust.
+# Example for llama.cpp: extra_body = { cache_prompt = true }
+# extra_body = { cache_prompt = true }
+
+# Ordered OpenAI-compatible fallbacks. Each entry may set backend/model and
+# extra_body; the next endpoint is tried only before streaming begins.
+# [[llm.fallbacks]]
+# backend = "llama_cpp"
+# base_url = "http://127.0.0.1:8080/v1"
+# model = "qwen2.5-14b-instruct"
+# extra_body = { cache_prompt = true }
+# [[llm.fallbacks]]
+# backend = "ollama"
+# base_url = "http://127.0.0.1:11434/v1"
+# model = "qwen2.5:14b"
+# api_key_env = "LOCAL_FALLBACK_KEY"
+
+[llm.optimization]
+# auto selects the compact path only when the model is inferred as <70B.
+# Other values: small, standard, off.
+mode = "auto"
+# Set this for aliases whose parameter count is not in the model id.
+# parameter_count_b = 32.0
+small_max_steps = 12
+small_tool_budget = 14
+small_context_messages = 24
+small_context_chars = 48000
+small_tool_result_max_chars = 8000
+small_max_tokens = 4096
+small_temperature = 0.1
+small_thinking = false
+compact_tool_results = true
+small_tool_schema_chars = 2400
+compact_tool_schemas = true
+small_parallel_tool_calls = false
 
 [paths]
 # Outer layer root (user/home overlay). Empty = ~/.dsh-rust
@@ -26,6 +67,15 @@ deny_patterns = [
 max_steps_per_turn = 24
 tool_timeout_secs = 120
 tool_result_max_chars = 16000
+worker_heartbeat_secs = 15
+worker_stale_secs = 90
+approval_timeout_secs = 300
+scheduler_enabled = true
+scheduler_poll_secs = 5
+scheduler_max_concurrency = 1
+retry_max_attempts = 3
+retry_backoff_secs = 5
+retry_max_backoff_secs = 300
 skill_prompt_topk = 4
 plugin_prompt_topk = 3
 
@@ -44,3 +94,16 @@ enabled = true
 [tui]
 show_thinking = true
 sidebar = true
+
+[tui.startup]
+enabled = false
+sound = true
+# Fixed English narration and original synthesized effects, 0.0..1.0.
+volume = 0.35
+# Six phases total 13.8 seconds of motion, excluding interaction and voice tails.
+# Supported playback speed range: 0.25..3.0.
+speed = 1.0
+theme = "dark" # dark | light
+# Confirm three checkpoints with any left click, Enter, or Space.
+interactive = true
+reduced_motion = false

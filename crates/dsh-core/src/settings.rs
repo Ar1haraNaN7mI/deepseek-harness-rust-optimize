@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionSettings {
     #[serde(default)]
     pub permissions: PermissionMode,
@@ -52,6 +52,41 @@ pub struct SessionSettings {
     pub add_dirs: Vec<String>,
     #[serde(default)]
     pub bypass_hook_trust: bool,
+    /// Treat scoped security research as ordinary technical work in the
+    /// model-facing prompt. Runtime permissions and audit controls are
+    /// independent and remain authoritative.
+    #[serde(default = "default_true")]
+    pub security_research_mode: bool,
+}
+
+impl Default for SessionSettings {
+    fn default() -> Self {
+        Self {
+            permissions: PermissionMode::default(),
+            model: None,
+            thinking: None,
+            sidebar: None,
+            show_thinking: None,
+            personality: None,
+            vim_mode: false,
+            raw_mode: false,
+            memory_inject: true,
+            memory_generate: true,
+            statusline: Vec::new(),
+            title_fields: Vec::new(),
+            theme: None,
+            pet: None,
+            experimental: ExperimentalFlags::default(),
+            extra_read_dirs: Vec::new(),
+            keymap_overrides: std::collections::BTreeMap::new(),
+            approval: crate::policy::ApprovalPolicy::default(),
+            sandbox: crate::policy::SandboxMode::default(),
+            web_search_live: false,
+            add_dirs: Vec::new(),
+            bypass_hook_trust: false,
+            security_research_mode: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -62,13 +97,26 @@ pub struct ExperimentalFlags {
     pub prevent_sleep: bool,
 }
 
-pub const PERSONALITIES: &[&str] = &["default", "concise", "explanatory", "collaborative", "friendly"];
+pub const PERSONALITIES: &[&str] = &[
+    "default",
+    "concise",
+    "explanatory",
+    "collaborative",
+    "friendly",
+];
 
-pub const STATUSLINE_FIELDS: &[&str] =
-    &["model", "context", "limits", "git", "tokens", "session", "permissions", "cwd"];
+pub const STATUSLINE_FIELDS: &[&str] = &[
+    "model",
+    "context",
+    "limits",
+    "git",
+    "tokens",
+    "session",
+    "permissions",
+    "cwd",
+];
 
-pub const TITLE_FIELDS: &[&str] =
-    &["project", "status", "thread", "branch", "model", "progress"];
+pub const TITLE_FIELDS: &[&str] = &["project", "status", "thread", "branch", "model", "progress"];
 
 pub const THEMES: &[&str] = &["default", "monokai", "dracula", "github", "ansi", "none"];
 
@@ -114,8 +162,20 @@ pub fn personality_prompt(name: &str) -> &'static str {
     match name {
         "concise" => "Respond concisely. Prefer short paragraphs and bullet points.",
         "explanatory" => "Explain reasoning clearly. Teach as you go without being verbose.",
-        "collaborative" => "Collaborate: ask clarifying questions when ambiguous and propose options.",
+        "collaborative" => {
+            "Collaborate: ask clarifying questions when ambiguous and propose options."
+        }
         "friendly" => "Be warm and encouraging while remaining technically precise.",
         _ => "Be direct, precise, and helpful.",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_settings_enable_security_research_mode() {
+        assert!(SessionSettings::default().security_research_mode);
     }
 }

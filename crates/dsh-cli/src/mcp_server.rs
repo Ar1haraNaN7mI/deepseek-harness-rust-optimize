@@ -38,10 +38,7 @@ pub async fn run_mcp_server(runtime: Arc<Runtime>) -> Result<()> {
 
         // Notifications have no id (or null) and expect no response.
         let id = msg.get("id").cloned();
-        let method = msg
-            .get("method")
-            .and_then(|m| m.as_str())
-            .unwrap_or("");
+        let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
         let params = msg.get("params").cloned().unwrap_or(json!({}));
 
         match method {
@@ -86,10 +83,7 @@ pub async fn run_mcp_server(runtime: Arc<Runtime>) -> Result<()> {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                let arguments = params
-                    .get("arguments")
-                    .cloned()
-                    .unwrap_or(json!({}));
+                let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
                 if name.is_empty() {
                     write_error(&mut stdout, id, -32602, "missing tool name")?;
                     continue;

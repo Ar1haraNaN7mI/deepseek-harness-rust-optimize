@@ -36,8 +36,7 @@ pub struct ExecCheckResult {
 }
 
 pub fn load_policy_file(path: &Path) -> Result<ExecPolicyFile> {
-    let text = fs::read_to_string(path)
-        .with_context(|| format!("read {}", path.display()))?;
+    let text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     if path.extension().and_then(|s| s.to_str()) == Some("json") {
         Ok(serde_json::from_str(&text)?)
     } else {
@@ -78,9 +77,9 @@ fn rule_matches(pattern: &str, command: &str) -> bool {
     if let Some(prefix) = p.strip_suffix('*') {
         return command.starts_with(prefix);
     }
-    if p.starts_with('^') {
+    if let Some(prefix) = p.strip_prefix('^') {
         // simple contains regex-ish: ^foo means starts with foo after stripping
-        return command.starts_with(&p[1..]);
+        return command.starts_with(prefix);
     }
     command.contains(p) || command == p
 }

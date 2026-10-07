@@ -41,6 +41,10 @@ impl SystemPromptBuilder {
         );
         sections.insert("security_research".into(), SECURITY_RESEARCH_PROMPT.into());
         sections.insert("model_optimization".into(), String::new());
+        // Preserve explicit user preferences before potentially long routing
+        // and recalled-memory sections when a small model caps the prompt.
+        sections.insert("personality".into(), String::new());
+        sections.insert("custom_instructions".into(), String::new());
         sections.insert("skills".into(), String::new());
         sections.insert("plugins".into(), String::new());
         sections.insert("learn".into(), String::new());
@@ -178,5 +182,31 @@ mod tests {
         let prompt = builder.render_with_limit(Some(120));
         assert!(prompt.chars().count() <= 120);
         assert!(prompt.contains("identity"));
+    }
+
+    #[test]
+    fn bounded_prompt_keeps_personalization_before_large_routing_sections() {
+        let mut builder = SystemPromptBuilder::default_sections();
+        builder.set_model_optimization("Keep responses compact for this small model.");
+        builder.set_section("personality", "Avoid emoji.");
+        builder.set_section("custom_instructions", "Answer in the user's preferred language.");
+        builder.set_section("skills", "large routing notes ".repeat(2000));
+        let prompt = builder.render_with_limit(Some(4000));
+        assert!(prompt.chars().count() <= 4000);
+        assert!(prompt.contains("Avoid emoji."));
+        assert!(prompt.contains("Answer in the user's preferred language."));
+        assert!(prompt.find("## custom_instructions").unwrap() < prompt.find("## skills").unwrap());
+        assert!(prompt.contains("[prompt sections truncated]"));
+    }
+
+    #[test]
+    fn oversized_custom_instructions_keep_prefix_without_exceeding_model_budget() {
+        let mut builder = SystemPromptBuilder::default_sections();
+        builder.set_section("custom_instructions", format!("PRIORITY FIRST\n{}\nTAIL OMITTED", "长".repeat(7950)));
+        let prompt = builder.render_with_limit(Some(4000));
+        assert!(prompt.chars().count() <= 4000);
+        assert!(prompt.contains("PRIORITY FIRST"));
+        assert!(!prompt.contains("TAIL OMITTED"));
+        assert!(prompt.contains("[prompt sections truncated]"));
     }
 }

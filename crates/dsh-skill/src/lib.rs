@@ -12,4 +12,4 @@ pub use catalog::{
 };
 pub use meta::{auto_tag_and_examples, SkillMeta};
 pub use router::{prompt_topk_section, rank_skills, RankedSkill};
-pub use tools::register_skill_tools;
+pub use tools::{register_skill_tools, register_skill_tools_with_weights, LearnWeightProvider};

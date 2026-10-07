@@ -1,21 +1,35 @@
 use crate::catalog::SkillCatalog;
-use crate::router::{load_learn_weights, prompt_topk_section, rank_skills};
+use crate::router::{prompt_topk_section, rank_skills};
 use async_trait::async_trait;
 use dsh_tools::{ToolContext, ToolDefinition, ToolError, ToolHandler, ToolRegistry};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::sync::Arc;
 
+pub type LearnWeightProvider = Arc<dyn Fn() -> HashMap<String, f32> + Send + Sync>;
+
+/// Register without personalized routing. Hosts with a learning store should
+/// supply its live, preference-aware provider through the variant below.
 pub fn register_skill_tools(registry: &ToolRegistry, catalog: Arc<SkillCatalog>) {
+    register_skill_tools_with_weights(registry, catalog, Arc::new(HashMap::new));
+}
+
+pub fn register_skill_tools_with_weights(
+    registry: &ToolRegistry,
+    catalog: Arc<SkillCatalog>,
+    weights: LearnWeightProvider,
+) {
     registry.register(Arc::new(SkillListTool {
         catalog: catalog.clone(),
     }));
     registry.register(Arc::new(SkillSearchTool {
         catalog: catalog.clone(),
+        weights: weights.clone(),
     }));
     registry.register(Arc::new(SkillLoadTool {
         catalog: catalog.clone(),
     }));
-    registry.register(Arc::new(SkillRecommendTool { catalog }));
+    registry.register(Arc::new(SkillRecommendTool { catalog, weights }));
 }
 
 struct SkillListTool {
@@ -44,6 +58,7 @@ impl ToolHandler for SkillListTool {
 
 struct SkillSearchTool {
     catalog: Arc<SkillCatalog>,
+    weights: LearnWeightProvider,
 }
 
 #[async_trait]
@@ -63,13 +78,13 @@ impl ToolHandler for SkillSearchTool {
         )
     }
 
-    async fn call(&self, args: Value, ctx: &ToolContext) -> Result<String, ToolError> {
+    async fn call(&self, args: Value, _ctx: &ToolContext) -> Result<String, ToolError> {
         let query = args
             .get("query")
             .and_then(|v| v.as_str())
             .ok_or_else(|| ToolError::Message("query required".into()))?;
         let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
-        let weights = load_learn_weights(&ctx.outer_home.join("meta"));
+        let weights = (self.weights)();
         let ranked = rank_skills(&self.catalog, query, &weights, limit);
         let payload: Vec<Value> = ranked
             .iter()
@@ -96,6 +111,7 @@ impl ToolHandler for SkillSearchTool {
 
 struct SkillRecommendTool {
     catalog: Arc<SkillCatalog>,
+    weights: LearnWeightProvider,
 }
 
 #[async_trait]
@@ -115,13 +131,13 @@ impl ToolHandler for SkillRecommendTool {
         )
     }
 
-    async fn call(&self, args: Value, ctx: &ToolContext) -> Result<String, ToolError> {
+    async fn call(&self, args: Value, _ctx: &ToolContext) -> Result<String, ToolError> {
         let query = args
             .get("query")
             .and_then(|v| v.as_str())
             .ok_or_else(|| ToolError::Message("query required".into()))?;
         let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(3) as usize;
-        let weights = load_learn_weights(&ctx.outer_home.join("meta"));
+        let weights = (self.weights)();
         let ranked = rank_skills(&self.catalog, query, &weights, limit);
         Ok(prompt_topk_section(&ranked))
     }

@@ -17,6 +17,14 @@ const event = (sequence: number, type: string, payload = {}): Envelope => ({
   payload: { session_id: "session-1", ...payload },
 });
 describe("runtime stream projection", () => {
+  it("preserves reasoning separately so display preferences never mix it into the answer", () => {
+    let state = reduceEvent(undefined, event(1, "agent.reasoning_delta", {text:"consider "}));
+    state = reduceEvent(state, event(2, "agent.reasoning_delta", {text:"options"}));
+    state = reduceEvent(state, event(3, "agent.text_delta", {text:"answer"}));
+    expect(state.entries.map(({kind,text}) => ({kind,text}))).toEqual([
+      {kind:"reasoning",text:"consider options"}, {kind:"text",text:"answer"},
+    ]);
+  });
   it("keeps text and tool output in their real interleaved order and deduplicates records", () => {
     let state = reduceEvent(undefined, event(1, "agent.turn_started"));
     state = reduceEvent(state, event(2, "agent.text_delta", { text: "开始" }));

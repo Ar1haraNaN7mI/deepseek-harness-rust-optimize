@@ -1,5 +1,6 @@
 mod app_server;
 mod cloud;
+mod harness_settings;
 mod mcp_server;
 mod startup_inventory;
 mod startup_web;
@@ -21,8 +22,8 @@ use dsh_core::{
 };
 use dsh_fs::{FsService, PathGuard, PathGuardConfig};
 use dsh_llm::{DeepSeekClient, LlmBackend};
-use dsh_plugin::{install_plugin_from_path, register_plugin_tools, PluginRegistry};
-use dsh_skill::{register_skill_tools, SkillCatalog};
+use dsh_plugin::{install_plugin_from_path, register_plugin_tools_with_weights, PluginRegistry};
+use dsh_skill::{register_skill_tools_with_weights, SkillCatalog};
 use dsh_tools::ToolRegistry;
 use dsh_tui::{run_tui, TuiOptions};
 use serde::{Deserialize, Serialize};
@@ -2329,7 +2330,9 @@ fn boot_from_config(
             None
         },
     );
-    register_skill_tools(&tools, skills.clone());
+    let learning = runtime.learn.clone();
+    let weights: dsh_skill::LearnWeightProvider = Arc::new(move || learning.weights());
+    register_skill_tools_with_weights(&tools, skills.clone(), weights.clone());
     runtime.attach_skills(skills.clone());
 
     let plugins = Arc::new(PluginRegistry::new(
@@ -2341,7 +2344,7 @@ fn boot_from_config(
     seed_example_plugin(workspace, &runtime.outer_home.join("plugins"))?;
     plugins.discover_and_load(&roots);
     plugins.start_hot_reload();
-    register_plugin_tools(&tools, plugins.clone());
+    register_plugin_tools_with_weights(&tools, plugins.clone(), weights);
     runtime.attach_plugins(plugins.clone());
 
     let skill_names: Vec<String> = skills.list().into_iter().map(|s| s.name).collect();

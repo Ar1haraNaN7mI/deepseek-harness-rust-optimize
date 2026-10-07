@@ -9,7 +9,9 @@ const scoreDurations=[2.8,2.8,3.4,3.2,2.8,3];
 const ui = Object.fromEntries(['sound','theme','play','skip','settings','closeSettings','controlPanel','replay','interactive','speed','seek','currentTime','totalTime','phaseTitle','phaseEnglish','phaseNote','status','identityCard','identityName','identityId','cardName','cardId','identityLine','subtitleZh','subtitleEn','saveIdentity','profileStatus','connectionStatus','connectLocal','inventoryPanel','inventoryMessage','skillsCount','pluginsCount','skillsState','pluginsState','skillsList','pluginsList','inventoryIssues','cardMode'].map(id => [id,$(id)]));
 const canvas=$('scene'), pane=$('canvasPane'), stage=$('experience'), ctx=canvas.getContext('2d',{alpha:false});
 const chapters=[...document.querySelectorAll('.chapter')];
-const reducedMotion=matchMedia('(prefers-reduced-motion: reduce)');
+const motionMedia=matchMedia('(prefers-reduced-motion: reduce)');
+const motionOverride=new URLSearchParams(location.search).get('motion')==='reduce';
+const reducedMotion={get matches(){return motionOverride||motionMedia.matches;},addEventListener:(...args)=>motionMedia.addEventListener(...args)};
 const phases=[
  ['深潜协议','DEEP DIVE / HARNESS','一道信号，开启新的深度。','SYSTEM / STANDBY'],
  ['建立本地连接','LOCAL CONNECTION','连接当前 DSH 工作区。','ACCESS / REQUEST'],
@@ -252,6 +254,7 @@ ui.speed.addEventListener('change',()=>{speed=Number(ui.speed.value);lastFrame=p
 ui.seek.addEventListener('input',()=>{const t=Number(ui.seek.value);generation++;starting=false;stopAudio();cancelVoice();sequence.seek(t);local.cancelLoad();manualPause=true;refresh();});
 chapters.forEach((c,i)=>c.addEventListener('click',()=>jump(i)));
 document.addEventListener('keydown',e=>{
+ if(e.isComposing||e.keyCode===229)return;
  if(e.altKey||e.ctrlKey||e.metaKey)return;
  if(e.repeat){if(e.key==='Enter'||e.key===' ')e.preventDefault();return;}
  if(e.key==='Escape'){e.preventDefault();if(!ui.controlPanel.hidden)settings(false);else skip();return;}

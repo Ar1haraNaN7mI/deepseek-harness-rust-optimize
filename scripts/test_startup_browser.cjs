@@ -479,6 +479,11 @@ async function main() {
   assert.equal(embedded.messages[0].origin, 'http://127.0.0.1:8770');
   assert.equal(embedded.messages[0].message.source, 'dsh-startup');
   assert.equal(embedded.messages[0].message.channel, 'channel-test-12345678');
+  embedded.document.emit('keydown', { key: 'Escape', isComposing: true, target: embedded.element('identityName') });
+  assert.equal(embedded.messages.length, 1, 'cancelling IME composition must not skip the film');
+  const reducedEmbed = createHarness({ embedded: true, search: embedSearch + '&motion=reduce' }); await settle();
+  reducedEmbed.frame(1);
+  assert.equal(reducedEmbed.drawStates.at(-1).reducedMotion, true, 'the app accessibility preference must reach the isolated film');
   embedded.tap(); await settle(); embedded.element('skip').emit('click');
   assert.equal(embedded.messages.at(-1).message.type, 'skip');
   assert.equal(embedded.frames.size, 0, 'the embedded film stops rendering before handing over to Harness');

@@ -4,6 +4,7 @@ use crate::permissions::PermissionMode;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -20,6 +21,10 @@ pub struct SessionSettings {
     pub show_thinking: Option<bool>,
     #[serde(default)]
     pub personality: Option<String>,
+    #[serde(default)]
+    pub custom_instructions: String,
+    #[serde(default)]
+    pub characteristics: PersonalityCharacteristics,
     #[serde(default)]
     pub vim_mode: bool,
     #[serde(default)]
@@ -68,6 +73,8 @@ impl Default for SessionSettings {
             sidebar: None,
             show_thinking: None,
             personality: None,
+            custom_instructions: String::new(),
+            characteristics: PersonalityCharacteristics::default(),
             vim_mode: false,
             raw_mode: false,
             memory_inject: true,
@@ -86,6 +93,148 @@ impl Default for SessionSettings {
             bypass_hook_trust: false,
             security_research_mode: true,
         }
+    }
+}
+
+pub const CUSTOM_INSTRUCTIONS_MAX_CHARS: usize = 8000;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CharacteristicLevel {
+    #[default]
+    Default,
+    More,
+    Less,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PersonalityCharacteristics {
+    pub warmth: CharacteristicLevel,
+    pub enthusiasm: CharacteristicLevel,
+    pub headers_lists: CharacteristicLevel,
+    pub emoji: CharacteristicLevel,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SettingsPatch {
+    pub model: Option<String>,
+    pub thinking: Option<bool>,
+    pub personality: Option<String>,
+    pub custom_instructions: Option<String>,
+    pub characteristics: Option<PersonalityCharacteristics>,
+    pub memory_inject: Option<bool>,
+    pub memory_generate: Option<bool>,
+    pub approval: Option<crate::policy::ApprovalPolicy>,
+    pub sandbox: Option<crate::policy::SandboxMode>,
+    pub security_research_mode: Option<bool>,
+    pub sidebar: Option<bool>,
+    pub show_thinking: Option<bool>,
+}
+
+impl SettingsPatch {
+    pub(crate) fn apply(self, settings: &mut SessionSettings) -> Result<()> {
+        if let Some(model) = self.model {
+            let model = model.trim();
+            anyhow::ensure!(
+                !model.is_empty()
+                    && model.chars().count() <= 256
+                    && !model.chars().any(char::is_control),
+                "model must contain 1..256 printable characters"
+            );
+            settings.model = Some(model.to_string());
+        }
+        if let Some(name) = self.personality {
+            anyhow::ensure!(
+                PERSONALITIES.contains(&name.as_str()),
+                "Unsupported personality: {name}"
+            );
+            settings.personality = Some(name);
+        }
+        if let Some(value) = self.thinking {
+            settings.thinking = Some(value);
+        }
+        if let Some(value) = self.sidebar {
+            settings.sidebar = Some(value);
+        }
+        if let Some(value) = self.show_thinking {
+            settings.show_thinking = Some(value);
+        }
+        if let Some(value) = self.custom_instructions {
+            settings.custom_instructions = value;
+        }
+        if let Some(value) = self.characteristics {
+            settings.characteristics = value;
+        }
+        if let Some(value) = self.memory_inject {
+            settings.memory_inject = value;
+        }
+        if let Some(value) = self.memory_generate {
+            settings.memory_generate = value;
+        }
+        if let Some(value) = self.approval {
+            settings.approval = value;
+        }
+        if let Some(value) = self.security_research_mode {
+            settings.security_research_mode = value;
+        }
+        if let Some(value) = self.sandbox {
+            settings.sandbox = value;
+            settings.permissions = value.to_permission();
+        }
+        settings.validate()
+    }
+}
+
+impl SessionSettings {
+    pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.custom_instructions.chars().count() <= CUSTOM_INSTRUCTIONS_MAX_CHARS,
+            "Custom instructions must be at most {CUSTOM_INSTRUCTIONS_MAX_CHARS} characters"
+        );
+        anyhow::ensure!(
+            !self
+                .custom_instructions
+                .chars()
+                .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\r' | '\t')),
+            "Custom instructions contain unsupported control characters"
+        );
+        Ok(())
+    }
+
+    pub fn personalization_prompt(&self) -> String {
+        let mut lines =
+            vec![personality_prompt(self.personality.as_deref().unwrap_or("default")).to_string()];
+        for (level, more, less) in [
+            (
+                self.characteristics.warmth,
+                "Use a warmer, more considerate tone.",
+                "Use a matter-of-fact tone with minimal social phrasing.",
+            ),
+            (
+                self.characteristics.enthusiasm,
+                "Express more enthusiasm when appropriate.",
+                "Keep enthusiasm restrained and avoid exclamations.",
+            ),
+            (
+                self.characteristics.headers_lists,
+                "Use headings and lists more often when they aid readability.",
+                "Prefer connected prose with fewer headings and lists.",
+            ),
+            (
+                self.characteristics.emoji,
+                "Use occasional relevant emoji where suitable.",
+                "Avoid emoji.",
+            ),
+        ] {
+            match level {
+                CharacteristicLevel::More => lines.push(more.to_string()),
+                CharacteristicLevel::Less => lines.push(less.to_string()),
+                CharacteristicLevel::Default => (),
+            }
+        }
+        lines.join("\n")
     }
 }
 
@@ -151,11 +300,33 @@ fn default_true() -> bool {
 }
 
 pub fn save_settings(outer_home: &Path, settings: &SessionSettings) -> Result<PathBuf> {
+    settings.validate()?;
     fs::create_dir_all(outer_home)?;
     let path = settings_path(outer_home);
     let text = toml::to_string_pretty(settings).context("serialize settings")?;
-    fs::write(&path, text)?;
+    atomic_write(&path, text.as_bytes())?;
     Ok(path)
+}
+
+pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path.parent().context("Persistence path has no parent")?;
+    fs::create_dir_all(parent)?;
+    let temporary = parent.join(format!(".dsh-write-{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| -> Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temporary, path).with_context(|| format!("replace {}", path.display()))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 pub fn personality_prompt(name: &str) -> &'static str {
@@ -177,5 +348,36 @@ mod tests {
     #[test]
     fn new_settings_enable_security_research_mode() {
         assert!(SessionSettings::default().security_research_mode);
+    }
+
+    #[test]
+    fn older_settings_keep_defaults_and_characteristics_validate() {
+        let settings: SessionSettings =
+            toml::from_str("personality = 'concise'\nmemory_generate = false").unwrap();
+        assert_eq!(settings.custom_instructions, "");
+        assert_eq!(
+            settings.characteristics,
+            PersonalityCharacteristics::default()
+        );
+        assert!(settings.memory_inject);
+        assert!(!settings.memory_generate);
+        assert!(
+            serde_json::from_str::<SettingsPatch>(r#"{"characteristics":{"emoji":"many"}}"#)
+                .is_err()
+        );
+        assert!(serde_json::from_str::<SettingsPatch>(r#"{"pretend_setting":true}"#).is_err());
+    }
+
+    #[test]
+    fn custom_instruction_limit_counts_characters_and_rejects_controls() {
+        let mut settings = SessionSettings::default();
+        settings.custom_instructions = "语".repeat(CUSTOM_INSTRUCTIONS_MAX_CHARS);
+        assert!(settings.validate().is_ok());
+        settings.custom_instructions.push('a');
+        assert!(settings.validate().is_err());
+        settings.custom_instructions = "line\nnext\ttab".into();
+        assert!(settings.validate().is_ok());
+        settings.custom_instructions.push('\u{1b}');
+        assert!(settings.validate().is_err());
     }
 }

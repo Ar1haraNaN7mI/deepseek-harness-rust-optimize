@@ -1,11 +1,9 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
-import * as Dialog from "@radix-ui/react-dialog";
 import {
   ArrowUpIcon,
   CheckIcon,
   ChevronRightIcon,
   Cross1Icon,
-  GearIcon,
   HamburgerMenuIcon,
   MixerHorizontalIcon,
   PlusIcon,
@@ -14,21 +12,30 @@ import {
 } from "@radix-ui/react-icons";
 import Markdown from "react-markdown";
 import { Emblem } from "./Emblem";
-import { errorText, post } from "./api";
-import {
-  readPreferences,
-  savePreferences,
-  type WebPreferences,
-} from "./preferences";
+import { SettingsCenter } from "./SettingsCenter";
+import { useUiPreferences, useInterfaceEffects, shouldSend } from "./uiPreferences";
+import { unlockNotificationAudio } from "./notifications";
 import { useHarness } from "./useHarness";
-import type { Activity, Bootstrap, Profile, SessionEvent } from "./types";
+import type { Activity, Bootstrap, SessionEvent } from "./types";
 
-type Harness = ReturnType<typeof useHarness>;
 const labelSession = (name: string | null, id: string) =>
   name || `会话 ${id.slice(0, 8)}`;
+function Reasoning({ text }: { text: string }) {
+  return <details className="reasoning"><summary>模型思考</summary><pre>{text}</pre></details>;
+}
+function Companion({ working }: { working: boolean }) {
+  return <div className={`companion ${working ? "working" : ""}`} role="img" aria-label={working ? "猫咪正在陪你工作" : "猫咪正在休息"}>
+    <svg viewBox="0 0 100 66" aria-hidden="true">
+      <path className="cat-tail" d="M69 51c26 0 18-30 11-23" fill="none" stroke="currentColor" strokeWidth="7" strokeLinecap="round" />
+      <path d="M25 53V26L21 9l19 11q10-5 21 0L77 9l-4 20v24q-23 13-48 0Z" fill="currentColor" />
+      <g className="cat-face" fill="none" stroke="var(--paper)" strokeWidth="2.4" strokeLinecap="round"><path d="m34 38 6-2m19 0 6 2m-18 6 3 2 3-2"/><path d="m22 42 12 2m31 0 11-2"/></g>
+    </svg><span>{working ? "WITH YOU / WORKING" : "YOUR QUIET COMPANION"}</span>
+  </div>;
+}
 function ToolActivity({ item }: { item: Activity }) {
+  const [preferences] = useUiPreferences();
   return (
-    <details className="tool-activity">
+    <details key={String(preferences.showToolDetails)} className="tool-activity" open={preferences.showToolDetails || undefined}>
       <summary>
         <span
           className={`activity-dot ${item.finished ? (item.ok ? "ok" : "failed") : "working"}`}
@@ -69,6 +76,7 @@ function Message({ role, text }: { role: "user" | "assistant"; text: string }) {
   );
 }
 function Transcript({ events }: { events: SessionEvent[] }) {
+  const [preferences] = useUiPreferences();
   const results = new Map(
     events
       .filter((event) => event.type === "tool_result")
@@ -79,11 +87,10 @@ function Transcript({ events }: { events: SessionEvent[] }) {
       {events.map((event) => {
         if (event.type === "user_message" || event.type === "assistant_message")
           return (
-            <Message
-              key={event.id}
-              role={event.type === "user_message" ? "user" : "assistant"}
-              text={event.text || ""}
-            />
+            <div key={event.id}>
+              {event.reasoning && preferences.showThinking && <Reasoning text={event.reasoning} />}
+              <Message role={event.type === "user_message" ? "user" : "assistant"} text={event.text || ""} />
+            </div>
           );
         if (event.type === "tool_call") {
           const result = results.get(event.call_id);
@@ -214,222 +221,6 @@ function Catalog({ data, onClose }: { data: Bootstrap; onClose: () => void }) {
     </aside>
   );
 }
-function Settings({
-  harness,
-  onReplay,
-}: {
-  harness: Harness;
-  onReplay: () => void;
-}) {
-  const { data, setData } = harness;
-  const [open, setOpen] = useState(false);
-  const [username, setUsername] = useState("");
-  const [badge, setBadge] = useState("");
-  const [profileStatus, setProfileStatus] = useState("");
-  const [saving, setSaving] = useState(false);
-  const [preference, setPreference] = useState<WebPreferences>(readPreferences);
-  const [preferenceStatus, setPreferenceStatus] = useState("");
-  const [cliStatus, setCliStatus] = useState("");
-  const [cliSaving, setCliSaving] = useState(false);
-  useEffect(() => {
-    if (data) {
-      setUsername(data.profile.username);
-      setBadge(data.profile.badge_id);
-    }
-  }, [data?.profile.username, data?.profile.badge_id]);
-  async function saveIdentity(event: FormEvent) {
-    event.preventDefault();
-    if (!data) return;
-    setSaving(true);
-    setProfileStatus("");
-    try {
-      const profile = await post<Profile>("/api/profile", data.token, {
-        username,
-        badge_id: badge,
-      });
-      setData((previous) => previous && { ...previous, profile });
-      setProfileStatus("已保存到本机资料。");
-    } catch (failure) {
-      setProfileStatus(`保存失败：${errorText(failure)}`);
-    } finally {
-      setSaving(false);
-    }
-  }
-  function updatePreference(next: WebPreferences) {
-    try {
-      savePreferences(next);
-      setPreference(next);
-      setPreferenceStatus("已保存到当前浏览器。");
-    } catch {
-      setPreferenceStatus("浏览器未允许保存设置，请检查存储权限。");
-    }
-  }
-  async function setCli(enabled: boolean) {
-    if (!data) return;
-    setCliSaving(true);
-    setCliStatus("");
-    try {
-      await post("/api/startup-next", data.token, { enabled });
-      setData(
-        (previous) =>
-          previous && {
-            ...previous,
-            startup: { ...previous.startup, next_enabled: enabled },
-          },
-      );
-      setCliStatus(`下一次 CLI 启动将${enabled ? "播放" : "跳过"}动画。`);
-    } catch (failure) {
-      setCliStatus(errorText(failure));
-    } finally {
-      setCliSaving(false);
-    }
-  }
-  return (
-    <Dialog.Root open={open} onOpenChange={setOpen}>
-      <Dialog.Trigger asChild>
-        <button className="settings-trigger">
-          <GearIcon />
-          <span>偏好设置</span>
-          <span className="keycap"></span>
-        </button>
-      </Dialog.Trigger>
-      <Dialog.Portal>
-        <Dialog.Overlay className="dialog-overlay" />
-        <Dialog.Content className="settings-dialog">
-          <div className="dialog-top">
-            <span className="eyebrow">OPERATOR CONFIGURATION</span>
-            <Dialog.Close className="icon-button" aria-label="关闭设置">
-              <Cross1Icon />
-            </Dialog.Close>
-          </div>
-          <Dialog.Title>个人与启动设置</Dialog.Title>
-          <Dialog.Description>
-            本机身份资料与两个独立的启动入口。
-          </Dialog.Description>
-          <form onSubmit={saveIdentity} className="settings-section">
-            <h3>操作员身份</h3>
-            <div className="identity-inputs">
-              <label>
-                显示名称
-                <input
-                  required
-                  maxLength={32}
-                  value={username}
-                  onChange={(event) => setUsername(event.target.value)}
-                  autoComplete="nickname"
-                />
-              </label>
-              <label>
-                档案编号
-                <input
-                  required
-                  maxLength={32}
-                  value={badge}
-                  onChange={(event) => setBadge(event.target.value)}
-                />
-              </label>
-            </div>
-            <div className="inline-actions">
-              <button
-                className="solid-button"
-                disabled={saving || !data}
-                type="submit"
-              >
-                {saving ? "保存中…" : "保存资料"}
-              </button>
-              <span className="form-status" role="status">
-                {profileStatus}
-              </span>
-            </div>
-          </form>
-          <section className="settings-section">
-            <h3>
-              网页开场<span>WEB</span>
-            </h3>
-            <label className="setting-row">
-              <span>
-                每次打开网页时播放<small>默认关闭；动画需点击画面开始。</small>
-              </span>
-              <input
-                type="checkbox"
-                checked={preference.enabled ?? data?.startup.enabled ?? false}
-                onChange={(event) =>
-                  updatePreference({
-                    ...preference,
-                    enabled: event.target.checked,
-                  })
-                }
-              />
-            </label>
-            <label className="setting-row">
-              <span>
-                仅下一次打开网页时播放<small>使用一次后自动清除。</small>
-              </span>
-              <input
-                type="checkbox"
-                checked={preference.next}
-                onChange={(event) =>
-                  updatePreference({
-                    ...preference,
-                    next: event.target.checked,
-                  })
-                }
-              />
-            </label>
-            <div className="inline-actions">
-              <button
-                className="outline-button"
-                onClick={() => {
-                  setOpen(false);
-                  onReplay();
-                }}
-              >
-                现在体验开场 <ChevronRightIcon />
-              </button>
-              <span className="form-status" role="status">
-                {preferenceStatus}
-              </span>
-            </div>
-          </section>
-          <section className="settings-section">
-            <h3>
-              下一次终端开场<span>CLI</span>
-            </h3>
-            <p className="subtle">
-              当前：
-              {data?.startup.next_enabled == null
-                ? `跟随配置（${data?.startup.enabled ? "开启" : "关闭"}）`
-                : data.startup.next_enabled
-                  ? "下一次开启"
-                  : "下一次关闭"}
-              。此开关写入本机 CLI 一次性设置。
-            </p>
-            <div className="inline-actions">
-              <button
-                className="outline-button"
-                disabled={!data || cliSaving}
-                onClick={() => void setCli(true)}
-              >
-                下一次开启
-              </button>
-              <button
-                className="outline-button"
-                disabled={!data || cliSaving}
-                onClick={() => void setCli(false)}
-              >
-                下一次关闭
-              </button>
-            </div>
-            <p className="form-status" role="status">
-              {cliStatus}
-            </p>
-          </section>
-        </Dialog.Content>
-      </Dialog.Portal>
-    </Dialog.Root>
-  );
-}
-
 export function App({
   onReplay,
   initialData,
@@ -442,9 +233,31 @@ export function App({
   const [draft, setDraft] = useState("");
   const [sidebar, setSidebar] = useState(false);
   const [catalog, setCatalog] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [preferences] = useUiPreferences();
+  useInterfaceEffects();
   const scroll = useRef<HTMLDivElement>(null);
   const follow = useRef(true);
   const composer = useRef<HTMLTextAreaElement>(null);
+  useEffect(() => {
+    const keydown = (event: KeyboardEvent) => {
+      if (document.querySelector(".startup-gate") || event.isComposing || !(event.ctrlKey || event.metaKey)) return;
+      if (event.key === ",") { event.preventDefault(); setSettingsOpen((value) => !value); }
+      else if (!settingsOpen && event.shiftKey && event.key.toLowerCase() === "o") {
+        event.preventDefault(); void harness.createSession();
+      } else if (!settingsOpen && event.shiftKey && event.key.toLowerCase() === "l") {
+        event.preventDefault(); composer.current?.focus();
+      }
+    };
+    window.addEventListener("keydown", keydown);
+    window.addEventListener("pointerdown", unlockNotificationAudio);
+    window.addEventListener("keydown", unlockNotificationAudio);
+    return () => {
+      window.removeEventListener("keydown", keydown);
+      window.removeEventListener("pointerdown", unlockNotificationAudio);
+      window.removeEventListener("keydown", unlockNotificationAudio);
+    };
+  }, [settingsOpen, harness.createSession]);
   useEffect(() => {
     if (follow.current && scroll.current)
       scroll.current.scrollTop = scroll.current.scrollHeight;
@@ -537,6 +350,7 @@ export function App({
           )}
         </nav>
         <div className="sidebar-bottom">
+          {preferences.pet === "cat" && <Companion working={!!live?.running} />}
           <div className="operator">
             <span className="operator-avatar">
               {data?.profile.username.slice(0, 1).toUpperCase() || "—"}
@@ -547,7 +361,7 @@ export function App({
             </span>
             <span className={`status-dot ${!data ? "offline" : ""}`} />
           </div>
-          <Settings harness={harness} onReplay={onReplay} />
+          <SettingsCenter harness={harness} onReplay={onReplay} open={settingsOpen} onOpenChange={setSettingsOpen} />
         </div>
       </aside>
       <div className="workspace">
@@ -686,6 +500,8 @@ export function App({
             {live?.entries.map((item) =>
               item.kind === "text" ? (
                 <Message key={item.id} role="assistant" text={item.text} />
+              ) : item.kind === "reasoning" ? (
+                preferences.showThinking && <Reasoning key={item.id} text={item.text} />
               ) : (
                 <ToolActivity key={item.id} item={item} />
               ),
@@ -745,11 +561,7 @@ export function App({
                 value={draft}
                 onChange={(event) => setDraft(event.target.value)}
                 onKeyDown={(event) => {
-                  if (
-                    event.key === "Enter" &&
-                    !event.shiftKey &&
-                    !event.nativeEvent.isComposing
-                  ) {
+                  if (shouldSend({ ...event, isComposing: event.nativeEvent.isComposing }, preferences.sendKey)) {
                     event.preventDefault();
                     void submit(event);
                   }
@@ -787,7 +599,7 @@ export function App({
               </div>
             </form>
             <div className="composer-foot">
-              <span>Enter 发送 / Shift + Enter 换行</span>
+              <span>{preferences.sendKey === "enter" ? "Enter 发送 / Shift + Enter 换行" : "Ctrl / ⌘ + Enter 发送 / Enter 换行"}</span>
               <span>DSH · RUST RUNTIME</span>
             </div>
           </div>
@@ -796,6 +608,12 @@ export function App({
       {catalog && data && (
         <Catalog data={data} onClose={() => setCatalog(false)} />
       )}
+      <div className="notification-stack" aria-live="polite">
+        {harness.notices.map((notice) => <div className="harness-notice" key={notice.id}>
+          <button onClick={() => { harness.selectSession(notice.sessionId); harness.dismissNotice(notice.id); }}>{notice.title}<small>查看会话 ↗</small></button>
+          <button className="icon-button" aria-label="关闭通知" onClick={() => harness.dismissNotice(notice.id)}><Cross1Icon /></button>
+        </div>)}
+      </div>
     </div>
   );
 }

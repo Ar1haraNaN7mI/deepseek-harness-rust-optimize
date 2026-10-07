@@ -30,6 +30,7 @@ export type SessionEvent = {
   arguments?: unknown;
   ok?: boolean;
   content?: string;
+  reasoning?: string | null;
 };
 export type Session = {
   id: string;
@@ -85,7 +86,7 @@ export type Approval = {
 };
 export type Activity = {
   id: string;
-  kind: "text" | "tool";
+  kind: "text" | "tool" | "reasoning";
   text: string;
   name?: string;
   ok?: boolean;

@@ -28,13 +28,16 @@ static SESSION_TURNS: OnceLock<parking_lot::Mutex<SessionTurnKeys>> = OnceLock::
 /// Reserve a session before returning an accepted response. Retaining the Arc
 /// makes the runtime address unique for the entire lease, including task errors
 /// and cancellation. No parking_lot guard is held across an await.
-struct SessionTurnGuard {
+pub(crate) struct SessionTurnGuard {
     runtime: Arc<Runtime>,
     session_id: String,
 }
 
 impl SessionTurnGuard {
-    fn acquire(runtime: &Arc<Runtime>, session_id: &str) -> std::result::Result<Self, RpcFailure> {
+    pub(crate) fn acquire(
+        runtime: &Arc<Runtime>,
+        session_id: &str,
+    ) -> std::result::Result<Self, RpcFailure> {
         let key = (Arc::as_ptr(runtime) as usize, session_id.to_owned());
         if !SESSION_TURNS
             .get_or_init(Default::default)
@@ -76,14 +79,14 @@ struct RpcRequest {
 }
 
 #[derive(Debug)]
-struct RpcFailure {
-    code: i64,
-    message: String,
-    data: Option<Value>,
+pub(crate) struct RpcFailure {
+    pub(crate) code: i64,
+    pub(crate) message: String,
+    pub(crate) data: Option<Value>,
 }
 
 impl RpcFailure {
-    fn invalid_params(message: impl Into<String>) -> Self {
+    pub(crate) fn invalid_params(message: impl Into<String>) -> Self {
         Self {
             code: -32602,
             message: message.into(),
@@ -91,7 +94,7 @@ impl RpcFailure {
         }
     }
 
-    fn internal(err: impl Into<String>) -> Self {
+    pub(crate) fn internal(err: impl Into<String>) -> Self {
         Self {
             code: -32603,
             message: err.into(),
@@ -358,7 +361,7 @@ pub(crate) fn session_summaries(runtime: &Runtime, all: bool) -> Vec<Value> {
         .collect()
 }
 
-fn resolve_session(
+pub(crate) fn resolve_session(
     runtime: &Runtime,
     query: &str,
 ) -> std::result::Result<Arc<parking_lot::RwLock<dsh_core::Session>>, RpcFailure> {
@@ -390,6 +393,9 @@ async fn handle_request(
     method: &str,
     params: Value,
 ) -> std::result::Result<Value, RpcFailure> {
+    if let Some(result) = crate::harness_settings::dispatch(&runtime, method, &params) {
+        return result;
+    }
     match method {
         "initialize" => Ok(json!({
             "protocolVersion": "2.0",
@@ -402,7 +408,10 @@ async fn handle_request(
                 "tools": true,
                 "agent": true,
                 "cloud": true,
-                "llm": true
+                "llm": true,
+                "settings": true,
+                "memoryManagement": true,
+                "sessionManagement": true
             },
             "serverInfo": {
                 "name": "dsh-rust",
@@ -517,11 +526,11 @@ async fn handle_request(
                 .session_id
                 .clone()
                 .ok_or_else(|| RpcFailure::invalid_params("task has no session"))?;
+            let session_guard = SessionTurnGuard::acquire(&runtime, &session_id)?;
             let session = runtime
                 .sessions
                 .get_or_load(&session_id)
                 .map_err(|err| RpcFailure::internal(err.to_string()))?;
-            let session_guard = SessionTurnGuard::acquire(&runtime, &session_id)?;
             if session.read().goal_paused {
                 session.write().goal_paused = false;
                 runtime.sessions.persist_now(&session);
@@ -738,7 +747,13 @@ async fn handle_request(
                 .get("task_id")
                 .and_then(Value::as_str)
                 .map(str::to_string);
-            let session_guard = SessionTurnGuard::acquire(&runtime, &session.read().id)?;
+            let session_id = session.read().id.clone();
+            let session_guard = SessionTurnGuard::acquire(&runtime, &session_id)?;
+            // A delete may have completed between resolution and reservation.
+            let session = runtime
+                .sessions
+                .get_or_load(&session_id)
+                .map_err(|error| RpcFailure::invalid_params(error.to_string()))?;
             if wait {
                 run_agent(runtime, task_id, session, prompt, session_guard).await
             } else {

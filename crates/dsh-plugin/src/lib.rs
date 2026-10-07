@@ -13,4 +13,4 @@ pub use loader::{
 pub use meta::{auto_tag_plugin, PluginMeta};
 pub use registry::{PluginLoadEvent, PluginRegistry, RoutingSummary};
 pub use router::{prompt_topk_section, rank_plugins, RankedPlugin};
-pub use tools::register_plugin_tools;
+pub use tools::{register_plugin_tools, register_plugin_tools_with_weights, LearnWeightProvider};

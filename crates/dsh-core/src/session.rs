@@ -479,6 +479,9 @@ pub struct SessionStore {
     dir: Option<PathBuf>,
     dirty: RwLock<HashMap<String, Arc<RwLock<Session>>>>,
     flush_scheduled: AtomicBool,
+    // Serialize durable writes with management operations so a delayed flush
+    // cannot recreate a successfully deleted conversation.
+    io_lock: parking_lot::Mutex<()>,
 }
 
 impl Default for SessionStore {
@@ -494,6 +497,7 @@ impl SessionStore {
             dir: None,
             dirty: RwLock::new(HashMap::new()),
             flush_scheduled: AtomicBool::new(false),
+            io_lock: parking_lot::Mutex::new(()),
         }
     }
 
@@ -504,6 +508,7 @@ impl SessionStore {
             dir: Some(dir),
             dirty: RwLock::new(HashMap::new()),
             flush_scheduled: AtomicBool::new(false),
+            io_lock: parking_lot::Mutex::new(()),
         }
     }
 
@@ -529,6 +534,10 @@ impl SessionStore {
     }
 
     pub fn get_or_load(&self, id: &str) -> anyhow::Result<Arc<RwLock<Session>>> {
+        if let Some(s) = self.get(id) {
+            return Ok(s);
+        }
+        let _io = self.io_lock.lock();
         if let Some(s) = self.get(id) {
             return Ok(s);
         }
@@ -563,10 +572,19 @@ impl SessionStore {
     }
 
     pub fn persist_now_result(&self, session: &Arc<RwLock<Session>>) -> anyhow::Result<()> {
+        let _io = self.io_lock.lock();
         let Some(dir) = &self.dir else {
             return Ok(());
         };
         let snap = session.read().clone();
+        if !self
+            .sessions
+            .read()
+            .get(&snap.id)
+            .is_some_and(|current| Arc::ptr_eq(current, session))
+        {
+            anyhow::bail!("session is no longer in this store: {}", snap.id);
+        }
         let path = dir.join(format!("{}.json", snap.id));
         snap.save_json(&path)?;
         self.dirty.write().remove(&snap.id);
@@ -589,22 +607,36 @@ impl SessionStore {
     }
 
     pub fn list_ids(&self) -> Vec<String> {
+        self.try_list_ids().unwrap_or_else(|_| {
+            let mut ids: Vec<_> = self.sessions.read().keys().cloned().collect();
+            ids.sort();
+            ids
+        })
+    }
+
+    /// Management callers must not mistake an unreadable store for an empty one.
+    pub fn try_list_ids(&self) -> anyhow::Result<Vec<String>> {
         let mut ids: Vec<_> = self.sessions.read().keys().cloned().collect();
         if let Some(dir) = &self.dir {
-            if let Ok(entries) = fs::read_dir(dir) {
-                for e in entries.flatten() {
-                    if e.path().extension().and_then(|s| s.to_str()) == Some("json") {
-                        if let Some(stem) = e.path().file_stem().and_then(|s| s.to_str()) {
-                            if !ids.iter().any(|i| i == stem) {
-                                ids.push(stem.to_string());
+            match fs::read_dir(dir) {
+                Ok(entries) => {
+                    for entry in entries {
+                        let e = entry?;
+                        if e.path().extension().and_then(|s| s.to_str()) == Some("json") {
+                            if let Some(stem) = e.path().file_stem().and_then(|s| s.to_str()) {
+                                if !ids.iter().any(|i| i == stem) {
+                                    ids.push(stem.to_string());
+                                }
                             }
                         }
                     }
                 }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
             }
         }
         ids.sort();
-        ids
+        Ok(ids)
     }
 
     pub fn resolve(&self, query: &str) -> anyhow::Result<Arc<RwLock<Session>>> {
@@ -652,29 +684,53 @@ impl SessionStore {
 
     pub fn set_archived(&self, id: &str, archived: bool) -> anyhow::Result<()> {
         let session = self.resolve(id)?;
-        session.write().archived = archived;
-        self.persist_now(&session);
-        Ok(())
+        self.commit_change(&session, |snapshot| snapshot.archived = archived)
     }
 
     pub fn rename(&self, id: &str, name: &str) -> anyhow::Result<()> {
         let session = self.resolve(id)?;
-        session.write().rename(name);
-        self.persist_now(&session);
+        self.commit_change(&session, |snapshot| snapshot.rename(name))
+    }
+
+    fn commit_change(
+        &self,
+        session: &Arc<RwLock<Session>>,
+        change: impl FnOnce(&mut Session),
+    ) -> anyhow::Result<()> {
+        let _io = self.io_lock.lock();
+        let mut current = session.write();
+        if !self
+            .sessions
+            .read()
+            .get(&current.id)
+            .is_some_and(|entry| Arc::ptr_eq(entry, session))
+        {
+            anyhow::bail!("session is no longer in this store: {}", current.id);
+        }
+        let mut next = current.clone();
+        change(&mut next);
+        if let Some(dir) = &self.dir {
+            next.save_json(&dir.join(format!("{}.json", next.id)))?;
+        }
+        self.dirty.write().remove(&next.id);
+        *current = next;
         Ok(())
     }
 
     pub fn delete(&self, id: &str) -> anyhow::Result<()> {
         let session = self.resolve(id)?;
+        let _io = self.io_lock.lock();
         let real_id = session.read().id.clone();
-        self.sessions.write().remove(&real_id);
-        self.dirty.write().remove(&real_id);
         if let Some(dir) = &self.dir {
             let path = dir.join(format!("{real_id}.json"));
-            if path.exists() {
-                fs::remove_file(&path)?;
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
             }
         }
+        self.sessions.write().remove(&real_id);
+        self.dirty.write().remove(&real_id);
         Ok(())
     }
 
@@ -713,6 +769,68 @@ impl SessionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct ManagementFixture(PathBuf);
+
+    impl ManagementFixture {
+        fn new() -> Self {
+            let path =
+                std::env::temp_dir().join(format!("dsh-session-management-{}", Uuid::new_v4()));
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for ManagementFixture {
+        fn drop(&mut self) {
+            let temp = std::env::temp_dir().canonicalize().unwrap();
+            let path = self.0.canonicalize().unwrap();
+            assert_eq!(path.parent(), Some(temp.as_path()));
+            assert!(path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("dsh-session-management-"));
+            fs::remove_dir_all(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn management_disk_errors_do_not_change_in_memory_session() {
+        let fixture = ManagementFixture::new();
+        let store = SessionStore::with_dir(fixture.0.clone());
+        let session = store.create();
+        let id = session.read().id.clone();
+        let path = fixture.0.join(format!("{id}.json"));
+        let original = fixture.0.join("original.backup");
+        fs::rename(&path, &original).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(store.set_archived(&id, true).is_err());
+        assert!(!session.read().archived);
+        assert!(store.rename(&id, "new name").is_err());
+        assert!(session.read().name.is_none());
+        assert!(store.delete(&id).is_err());
+        assert!(store.get(&id).is_some());
+        fs::remove_dir(&path).unwrap();
+        fs::rename(&original, &path).unwrap();
+        store.set_archived(&id, true).unwrap();
+        assert!(Session::load_json(&path).unwrap().archived);
+    }
+
+    #[test]
+    fn deleted_session_cannot_be_recreated_by_a_delayed_flush() {
+        let fixture = ManagementFixture::new();
+        let store = SessionStore::with_dir(fixture.0.clone());
+        let session = store.create();
+        let id = session.read().id.clone();
+        store.mark_dirty(&session);
+        store.delete(&id).unwrap();
+        store.mark_dirty(&session);
+        store.flush_dirty();
+        assert!(store.persist_now_result(&session).is_err());
+        assert!(!fixture.0.join(format!("{id}.json")).exists());
+        assert!(store.get(&id).is_none());
+    }
 
     #[test]
     fn old_session_json_gets_schema_default() {

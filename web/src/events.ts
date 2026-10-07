@@ -71,8 +71,13 @@ export function reduceEvent(
         next.entries.push({ id: `text-${event.sequence}`, kind: "text", text });
       return { ...next, running: true, status: "正在回复" };
     }
-    case "agent.reasoning_delta":
+    case "agent.reasoning_delta": {
+      const text = typeof payload.text === "string" ? payload.text : "";
+      const last = next.entries.at(-1);
+      if (last?.kind === "reasoning") next.entries[next.entries.length - 1] = { ...last, text: last.text + text };
+      else if (text) next.entries.push({ id: `reasoning-${event.sequence}`, kind: "reasoning", text });
       return { ...next, running: true, status: "模型正在处理" };
+    }
     case "agent.tool_started":
       next.entries.push({
         id: String(payload.call_id),

@@ -97,6 +97,7 @@ def main():
     parser.add_argument("--output", type=Path, default=Path("target/harness-web-qa"))
     parser.add_argument("--port", type=int, default=0)
     parser.add_argument("--serve", action="store_true", help="Keep the isolated tested host alive until Ctrl+C")
+    parser.add_argument("--settings", action="store_true", help="Verify settings persistence, model personalization, and conversation data controls")
     args = parser.parse_args()
     binary = args.binary.resolve(strict=True)
     output = args.output.resolve()
@@ -194,6 +195,25 @@ def main():
             assert status == 200 and "error" not in value, value
             return value["result"]
 
+        if args.settings:
+            settings = rpc("settings/get")
+            assert "local-fixture-key" not in json.dumps(settings)
+            assert settings["account"]["kind"] == "local"
+            saved = rpc("settings/update", {"patch": {"custom_instructions": "DSH_SETTINGS_QA_CONTEXT", "personality": "concise", "memory_inject": False, "memory_generate": False}})
+            assert saved["settings"]["custom_instructions"] == "DSH_SETTINGS_QA_CONTEXT"
+            assert "DSH_SETTINGS_QA_CONTEXT" in (outer / "settings.toml").read_text(encoding="utf-8")
+            assert rpc("settings/get")["settings"]["memory_inject"] is False
+            _, invalid = request("POST", "/api/harness/rpc", {"method": "settings/update", "params": {"patch": {"unknown_field": True}}})
+            assert "error" in invalid, invalid
+            assert request("POST", "/api/harness/rpc", {"method": "settings/update", "params": {"patch": {"personality": "friendly"}}}, authenticated=False)[0] == 403
+            assert rpc("memory/list")["total"] == 0
+            assert rpc("memory/clear")["deleted_episodes"] == 0
+            scratch_ids = [rpc("sessions/create", {"name": f"Disposable settings QA {n}"})["session"]["id"] for n in (1, 2)]
+            assert rpc("sessions/archive_all")["count"] == 2
+            assert not rpc("sessions/list")["sessions"]
+            assert rpc("sessions/delete_all")["count"] == 2
+            assert not any((outer / "sessions" / f"{sid}.json").exists() for sid in scratch_ids)
+
         session_id = rpc("sessions/create", {"name": "HTTP integration test"})["session"]["id"]
         cursor = bootstrap["latest_sequence"]
         received = []
@@ -223,6 +243,23 @@ def main():
         persisted = json.loads((outer / "sessions" / f"{session_id}.json").read_text(encoding="utf-8"))
         assert len([event for event in persisted["events"] if event["type"] == "assistant_message"]) == 2
         assert "Fixture reply: e2e turn 1" in json.dumps(mock.requests[1])
+        if args.settings:
+            assert "DSH_SETTINGS_QA_CONTEXT" in json.dumps(mock.requests[0])
+            assert rpc("sessions/rename", {"id": session_id, "name": "Settings integration verified"})
+            assert rpc("sessions/archive", {"id": session_id})["archived"] is True
+            assert not rpc("sessions/list")["sessions"]
+            assert rpc("sessions/unarchive", {"id": session_id})["archived"] is False
+            for export_format in ("json", "markdown"):
+                exported = rpc("sessions/export", {"id": session_id, "format": export_format})
+                assert exported["session_count"] == 1 and "Fixture reply" in exported["content"]
+                assert "local-fixture-key" not in exported["content"]
+            metrics = rpc("settings/get")
+            assert metrics["usage"]["assistant_message_count"] == 2
+            assert metrics["storage"]["session_bytes"] > 0
+            assert metrics["usage"]["token_usage_available"] is False
+            disposable = rpc("sessions/create")["session"]["id"]
+            assert rpc("sessions/delete", {"id": disposable})["deleted"]
+            assert not (outer / "sessions" / f"{disposable}.json").exists()
         assert request("POST", "/api/profile", {"username": "OPERATOR-QA", "badge_id": "DSH-QA"})[0] == 200
         assert request("POST", "/api/startup-next", {"enabled": True})[0] == 200
         assert request("GET", "/api/harness/bootstrap")[1]["startup"]["next_enabled"] is True
@@ -242,8 +279,10 @@ def main():
             assert request("GET", path)[0] == 403, path
         report = {"passed": True, "url": f"http://127.0.0.1:{port}/", "session_id": session_id, "mock_requests": len(mock.requests),
                   "stream_events": len(received), "fixture_workspace": str(workspace), "next_cli_marker_unconsumed": True,
-                  "installed_assets": args.installed_assets,
+                  "installed_assets": args.installed_assets, "settings_checked": args.settings,
                   "checks": ["token", "actual inventory", "two streamed turns", "event pagination", "persisted history", "profile", "next CLI", "static traversal"]}
+        if args.settings:
+            report["checks"] += ["settings persistence and validation", "custom instructions reach model", "memory management", "archive/unarchive", "rename", "single and bulk delete", "export JSON/Markdown", "actual storage and usage"]
         (output / "report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
         print(json.dumps(report), flush=True)
         if args.serve:

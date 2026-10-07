@@ -456,6 +456,21 @@ async fn run_turn_inner(
             model_policy.tool_result_max_chars = Some(max_chars.min(configured_max).max(1));
         }
     }
+    // Adaptive values are defaults. Explicit DSH settings must remain effective
+    // for small models as well. Read here, not in model_profile(), which is also
+    // called while update_settings owns the settings write lock.
+    {
+        let settings = runtime.settings.read();
+        if settings.temperature.is_some() {
+            model_policy.temperature = Some(base_llm_config.temperature);
+        }
+        if settings.thinking.is_some() {
+            model_policy.thinking = Some(base_llm_config.thinking);
+        }
+        if settings.max_tokens.is_some() {
+            model_policy.max_tokens = Some(base_llm_config.max_tokens);
+        }
+    }
 
     // agent/pre-step analogue: one-pass cognition before first model request.
     let thought_notes = prepare_turn_cognition(&runtime, &user_text, model_profile.small_model);
@@ -858,7 +873,7 @@ async fn run_turn_inner(
             Some(&run_id),
         );
 
-            if runtime.config.learn.enabled {
+            if runtime.config.learn.enabled && runtime.settings.read().memory_generate {
                 let note = if name == "skill_load" {
                     format!(
                         "loaded skill {}",
@@ -1038,6 +1053,7 @@ fn prepare_turn_cognition(
     user_text: &str,
     small_model: bool,
 ) -> Vec<(usize, String)> {
+    runtime.sync_personalization();
     let skill_topk = if small_model {
         runtime.config.agent.skill_prompt_topk.min(2)
     } else {
@@ -1080,9 +1096,7 @@ fn prepare_turn_cognition(
     }
 
     let mut sections: HashMap<&str, String> = HashMap::new();
-    if runtime.config.learn.enabled {
-        sections.insert("learn", runtime.learn.prompt_section(user_text));
-    }
+    sections.insert("learn", runtime.learn.prompt_section(user_text));
 
     // Single-pass rank after CTM boosts (was double-ranked).
     if let Some(skills) = runtime.skills.read().clone() {
@@ -1170,6 +1184,9 @@ impl Drop for ActiveAgentGuard {
 }
 
 fn record_task_feedback(runtime: &Runtime, task_id: &str, run_id: &str, ok: bool, note: &str) {
+    if !runtime.config.learn.enabled || !runtime.settings.read().memory_generate {
+        return;
+    }
     let Some(task) = runtime.tasks.task(task_id) else {
         return;
     };
@@ -1238,6 +1255,30 @@ async fn execute_tool_with_timeout(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cognition_drops_stale_memory_when_existing_tui_toggle_changes() {
+        let fixture = crate::tests::RuntimeFixture::new(crate::SessionSettings::default(), true);
+        let runtime = &fixture.runtime;
+        runtime
+            .learn
+            .record_tool_outcome("fixture task", "shell", true, "private learned note");
+        prepare_turn_cognition(runtime, "fixture task", false);
+        assert!(runtime
+            .prompt
+            .read()
+            .render()
+            .contains("private learned note"));
+        runtime.settings.write().memory_inject = false;
+        prepare_turn_cognition(runtime, "fixture task", false);
+        assert!(!runtime
+            .prompt
+            .read()
+            .render()
+            .contains("private learned note"));
+        assert!(runtime.learn.weights().is_empty());
+        assert!(runtime.learn.recall("fixture task", 5).is_empty());
+    }
 
     #[test]
     fn agent_event_protocol_projection_keeps_correlations() {

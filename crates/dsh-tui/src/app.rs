@@ -264,7 +264,7 @@ pub async fn run_tui(runtime: Arc<Runtime>, opts: TuiOptions) -> Result<()> {
     let mut seed_lines = vec![
         UiLine {
             kind: CellKind::System,
-            text: "Welcome to dsh-rust — DeepSeek coding agent (Codex-style TUI)".into(),
+            text: "Welcome to DSH — your local coding agent".into(),
             header: Some("dsh".into()),
             running: false,
             ok: None,

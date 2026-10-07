@@ -28,6 +28,7 @@ uuid.workspace = true
 chrono.workspace = true
 sha2.workspace = true
 hex.workspace = true
+reqwest.workspace = true
 dsh-core.workspace = true
 dsh-app-client.workspace = true
 dsh-protocol.workspace = true

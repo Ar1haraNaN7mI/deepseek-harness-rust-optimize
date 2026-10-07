@@ -489,6 +489,7 @@ dependencies = [
  "dsh-tui",
  "hex",
  "parking_lot",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2",

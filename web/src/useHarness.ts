@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ApiError, bootstrap, errorText, isAbort, rpc } from "./api";
+import { deliverNotice, noticeForEvent, type HarnessNotice } from "./notifications";
 import {
   acceptTurn,
   beginTurn,
@@ -12,6 +13,7 @@ import type {
   Approval,
   Bootstrap,
   EventBatch,
+  Envelope,
   LiveTurn,
   SessionResult,
   SessionSummary,
@@ -30,8 +32,11 @@ export function useHarness(initialData?: Bootstrap) {
   const [loadingSession, setLoadingSession] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [retry, setRetry] = useState(0);
+  const [notices, setNotices] = useState<HarnessNotice[]>([]);
   const mounted = useRef(false);
   const requestSequence = useRef(0);
+  const snapshotVersions = useRef(new Map<string, number>());
+  const completedTurns = useRef(new Map<string, { sequence: number; requestId?: number }>());
   const liveRef = useRef(live);
   liveRef.current = live;
   const mutateLive = useCallback(
@@ -43,9 +48,33 @@ export function useHarness(initialData?: Bootstrap) {
     },
     [],
   );
+  const beginSnapshot = useCallback((id: string) => {
+    const version = (snapshotVersions.current.get(id) || 0) + 1;
+    snapshotVersions.current.set(id, version);
+    return version;
+  }, []);
+  const applySnapshot = useCallback((id: string, result: SessionResult, version: number) => {
+    if (snapshotVersions.current.get(id) !== version) return false;
+    setSnapshots((previous) => ({ ...previous, [id]: result }));
+    mutateLive((previous) => {
+      const current = previous[id];
+      const completed = completedTurns.current.get(id);
+      // A newer selection fetch may supersede completion reconciliation. It
+      // must also retire that completed stream, but never a new local turn.
+      if (current && !current.running && completed &&
+          current.lastSequence === completed.sequence && current.requestId === completed.requestId)
+        return { ...previous, [id]: { ...current, entries: [], prompt: undefined } };
+      if (!current && isRunningState(result.state))
+        return { ...previous, [id]: { ...emptyTurn(), running: true, taskId: result.task_id, status: "运行时正在执行" } };
+      return previous;
+    });
+    return true;
+  }, [mutateLive]);
 
   useEffect(() => {
     mounted.current = true;
+    for (const id of snapshotVersions.current.keys()) beginSnapshot(id);
+    completedTurns.current.clear();
     const abort = new AbortController();
     let alive = true;
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -83,8 +112,42 @@ export function useHarness(initialData?: Bootstrap) {
           if (alive) setApprovals(result.approvals);
         }
         await refreshApprovals();
+        let approvalsDirty = false;
+        const pendingFinished = new Map<string, Envelope>();
+        const showNotice = (notice: HarnessNotice | undefined) => {
+          if (!notice) return;
+          deliverNotice(notice);
+          setNotices((previous) => [...previous.filter((item) => item.id !== notice.id), notice].slice(-3));
+        };
+        async function reconcile() {
+          if (approvalsDirty) { await refreshApprovals(); approvalsDirty = false; }
+          if (!pendingFinished.size || !alive) return;
+          const list = await rpc<{ sessions: SessionSummary[] }>(value.token, "sessions/list", {}, abort.signal);
+          if (!alive) return;
+          setSessions(list.sessions);
+          for (const [id, event] of pendingFinished) {
+            if (!list.sessions.some((session) => session.id === id)) {
+              beginSnapshot(id);
+              completedTurns.current.delete(id);
+              pendingFinished.delete(id);
+              continue;
+            }
+            const version = beginSnapshot(id);
+            const snapshot = await rpc<SessionResult>(value.token, "sessions/get", { id }, abort.signal);
+            if (!alive) return;
+            if (!applySnapshot(id, snapshot, version)) continue;
+            if (snapshot.task_id === event.task_id || !event.task_id)
+              showNotice(noticeForEvent(event, snapshot.state));
+            pendingFinished.delete(id);
+          }
+        }
         while (alive) {
           try {
+            // Retry durable state reconciliation even if no new event arrives.
+            // The event cursor remains monotonic, so notifications are not replayed.
+            await reconcile();
+            if (!alive) break;
+            setEventError("");
             const batch = await rpc<EventBatch>(
               value.token,
               "events/wait",
@@ -92,10 +155,20 @@ export function useHarness(initialData?: Bootstrap) {
               abort.signal,
             );
             if (!alive) break;
+            const previousCursor = cursor;
             cursor = consumedCursor(cursor, batch.events);
+            for (const event of batch.events) {
+              if (event.sequence <= previousCursor) continue;
+              showNotice(noticeForEvent(event));
+              const id = event.payload.session_id;
+              if (typeof id !== "string") continue;
+              if (["agent.done", "agent.server_error"].includes(event.event_type)) {
+                pendingFinished.set(id, event);
+                approvalsDirty = true;
+              }
+              if (event.event_type === "agent.approval_needed") approvalsDirty = true;
+            }
             setEventError("");
-            const finished = new Map<string, number>();
-            let approvalChanged = false;
             mutateLive((previous) => {
               const next = { ...previous };
               for (const event of batch.events) {
@@ -106,46 +179,14 @@ export function useHarness(initialData?: Bootstrap) {
                 )
                   continue;
                 next[id] = reduceEvent(next[id], event);
-                if (
-                  ["agent.done", "agent.server_error"].includes(
-                    event.event_type,
-                  )
-                )
-                  finished.set(id, event.sequence);
-                if (event.event_type === "agent.approval_needed")
-                  approvalChanged = true;
+                if (["agent.done", "agent.server_error"].includes(event.event_type)) {
+                  beginSnapshot(id); // Invalidate reads started before completion.
+                  completedTurns.current.set(id, { sequence: event.sequence, requestId: next[id].requestId });
+                }
               }
               return next;
             });
-            if (approvalChanged || finished.size) await refreshApprovals();
-            for (const [id, endSequence] of finished) {
-              const snapshot = await rpc<SessionResult>(
-                value.token,
-                "sessions/get",
-                { id },
-                abort.signal,
-              );
-              if (!alive) break;
-              // A later turn may already be streaming; never erase its live data.
-              setSnapshots((previous) => ({ ...previous, [id]: snapshot }));
-              mutateLive((previous) =>
-                previous[id]?.lastSequence === endSequence
-                  ? {
-                      ...previous,
-                      [id]: { ...previous[id], entries: [], prompt: undefined },
-                    }
-                  : previous,
-              );
-            }
-            if (finished.size) {
-              const list = await rpc<{ sessions: SessionSummary[] }>(
-                value.token,
-                "sessions/list",
-                {},
-                abort.signal,
-              );
-              if (alive) setSessions(list.sessions);
-            }
+            await reconcile();
           } catch (failure) {
             if (!alive || isAbort(failure)) break;
             if (failure instanceof ApiError && failure.code === 403) {
@@ -180,11 +221,12 @@ export function useHarness(initialData?: Bootstrap) {
       abort.abort();
       clearTimeout(timer);
     };
-  }, [retry, mutateLive, initialData]);
+  }, [retry, mutateLive, beginSnapshot, applySnapshot, initialData]);
 
   useEffect(() => {
     if (!data || !currentId) return;
     const abort = new AbortController();
+    const version = beginSnapshot(currentId);
     setLoadingSession(true);
     setError("");
     rpc<SessionResult>(
@@ -195,30 +237,17 @@ export function useHarness(initialData?: Bootstrap) {
     )
       .then((result) => {
         if (!abort.signal.aborted) {
-          setSnapshots((previous) => ({ ...previous, [currentId]: result }));
-          mutateLive((previous) =>
-            !previous[currentId] && isRunningState(result.state)
-              ? {
-                  ...previous,
-                  [currentId]: {
-                    ...emptyTurn(),
-                    running: true,
-                    taskId: result.task_id,
-                    status: "运行时正在执行",
-                  },
-                }
-              : previous,
-          );
+          applySnapshot(currentId, result, version);
         }
       })
       .catch((failure) => {
-        if (!isAbort(failure)) setError(errorText(failure));
+        if (!isAbort(failure) && snapshotVersions.current.get(currentId) === version) setError(errorText(failure));
       })
       .finally(() => {
         if (!abort.signal.aborted) setLoadingSession(false);
       });
     return () => abort.abort();
-  }, [currentId, data?.token, mutateLive]);
+  }, [currentId, data?.token, beginSnapshot, applySnapshot]);
 
   async function createSession() {
     if (!data || submitting) return;
@@ -357,6 +386,22 @@ export function useHarness(initialData?: Bootstrap) {
       setError(errorText(failure));
     }
   }
+  async function refreshSessions() {
+    if (!data) return;
+    const result = await rpc<{ sessions: SessionSummary[] }>(data.token, "sessions/list");
+    if (!mounted.current) return;
+    setSessions(result.sessions);
+    setCurrentId((id) => result.sessions.some((item) => item.id === id) ? id : result.sessions[0]?.id);
+    const ids = new Set(result.sessions.map((item) => item.id));
+    for (const id of snapshotVersions.current.keys()) {
+      if (!ids.has(id)) {
+        beginSnapshot(id);
+        completedTurns.current.delete(id);
+      }
+    }
+    setSnapshots((previous) => Object.fromEntries(Object.entries(previous).filter(([id]) => ids.has(id))));
+    mutateLive((previous) => Object.fromEntries(Object.entries(previous).filter(([id]) => ids.has(id))));
+  }
   return {
     data,
     setData,
@@ -376,6 +421,9 @@ export function useHarness(initialData?: Bootstrap) {
     send,
     stop,
     resolveApproval,
+    refreshSessions,
+    notices,
+    dismissNotice: (id: number) => setNotices((previous) => previous.filter((item) => item.id !== id)),
     reconnect: () => setRetry((value) => value + 1),
   };
 }

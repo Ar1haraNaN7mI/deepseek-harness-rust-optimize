@@ -4,8 +4,10 @@ import { App } from "./App";
 import { StartupSurface } from "./StartupSurface";
 import { bootstrap, isAbort } from "./api";
 import { consumeInitialPlayback } from "./preferences";
+import { consumeLaunchPlayback } from "./launchOverride";
 import type { Bootstrap } from "./types";
 import "./styles.css";
+import "./ui-effects.css";
 import "../../docs/startup-emblem.js";
 
 function HarnessRoot() {
@@ -18,9 +20,11 @@ function HarnessRoot() {
       .then((data) => {
         if (abort.signal.aborted) return;
         setPlay(
-          consumeInitialPlayback(
-            data.startup.enabled,
-            data.startup.override_enabled,
+          consumeLaunchPlayback(() =>
+            consumeInitialPlayback(
+              data.startup.enabled,
+              data.startup.override_enabled,
+            ),
           ),
         );
         setBoot({ data });

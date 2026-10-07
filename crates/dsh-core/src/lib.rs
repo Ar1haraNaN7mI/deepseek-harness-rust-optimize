@@ -60,8 +60,9 @@ pub use policy::{ApprovalPolicy, SandboxMode, APPROVAL_HELP, SANDBOX_HELP};
 pub use scheduler::{SchedulerSnapshot, TaskScheduler};
 pub use session::{Session, SessionEvent, SessionStore, SESSION_SCHEMA_VERSION};
 pub use settings::{
-    load_settings, personality_prompt, save_settings, SessionSettings, PERSONALITIES, PETS,
-    STATUSLINE_FIELDS, THEMES, TITLE_FIELDS,
+    load_settings, personality_prompt, save_settings, CharacteristicLevel,
+    PersonalityCharacteristics, SessionSettings, SettingsPatch, CUSTOM_INSTRUCTIONS_MAX_CHARS,
+    PERSONALITIES, PETS, STATUSLINE_FIELDS, THEMES, TITLE_FIELDS,
 };
 pub use startup_control::{set_next_startup, take_next_startup};
 pub use startup_profile::{load_startup_profile, save_startup_profile, StartupProfile};
@@ -175,6 +176,11 @@ impl Runtime {
         let learn = Arc::new(LearnStore::open(&outer_home));
         let ctm = Arc::new(ContinuousThought::new(config.ctm.clone(), learn.clone()));
         let settings = load_settings(&outer_home);
+        settings.validate()?;
+        learn.set_enabled(
+            config.learn.enabled && settings.memory_inject,
+            config.learn.enabled && settings.memory_generate,
+        );
         let permissions = settings.permissions;
         let features = load_features(&outer_home);
         let mcp = load_mcp(&outer_home);
@@ -216,18 +222,14 @@ impl Runtime {
             .write()
             .set_security_research_mode(settings.security_research_mode);
 
-        if let Some(model) = settings.model {
-            runtime.llm.set_model(model);
+        if let Some(model) = &settings.model {
+            runtime.llm.set_model(model.clone());
         }
         if let Some(thinking) = settings.thinking {
             runtime.llm.set_thinking(thinking);
         }
-        if let Some(p) = &settings.personality {
-            runtime
-                .prompt
-                .write()
-                .set_section("personality", personality_prompt(p).to_string());
-        }
+        runtime.apply_model_service(&settings);
+        runtime.sync_personalization();
 
         runtime.sync_model_optimization();
 
@@ -322,9 +324,70 @@ impl Runtime {
     }
 
     pub fn persist_settings(&self) -> anyhow::Result<()> {
-        let s = self.settings.read().clone();
+        let s = self.settings.read();
         save_settings(&self.outer_home, &s)?;
+        self.apply_personalization(&s);
         Ok(())
+    }
+
+    /// Save a validated settings update before changing the live runtime.
+    /// Holding the settings lock prevents concurrent patches losing fields.
+    pub fn update_settings(&self, patch: SettingsPatch) -> Result<SessionSettings> {
+        let mut settings = self.settings.write();
+        let mut next = settings.clone();
+        patch.apply(&mut next)?;
+        save_settings(&self.outer_home, &next)?;
+        if let Some(model) = &next.model {
+            self.set_model(model.clone());
+        }
+        if let Some(thinking) = next.thinking {
+            self.llm.set_thinking(thinking);
+        }
+        self.apply_model_service(&next);
+        *self.permissions.write() = next.permissions;
+        self.prompt
+            .write()
+            .set_security_research_mode(next.security_research_mode);
+        self.apply_personalization(&next);
+        *settings = next.clone();
+        Ok(next)
+    }
+
+    pub fn sync_personalization(&self) {
+        self.apply_personalization(&self.settings.read());
+    }
+
+    fn apply_model_service(&self, settings: &SessionSettings) {
+        if let Some(enabled) = settings.send_local_api_key {
+            self.llm.set_send_local_api_key(enabled);
+        }
+        if let Some(backend) = settings.backend {
+            self.llm.set_backend(backend);
+        }
+        if let Some(base_url) = &settings.base_url {
+            self.llm.set_base_url(base_url.clone());
+        }
+        if let Some(temperature) = settings.temperature {
+            self.llm.set_temperature(temperature);
+        }
+        if let Some(max_tokens) = settings.max_tokens {
+            self.llm.set_max_tokens(max_tokens);
+        }
+    }
+
+    fn apply_personalization(&self, settings: &SessionSettings) {
+        let inject = self.config.learn.enabled && settings.memory_inject;
+        self.learn.set_enabled(
+            inject,
+            self.config.learn.enabled && settings.memory_generate,
+        );
+        let mut prompt = self.prompt.write();
+        prompt.set_section("personality", settings.personalization_prompt());
+        prompt.set_section("custom_instructions", settings.custom_instructions.clone());
+        if !inject {
+            prompt.set_section("learn", "");
+            prompt.set_section("continuous_thought", "");
+        }
     }
 
     pub fn persist_features(&self) -> anyhow::Result<()> {
@@ -366,14 +429,10 @@ impl Runtime {
     }
 
     pub fn set_personality(&self, name: &str) -> anyhow::Result<()> {
-        {
-            let mut s = self.settings.write();
-            s.personality = Some(name.to_string());
-        }
-        self.prompt
-            .write()
-            .set_section("personality", personality_prompt(name).to_string());
-        self.persist_settings()?;
+        self.update_settings(SettingsPatch {
+            personality: Some(name.to_string()),
+            ..Default::default()
+        })?;
         Ok(())
     }
 
@@ -654,6 +713,142 @@ fn recover_unresolved_approvals(events: &JsonlEventStore) -> anyhow::Result<usiz
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    pub(crate) struct RuntimeFixture {
+        pub runtime: Arc<Runtime>,
+        root: PathBuf,
+    }
+
+    impl RuntimeFixture {
+        pub(crate) fn new(settings: SessionSettings, learn_enabled: bool) -> Self {
+            let root =
+                std::env::temp_dir().join(format!("dsh-personalization-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&root).unwrap();
+            let root = root.canonicalize().unwrap();
+            let mut config = AppConfig::builtin_default();
+            config.paths.outer_home = root.join("outer").display().to_string();
+            config.agent.scheduler_enabled = false;
+            config.learn.enabled = learn_enabled;
+            config.ctm.enabled = false;
+            save_settings(&root.join("outer"), &settings).unwrap();
+            let llm = DeepSeekClient::new(config.to_llm_config(String::new())).unwrap();
+            let runtime = Runtime::bootstrap(
+                config,
+                root.join("workspace"),
+                llm,
+                Arc::new(ToolRegistry::new()),
+            )
+            .unwrap();
+            Self { runtime, root }
+        }
+    }
+
+    impl Drop for RuntimeFixture {
+        fn drop(&mut self) {
+            assert_eq!(
+                self.root.parent(),
+                Some(std::env::temp_dir().canonicalize().unwrap().as_path())
+            );
+            assert!(self
+                .root
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("dsh-personalization-"));
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[tokio::test]
+    async fn personalization_updates_prompt_and_persisted_settings_at_boot_and_live() {
+        let mut settings = SessionSettings::default();
+        settings.custom_instructions = "Respond in fixture language.".into();
+        settings.characteristics.emoji = CharacteristicLevel::Less;
+        let fixture = RuntimeFixture::new(settings, true);
+        let runtime = &fixture.runtime;
+        assert!(runtime
+            .prompt
+            .read()
+            .render()
+            .contains("Respond in fixture language."));
+        assert!(runtime.prompt.read().render().contains("Avoid emoji."));
+        runtime
+            .learn
+            .record_tool_outcome("prior memory", "shell", true, "remember fixture note");
+        runtime
+            .prompt
+            .write()
+            .set_section("learn", runtime.learn.prompt_section("prior memory"));
+        let updated = runtime
+            .update_settings(SettingsPatch {
+                custom_instructions: Some("Use the updated instruction.".into()),
+                characteristics: Some(PersonalityCharacteristics {
+                    warmth: CharacteristicLevel::More,
+                    ..Default::default()
+                }),
+                memory_inject: Some(false),
+                memory_generate: Some(false),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(updated.custom_instructions, "Use the updated instruction.");
+        let prompt = runtime.prompt.read().render();
+        assert!(prompt.contains("Use the updated instruction."));
+        assert!(prompt.contains("warmer, more considerate"));
+        assert!(
+            !prompt.contains("Respond in fixture language.")
+                && !prompt.contains("remember fixture note")
+                && !prompt.contains("Avoid emoji.")
+        );
+        assert!(runtime.learn.recall("prior memory", 5).is_empty());
+        runtime
+            .learn
+            .record_task_outcome("task", "run", "new memory", 1, true, "ignored");
+        assert!(runtime.learn.feedback().is_empty());
+        let saved = load_settings(&runtime.outer_home);
+        assert_eq!(saved.custom_instructions, updated.custom_instructions);
+        assert_eq!(saved.characteristics, updated.characteristics);
+        assert!(!saved.memory_generate && !saved.memory_inject);
+    }
+
+    #[tokio::test]
+    async fn invalid_or_failed_settings_save_does_not_change_runtime() {
+        let fixture = RuntimeFixture::new(SessionSettings::default(), true);
+        let runtime = &fixture.runtime;
+        let before = runtime.prompt.read().render();
+        assert!(runtime
+            .update_settings(SettingsPatch {
+                custom_instructions: Some("x".repeat(CUSTOM_INSTRUCTIONS_MAX_CHARS + 1)),
+                ..Default::default()
+            })
+            .is_err());
+        assert_eq!(runtime.prompt.read().render(), before);
+        let path = settings::settings_path(&runtime.outer_home);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let model = runtime.llm.config().model;
+        assert!(runtime
+            .update_settings(SettingsPatch {
+                model: Some("uncommitted-model".into()),
+                custom_instructions: Some("not persisted".into()),
+                ..Default::default()
+            })
+            .is_err());
+        assert_eq!(runtime.llm.config().model, model);
+        assert!(runtime.settings.read().custom_instructions.is_empty());
+        assert_eq!(runtime.prompt.read().render(), before);
+    }
+
+    #[tokio::test]
+    async fn disabled_learning_config_overrides_enabled_memory_preferences() {
+        let fixture = RuntimeFixture::new(SessionSettings::default(), false);
+        fixture
+            .runtime
+            .learn
+            .record_tool_outcome("not saved", "shell", true, "ignored");
+        assert!(fixture.runtime.learn.list().episodes.is_empty());
+        assert!(fixture.runtime.learn.prompt_section("not saved").is_empty());
+    }
 
     #[test]
     fn unresolved_approval_is_recovered_once() {

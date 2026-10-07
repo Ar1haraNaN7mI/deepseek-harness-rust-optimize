@@ -10,11 +10,13 @@ import argparse
 import http.client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import math
 import os
 from pathlib import Path
 import re
 import shutil
 import socket
+import stat
 import subprocess
 import tempfile
 import threading
@@ -30,6 +32,7 @@ class ModelFixture(BaseHTTPRequestHandler):
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         self.server.requests.append(body)
+        self.server.authorizations.append(self.headers.get("Authorization"))
         prompts = [message.get("content", "") for message in body["messages"] if message.get("role") == "user"]
         answer = "Fixture reply: " + str(prompts[-1])[:400]
         # Multiple real SSE frames let the frontend exercise incremental text.
@@ -54,6 +57,16 @@ def available_port():
     with socket.socket() as temporary:
         temporary.bind(("127.0.0.1", 0))
         return temporary.getsockname()[1]
+
+
+def remove_fixture_root(root):
+    root = root.resolve()
+    assert root.parent == Path(tempfile.gettempdir()).resolve() and root.name.startswith("dsh-harness-web-")
+    def remove_readonly(function, path, error):
+        Path(path).resolve().relative_to(root)
+        os.chmod(path, stat.S_IWRITE)
+        function(path)
+    shutil.rmtree(root, onerror=remove_readonly)
 
 
 def fixture_config(endpoint: str, outer: Path) -> str:
@@ -97,6 +110,7 @@ def main():
     parser.add_argument("--output", type=Path, default=Path("target/harness-web-qa"))
     parser.add_argument("--port", type=int, default=0)
     parser.add_argument("--serve", action="store_true", help="Keep the isolated tested host alive until Ctrl+C")
+    parser.add_argument("--settings", action="store_true", help="Verify settings persistence, model personalization, and conversation data controls")
     args = parser.parse_args()
     binary = args.binary.resolve(strict=True)
     output = args.output.resolve()
@@ -104,6 +118,7 @@ def main():
     root = Path(tempfile.mkdtemp(prefix="dsh-harness-web-")).resolve()
     mock = ThreadingHTTPServer(("127.0.0.1", 0), ModelFixture)
     mock.requests = []
+    mock.authorizations = []
     mock.daemon_threads = True
     threading.Thread(target=mock.serve_forever, daemon=True).start()
     process = None
@@ -116,7 +131,15 @@ def main():
         skill.write_text("---\nname: harness-http-fixture\ndescription: Isolated browser test skill\n---\nThis is a local fixture.\n", encoding="utf-8")
         plugin = outer / "plugins" / "http-fixture"
         plugin.mkdir(parents=True)
-        (plugin / "plugin.json").write_text(json.dumps({"id": "http-fixture", "name": "HTTP Fixture Plugin", "version": "1.0", "tools": [{"name": "echo", "description": "Fixture definition"}]}), encoding="utf-8")
+        (plugin / "plugin.json").write_text(json.dumps({"id": "http-fixture", "name": "HTTP Fixture Plugin", "version": "1.0", "entry": "main.rhai", "tools": [{"name": "echo", "description": "Fixture definition"}]}), encoding="utf-8")
+        (plugin / "main.rhai").write_text('fn echo(args) { "fixture echo" }', encoding="utf-8")
+        if args.settings:
+            subprocess.run(["git", "init", "--quiet", str(workspace)], check=True)
+            review_file = workspace / "fixture-review.txt"
+            review_file.write_text("before review\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(workspace), "add", "fixture-review.txt"], check=True)
+            subprocess.run(["git", "-C", str(workspace), "-c", "user.name=DSH Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--quiet", "-m", "Fixture baseline"], check=True)
+            review_file.write_text("DSH_NATIVE_REVIEW_DIFF\n", encoding="utf-8")
         if args.installed_assets:
             assets = None
         elif args.assets:
@@ -194,6 +217,25 @@ def main():
             assert status == 200 and "error" not in value, value
             return value["result"]
 
+        if args.settings:
+            settings = rpc("settings/get")
+            assert "local-fixture-key" not in json.dumps(settings)
+            assert settings["account"]["kind"] == "local"
+            saved = rpc("settings/update", {"patch": {"custom_instructions": "DSH_SETTINGS_QA_CONTEXT", "personality": "concise", "memory_inject": False, "memory_generate": False}})
+            assert saved["settings"]["custom_instructions"] == "DSH_SETTINGS_QA_CONTEXT"
+            assert "DSH_SETTINGS_QA_CONTEXT" in (outer / "settings.toml").read_text(encoding="utf-8")
+            assert rpc("settings/get")["settings"]["memory_inject"] is False
+            _, invalid = request("POST", "/api/harness/rpc", {"method": "settings/update", "params": {"patch": {"unknown_field": True}}})
+            assert "error" in invalid, invalid
+            assert request("POST", "/api/harness/rpc", {"method": "settings/update", "params": {"patch": {"personality": "friendly"}}}, authenticated=False)[0] == 403
+            assert rpc("memory/list")["total"] == 0
+            assert rpc("memory/clear")["deleted_episodes"] == 0
+            scratch_ids = [rpc("sessions/create", {"name": f"Disposable settings QA {n}"})["session"]["id"] for n in (1, 2)]
+            assert rpc("sessions/archive_all")["count"] == 2
+            assert not rpc("sessions/list")["sessions"]
+            assert rpc("sessions/delete_all")["count"] == 2
+            assert not any((outer / "sessions" / f"{sid}.json").exists() for sid in scratch_ids)
+
         session_id = rpc("sessions/create", {"name": "HTTP integration test"})["session"]["id"]
         cursor = bootstrap["latest_sequence"]
         received = []
@@ -223,6 +265,105 @@ def main():
         persisted = json.loads((outer / "sessions" / f"{session_id}.json").read_text(encoding="utf-8"))
         assert len([event for event in persisted["events"] if event["type"] == "assistant_message"]) == 2
         assert "Fixture reply: e2e turn 1" in json.dumps(mock.requests[1])
+        if args.settings:
+            assert "DSH_SETTINGS_QA_CONTEXT" in json.dumps(mock.requests[0])
+            assert rpc("sessions/rename", {"id": session_id, "name": "Settings integration verified"})
+            assert rpc("sessions/archive", {"id": session_id})["archived"] is True
+            assert not rpc("sessions/list")["sessions"]
+            assert rpc("sessions/unarchive", {"id": session_id})["archived"] is False
+            for export_format in ("json", "markdown"):
+                exported = rpc("sessions/export", {"id": session_id, "format": export_format})
+                assert exported["session_count"] == 1 and "Fixture reply" in exported["content"]
+                assert "local-fixture-key" not in exported["content"]
+            metrics = rpc("settings/get")
+            assert metrics["usage"]["assistant_message_count"] == 2
+            assert metrics["storage"]["session_bytes"] > 0
+            assert metrics["usage"]["token_usage_available"] is False
+            disposable = rpc("sessions/create")["session"]["id"]
+            assert rpc("sessions/delete", {"id": disposable})["deleted"]
+            assert not (outer / "sessions" / f"{disposable}.json").exists()
+            # Exercise native settings through the authenticated HTTP transport,
+            # including actual model inference and a full process restart.
+            model = rpc("model/service")
+            assert "local-fixture-key" not in json.dumps(model)
+            connection = {key: model[key] for key in ("backend", "base_url", "model", "temperature", "max_tokens", "thinking")}
+            connection.update(backend="ollama", model="native-settings-fixture-8b", temperature=0.45, max_tokens=512, send_local_api_key=True)
+            assert rpc("model/update", connection)["model"] == "native-settings-fixture-8b"
+            key_result = rpc("model/credential", {"action": "save", "key": "native-fixture-key"})
+            assert key_result["credential_configured"] and "native-fixture-key" not in json.dumps(key_result)
+            assert "native-fixture-key" in (outer / "credentials.env").read_text(encoding="utf-8")
+            assert rpc("model/test")["ok"] is True
+            assert len(mock.requests) == 3 and mock.requests[-1]["messages"] == [{"role": "user", "content": "Reply with OK."}]
+            assert mock.requests[-1]["model"] == "native-settings-fixture-8b" and mock.requests[-1]["max_tokens"] == 16
+            assert rpc("model/credential", {"action": "clear"})["credential_configured"] is False
+            assert not (outer / "credentials.env").exists()
+            rpc("model/credential", {"action": "save", "key": "local-fixture-key"})
+            extensions = rpc("extensions/list")
+            assert any(item["id"] == "http-fixture" and item["enabled"] for item in extensions["plugins"])
+            assert rpc("skills/read", {"name": "harness-http-fixture"})["content"].startswith("---")
+            rpc("plugins/disable", {"id": "http-fixture"})
+            rpc("skills/disable", {"name": "harness-http-fixture"})
+            assert all(item["name"] != "plugin.http-fixture.echo" for item in rpc("tools/list")["tools"])
+            process.terminate()
+            process.wait(timeout=10)
+            # Keep an explicitly empty value so global dotenv discovery cannot
+            # inject the user's real key into this isolated test process.
+            environment["DSH_LLM_API_KEY"] = ""
+            environment["DEEPSEEK_API_KEY"] = "different-fixture-deepseek-key"
+            environment["OPENAI_API_KEY"] = "fixture-compatible-key"
+            process = subprocess.Popen(command, cwd=workspace, env=environment, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                                       creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+            deadline = time.monotonic() + 20
+            while True:
+                if process.poll() is not None:
+                    raise RuntimeError("Native settings fixture failed to restart")
+                try:
+                    status, restarted = request("GET", "/api/harness/bootstrap")
+                    if status == 200:
+                        break
+                except OSError:
+                    pass
+                if time.monotonic() > deadline:
+                    raise TimeoutError("Native settings restart timed out")
+                time.sleep(0.1)
+            token = restarted["token"]
+            assert restarted["model"]["name"] == "native-settings-fixture-8b"
+            assert rpc("model/service")["max_tokens"] == 512
+            extensions = rpc("extensions/list")
+            assert any(item["id"] == "http-fixture" and not item["enabled"] for item in extensions["plugins"])
+            assert any(item["name"] == "harness-http-fixture" and not item["enabled"] for item in extensions["skills"])
+            rpc("plugins/enable", {"id": "http-fixture"})
+            rpc("skills/enable", {"name": "harness-http-fixture"})
+            assert any(item["name"] == "plugin.http-fixture.echo" for item in rpc("tools/list")["tools"])
+            assert rpc("workspace/get")["workspace"] == str(workspace)
+            assert rpc("tasks/list", {"all": True})["tasks"], "Real task history missing"
+            prepared = rpc("review/prepare", {"scope": "uncommitted"})
+            assert "DSH_NATIVE_REVIEW_DIFF" in prepared["diff"]
+            assert "DSH_NATIVE_REVIEW_DIFF" in prepared["prompt"]
+            review_session = rpc("sessions/create", {"name": "Real DSH review fixture"})["session"]["id"]
+            assert rpc("agent/turn", {"session_id": review_session, "prompt": prepared["prompt"], "wait": False})["accepted"]
+            deadline = time.monotonic() + 15
+            while True:
+                snapshot = rpc("sessions/get", {"id": review_session})
+                if snapshot["state"] == "completed":
+                    break
+                assert time.monotonic() < deadline, "Real review task did not complete"
+                time.sleep(0.1)
+            assert any(event["type"] == "assistant_message" for event in snapshot["session"]["events"])
+            assert "DSH_NATIVE_REVIEW_DIFF" in json.dumps(mock.requests[-1])
+            auth_class = next((label for value, label in [(None, "absent"), ("Bearer local-fixture-key", "fixture original"), ("Bearer fixture-compatible-key", "fixture compatible"), ("Bearer different-fixture-deepseek-key", "fixture deepseek")] if value == mock.authorizations[-1]), "other value (redacted)")
+            assert auth_class == "fixture compatible", f"Restart credential category: {auth_class}; backend: {rpc('model/service')['backend']}"
+            assert math.isclose(mock.requests[-1]["temperature"], 0.45, abs_tol=1e-6) and mock.requests[-1]["max_tokens"] == 512, "Small-model defaults overrode explicit settings"
+            assert review_file.read_text(encoding="utf-8") == "DSH_NATIVE_REVIEW_DIFF\n"
+            connection.update(backend="deepseek", thinking=True)
+            rpc("model/update", connection)
+            thinking_session = rpc("sessions/create", {"name": "Explicit small-model thinking"})["session"]["id"]
+            rpc("agent/turn", {"session_id": thinking_session, "prompt": "Verify saved thinking preference", "wait": False})
+            deadline = time.monotonic() + 15
+            while rpc("sessions/get", {"id": thinking_session})["state"] != "completed":
+                assert time.monotonic() < deadline, "Thinking preference task timed out"
+                time.sleep(0.1)
+            assert mock.requests[-1]["thinking"] == {"type": "enabled"}, "Small-model defaults overrode explicit thinking"
         assert request("POST", "/api/profile", {"username": "OPERATOR-QA", "badge_id": "DSH-QA"})[0] == 200
         assert request("POST", "/api/startup-next", {"enabled": True})[0] == 200
         assert request("GET", "/api/harness/bootstrap")[1]["startup"]["next_enabled"] is True
@@ -242,8 +383,11 @@ def main():
             assert request("GET", path)[0] == 403, path
         report = {"passed": True, "url": f"http://127.0.0.1:{port}/", "session_id": session_id, "mock_requests": len(mock.requests),
                   "stream_events": len(received), "fixture_workspace": str(workspace), "next_cli_marker_unconsumed": True,
-                  "installed_assets": args.installed_assets,
+                  "installed_assets": args.installed_assets, "settings_checked": args.settings,
                   "checks": ["token", "actual inventory", "two streamed turns", "event pagination", "persisted history", "profile", "next CLI", "static traversal"]}
+        if args.settings:
+            report["checks"] += ["settings persistence and validation", "custom instructions reach model", "memory management", "archive/unarchive", "rename", "single and bulk delete", "export JSON/Markdown", "actual storage and usage"]
+            report["checks"] += ["model service save and real inference", "credential save/clear", "plugin and skill disable/enable", "restart persistence", "workspace and real tasks", "Git diff reaches actual review model and persists result"]
         (output / "report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
         print(json.dumps(report), flush=True)
         if args.serve:
@@ -264,8 +408,7 @@ def main():
         mock.server_close()
         if log:
             log.close()
-        assert root.parent == Path(tempfile.gettempdir()).resolve() and root.name.startswith("dsh-harness-web-")
-        shutil.rmtree(root)
+        remove_fixture_root(root)
 
 
 if __name__ == "__main__":

@@ -582,7 +582,7 @@ pub fn handle_slash(ctx: &mut SlashCtx<'_>, text: &str) -> SlashEffect {
                         mode.label(),
                         mode.description(),
                         PERMISSION_HELP,
-                        "See /approval and /sandbox for Codex-aligned policies."
+                        "See /approval and /sandbox for DSH execution policies."
                     ),
                 );
                 return SlashEffect::None;

@@ -1,0 +1,28 @@
+.ext-settings { min-width: 0; }
+.ext-toolbar, .ext-tabs, .ext-actions, .ext-heading { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.ext-toolbar { justify-content: space-between; margin: 20px 0; }
+.ext-tabs [aria-pressed="true"] { background: var(--accent, #286b52); color: white; border-color: transparent; }
+.ext-install { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; align-items: end; margin-bottom: 24px; }
+.ext-install .sc-description { grid-column: 1 / -1; margin: 0; overflow-wrap: anywhere; }
+.ext-install .sc-field { margin: 0; }
+.ext-list { margin-top: 12px; }
+.ext-entry { padding: 19px 0; border-bottom: 1px solid var(--border, #e4e6e9); min-width: 0; }
+.ext-entry > p { font-size: 13px; line-height: 1.6; margin: 8px 0; }
+.ext-heading strong { font-size: 14px; overflow-wrap: anywhere; }
+.ext-heading > span { font-size: 11px; }
+.ext-state { margin-left: auto; padding: 3px 8px; border: 1px solid var(--border, #d8dee2); border-radius: 5px; }
+.ext-state.is-live { color: var(--accent, #286b52); }
+.ext-meta, .ext-path { color: var(--text-muted, #697278); }
+.ext-path { display: block; font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; }
+.ext-actions { margin-top: 14px; }
+.ext-entry details { margin-top: 10px; font-size: 12px; }
+.ext-entry summary { cursor: pointer; }
+.ext-tool-names { display: flex; flex-direction: column; gap: 4px; overflow-wrap: anywhere; }
+.ext-error { color: var(--danger, #b23e3e); font-size: 13px; line-height: 1.5; overflow-wrap: anywhere; }
+.ext-notice { color: var(--accent, #286b52); font-size: 13px; line-height: 1.5; }
+.ext-confirm { margin-top: 14px; padding: 12px; border: 1px solid var(--border, #d8dee2); border-radius: 8px; font-size: 13px; line-height: 1.6; }
+.ext-confirm .sc-button + .sc-button { margin-left: 8px; }
+.ext-document { margin-top: 20px; padding: 16px; border: 1px solid var(--border, #d8dee2); border-radius: 10px; }
+.ext-document .ext-heading { justify-content: space-between; }
+.ext-document pre { max-height: 360px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/1.7 ui-monospace, monospace; }
+@media (max-width: 560px) { .ext-install { grid-template-columns: minmax(0, 1fr); } .ext-install > button { justify-self: start; } }

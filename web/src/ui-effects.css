@@ -1,0 +1,55 @@
+:root { color: var(--ink); background: var(--paper); --surface: #f9f9f4; --sidebar: #e4e6e4; --soft: #e5e9e1; --message-font: 14px; }
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --paper: #171a1d; --ink: #e8eaec; --line: #353b41; --muted: #a0a8af;
+  --surface: #20252a; --sidebar: #121619; --soft: #293137;
+}
+:root[data-theme="light"] { color-scheme: light; }
+.sidebar { background: var(--sidebar); }
+.catalog { background: var(--sidebar); }
+.catalog-tabs button, .registry-detail, .registry-detail code, .catalog-note, .registry-name small { color: var(--muted); }
+.catalog-tabs button[aria-selected="true"] { color: var(--blue); border-color: var(--blue); }
+.catalog-search { color: var(--ink); border-color: var(--line); }
+.session-link.active, .composer { background: var(--surface); }
+.operator-avatar, .message-body pre, .tool-activity, .approval { background: var(--soft); }
+.outline-button, .catalog-toggle { border-color: var(--line); }
+.solid-button { color: var(--paper); }
+.outline-button.selected { background: var(--soft); border-color: var(--blue); }
+.sidebar-section-label, .session-list-heading, .session-info small, .operator small,
+.settings-trigger, .keycap, .welcome-mark span, .welcome > p, .welcome-registry,
+.composer-context, .composer-foot, .message-label, .tool-activity small, .tool-activity summary,
+.registry-label, .catalog-foot, .catalog-summary, .registry-item small { color: var(--muted); }
+.welcome h1, .message-body, .catalog-panel h2 { color: var(--ink); }
+.send-button { background: var(--blue); color: #fff; }
+.composer:focus-within { border-color: var(--blue); }
+.reasoning { margin: 16px 0; padding: 12px 16px; border-left: 2px solid var(--line); color: var(--muted); font-size: 12px; }
+.reasoning summary { cursor: pointer; }
+.reasoning pre { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.65; max-height: 320px; overflow: auto; }
+:root[data-theme="dark"] .message.user .message-body,
+:root[data-theme="dark"] .message-body code,
+:root[data-theme="dark"] .message-body pre,
+:root[data-theme="dark"] .catalog-panel,
+:root[data-theme="dark"] .registry-tab.active,
+:root[data-theme="dark"] .tool-activity { background: var(--surface); }
+:root[data-theme="dark"] .notice.error { background: #3a2927; color: #f1b1a1; border-color: #80554b; }
+:root[data-theme="dark"] .model-warning { color: #d4bb8b; }
+.message-body { font-size: var(--message-font); }
+.composer textarea { font-size: var(--message-font); }
+:root[data-font-size="small"] { --message-font: 13px; }
+:root[data-font-size="large"] { --message-font: 17px; }
+:root[data-density="compact"] .session-link { padding-top: 8px; padding-bottom: 8px; }
+:root[data-density="compact"] .message { margin-top: 12px; margin-bottom: 18px; }
+:root[data-density="compact"] .composer textarea { min-height: 62px; }
+.companion { width: 110px; margin: 8px auto 16px; color: var(--blue); text-align: center; }
+.companion svg { width: 80px; height: 54px; }
+.companion span { display: block; font: 7px var(--mono); letter-spacing: .03em; color: var(--muted); white-space: nowrap; }
+.companion.working .cat-tail { transform-origin: 67px 51px; animation: companion-tail 1.5s ease-in-out infinite alternate; }
+@keyframes companion-tail { to { transform: rotate(-18deg); } }
+.notification-stack { position: fixed; right: 24px; bottom: 24px; z-index: 40; display: grid; gap: 8px; max-width: min(360px, calc(100vw - 32px)); }
+.harness-notice { display: flex; gap: 16px; align-items: center; border: 1px solid var(--line); background: var(--surface); color: var(--ink); border-radius: 10px; padding: 12px 10px 12px 18px; box-shadow: 0 5px 24px #0001; }
+.harness-notice > button:first-child { padding: 0; background: none; border: 0; text-align: left; font-size: 13px; }
+.harness-notice small { display: block; color: var(--muted); font-size: 10px; margin-top: 5px; }
+:root[data-motion="reduce"] *, :root[data-motion="reduce"] *::before, :root[data-motion="reduce"] *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; scroll-behavior: auto !important; }
+@media (prefers-reduced-motion: reduce) {
+  .companion *, .harness *, .settings-center * { animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; scroll-behavior: auto !important; }
+}

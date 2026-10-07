@@ -13,6 +13,7 @@ use tokio::sync::mpsc;
 pub struct DeepSeekClient {
     http: Client,
     config: RwLock<LlmConfig>,
+    send_local_api_key: RwLock<Option<bool>>,
 }
 
 /// Provider-neutral name for new integrations. `DeepSeekClient` remains the
@@ -30,6 +31,7 @@ impl DeepSeekClient {
         Ok(Self {
             http,
             config: RwLock::new(config),
+            send_local_api_key: RwLock::new(None),
         })
     }
 
@@ -102,6 +104,27 @@ impl DeepSeekClient {
 
     pub fn set_temperature(&self, temperature: f32) {
         self.config.write().temperature = temperature;
+    }
+
+    pub fn set_max_tokens(&self, max_tokens: u32) {
+        self.config.write().max_tokens = max_tokens;
+    }
+
+    pub fn set_send_local_api_key(&self, enabled: bool) {
+        *self.send_local_api_key.write() = Some(enabled);
+    }
+
+    pub fn sends_local_api_key(&self) -> bool {
+        self.send_local_api_key.read().unwrap_or_else(|| {
+            std::env::var("DSH_LLM_SEND_API_KEY")
+                .ok()
+                .is_some_and(|value| {
+                    matches!(
+                        value.trim().to_ascii_lowercase().as_str(),
+                        "1" | "true" | "yes" | "on"
+                    )
+                })
+        })
     }
 
     pub async fn stream_chat(
@@ -232,7 +255,7 @@ impl DeepSeekClient {
                 .http
                 .post(&url)
                 .header("Content-Type", "application/json");
-            if should_send_api_key(&endpoint, &base_url) {
+            if should_send_api_key(&endpoint, &base_url, self.sends_local_api_key()) {
                 request = request.bearer_auth(&endpoint.api_key);
             }
             match request.json(&body).send().await {
@@ -540,22 +563,18 @@ fn merge_extra_values(base: Option<Value>, overlay: Option<Value>) -> Option<Val
 /// Avoid leaking a hosted credential to a loopback OSS server when a user
 /// switches backends in one process. Explicitly opt in with
 /// `DSH_LLM_SEND_API_KEY=1` when a local gateway intentionally requires auth.
-fn should_send_api_key(endpoint: &ResolvedEndpoint, base_url: &str) -> bool {
+fn should_send_api_key(
+    endpoint: &ResolvedEndpoint,
+    base_url: &str,
+    send_local_api_key: bool,
+) -> bool {
     if endpoint.api_key.trim().is_empty() {
         return false;
     }
     if endpoint.backend.requires_api_key() {
         return true;
     }
-    if std::env::var("DSH_LLM_SEND_API_KEY")
-        .ok()
-        .is_some_and(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-    {
+    if send_local_api_key {
         return true;
     }
     !is_loopback_url(base_url)
@@ -820,13 +839,14 @@ mod tests {
         };
         assert!(is_loopback_url(&endpoint.base_url));
         if std::env::var("DSH_LLM_SEND_API_KEY").is_err() {
-            assert!(!should_send_api_key(&endpoint, &endpoint.base_url));
+            assert!(!should_send_api_key(&endpoint, &endpoint.base_url, false));
+            assert!(should_send_api_key(&endpoint, &endpoint.base_url, true));
         }
         let remote = ResolvedEndpoint {
             base_url: "https://llm.example/v1".into(),
             ..endpoint
         };
-        assert!(should_send_api_key(&remote, &remote.base_url));
+        assert!(should_send_api_key(&remote, &remote.base_url, false));
     }
 
     #[test]

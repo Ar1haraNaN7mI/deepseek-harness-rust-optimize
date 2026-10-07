@@ -1,8 +1,14 @@
 mod app_server;
 mod cloud;
+mod harness_settings;
+mod model_service;
+mod harness_extensions;
+mod workspace_settings;
 mod mcp_server;
 mod startup_inventory;
 mod startup_web;
+mod web_launch;
+mod web_legacy;
 
 use cloud::CloudProvider;
 
@@ -19,8 +25,8 @@ use dsh_core::{
 };
 use dsh_fs::{FsService, PathGuard, PathGuardConfig};
 use dsh_llm::{DeepSeekClient, LlmBackend};
-use dsh_plugin::{install_plugin_from_path, register_plugin_tools, PluginRegistry};
-use dsh_skill::{register_skill_tools, SkillCatalog};
+use dsh_plugin::{install_plugin_from_path, register_plugin_tools_with_weights, PluginRegistry};
+use dsh_skill::{register_skill_tools_with_weights, SkillCatalog};
 use dsh_tools::ToolRegistry;
 use dsh_tui::{run_tui, TuiOptions};
 use serde::{Deserialize, Serialize};
@@ -33,7 +39,7 @@ use tracing_subscriber::EnvFilter;
 #[derive(Parser, Debug)]
 #[command(
     name = "dsh",
-    about = "dsh-rust — OpenAI-compatible agent harness (Codex-style TUI + CLI)",
+    about = "DSH — agent harness for hosted and local models (TUI + CLI + Web)",
     long_about = "\
 dsh-rust is a two-layer coding agent for hosted and local OpenAI-compatible models.
 
@@ -183,6 +189,9 @@ enum Commands {
         /// Override frontend assets (default: installed share/dsh/web, then ./web/dist)
         #[arg(long)]
         assets: Option<PathBuf>,
+        /// Print the URL without automatically opening a browser window
+        #[arg(long)]
+        no_open: bool,
     },
 
     /// Interactive TUI (default) — boots even without API key
@@ -209,7 +218,7 @@ enum Commands {
         #[arg(long)]
         last_message_file: Option<PathBuf>,
     },
-    /// Resume a session non-interactively (Codex `exec resume`)
+    /// Resume a DSH session non-interactively
     #[command(name = "exec-resume", allow_missing_positional = true)]
     ExecResume {
         /// Session id (or unique prefix)
@@ -287,7 +296,7 @@ enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         command: Vec<String>,
     },
-    /// Manage local, auditable Codex-compatible cloud artifacts.
+    /// Manage local, auditable DSH task artifacts.
     Cloud {
         #[command(subcommand)]
         action: Option<CloudCmd>,
@@ -751,9 +760,7 @@ async fn run(cli: Cli) -> Result<()> {
             };
             dsh_tui::preview_startup_with_context(config.tui.startup, context).await?;
         }
-        Some(Commands::Web { port, assets }) => {
-            let boot = boot_tui(&workspace, config_path.as_ref(), &cli)?;
-            apply_cli_overrides(&boot.runtime, &cli)?;
+        Some(Commands::Web { port, assets, no_open }) => {
             let startup_override = if cli.no_startup {
                 Some(false)
             } else if cli.startup {
@@ -761,7 +768,20 @@ async fn run(cli: Cli) -> Result<()> {
             } else {
                 None
             };
-            startup_web::serve_harness(boot.runtime, port, assets, startup_override).await?;
+            let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin())
+                && std::io::IsTerminal::is_terminal(&std::io::stdout());
+            let Some(listener) = web_launch::prepare(port, &workspace, startup_override, interactive, !no_open, || {
+                // Reuse needs no new Runtime or local assets. A new/replacement
+                // service must validate before stopping the existing service.
+                anyhow::ensure!(!workspace.exists() || workspace.is_dir(), "工作区路径必须是目录：{}", workspace.display());
+                load_app_config(&workspace, config_path.as_ref())?;
+                startup_web::validate_frontend_assets(assets.as_deref())
+            }).await? else {
+                return Ok(());
+            };
+            let boot = boot_tui(&workspace, config_path.as_ref(), &cli)?;
+            apply_cli_overrides(&boot.runtime, &cli)?;
+            startup_web::serve_harness(boot.runtime, listener, assets, startup_override, interactive && !no_open).await?;
         }
         None => {
             let boot = boot_tui(&workspace, config_path.as_ref(), &cli)?;
@@ -2281,7 +2301,8 @@ fn boot_from_config(
 
     // Optional at boot — empty key is OK; configure later via CLI/TUI.
     let llm_config = config.to_llm_config(String::new());
-    let api_key = resolve_api_key_for_backend(&outer_home, llm_config.backend);
+    let effective_backend = load_settings(&outer_home).backend.unwrap_or(llm_config.backend);
+    let api_key = resolve_api_key_for_backend(&outer_home, effective_backend);
     let llm = DeepSeekClient::new(dsh_llm::LlmConfig {
         api_key,
         ..llm_config
@@ -2313,7 +2334,9 @@ fn boot_from_config(
             None
         },
     );
-    register_skill_tools(&tools, skills.clone());
+    let learning = runtime.learn.clone();
+    let weights: dsh_skill::LearnWeightProvider = Arc::new(move || learning.weights());
+    register_skill_tools_with_weights(&tools, skills.clone(), weights.clone());
     runtime.attach_skills(skills.clone());
 
     let plugins = Arc::new(PluginRegistry::new(
@@ -2325,7 +2348,7 @@ fn boot_from_config(
     seed_example_plugin(workspace, &runtime.outer_home.join("plugins"))?;
     plugins.discover_and_load(&roots);
     plugins.start_hot_reload();
-    register_plugin_tools(&tools, plugins.clone());
+    register_plugin_tools_with_weights(&tools, plugins.clone(), weights);
     runtime.attach_plugins(plugins.clone());
 
     let skill_names: Vec<String> = skills.list().into_iter().map(|s| s.name).collect();
@@ -2362,6 +2385,12 @@ fn boot_from_config(
 }
 
 fn seed_example_plugin(workspace: &Path, dest_root: &Path) -> Result<()> {
+    let state = dsh_skill::activation::ActivationStore::new(
+        dest_root.parent().ok_or_else(|| anyhow::anyhow!("plugin root has no parent"))?.join("meta/plugins-disabled.json"),
+    );
+    if state.disabled()?.contains("echo") {
+        return Ok(());
+    }
     let src = workspace.join("outer/plugins/echo-plugin");
     let dest = dest_root.join("echo");
     if !src.exists() {
@@ -2553,11 +2582,11 @@ mod startup_cli_tests {
     #[test]
     fn harness_web_command_accepts_assets_and_global_startup_preferences() {
         let cli = Cli::try_parse_from(["dsh", "web"]).unwrap();
-        assert!(matches!(cli.command, Some(Commands::Web { port: 8770, assets: None })));
+        assert!(matches!(cli.command, Some(Commands::Web { port: 8770, assets: None, no_open: false })));
         let cli = Cli::try_parse_from([
             "dsh", "web", "--port", "8870", "--assets", "web/dist", "--startup", "--silent",
         ]).unwrap();
-        assert!(matches!(cli.command, Some(Commands::Web { port: 8870, assets: Some(ref path) }) if path == Path::new("web/dist")));
+        assert!(matches!(cli.command, Some(Commands::Web { port: 8870, assets: Some(ref path), .. }) if path == Path::new("web/dist")));
         let mut config = AppConfig::builtin_default();
         apply_startup_overrides(&mut config, &cli);
         assert!(config.tui.startup.enabled);

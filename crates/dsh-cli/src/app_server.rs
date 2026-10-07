@@ -393,6 +393,15 @@ async fn handle_request(
     method: &str,
     params: Value,
 ) -> std::result::Result<Value, RpcFailure> {
+    if let Some(result) = crate::model_service::dispatch(&runtime, method, &params).await {
+        return result;
+    }
+    if let Some(result) = crate::workspace_settings::dispatch(&runtime, method, &params).await {
+        return result;
+    }
+    if let Some(result) = crate::harness_extensions::dispatch(&runtime, method, &params) {
+        return result;
+    }
     if let Some(result) = crate::harness_settings::dispatch(&runtime, method, &params) {
         return result;
     }

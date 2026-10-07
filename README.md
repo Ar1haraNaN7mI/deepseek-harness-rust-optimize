@@ -1,6 +1,6 @@
 # dsh-rust
 
-用 Rust 重写的 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 风格编程助手：**终端里就能对话、改代码、跑命令**，交互对齐 Codex CLI，模型默认走 DeepSeek。
+用 Rust 重写的 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 风格编程助手：**终端里就能对话、改代码、跑命令**，提供 CLI、终端界面和网页工作台，模型默认走 DeepSeek。
 
 > 仓库：[`deepseek-harness-rust-optimize`](https://github.com/Ar1haraNaN7mI/deepseek-harness-rust-optimize)
 
@@ -36,7 +36,7 @@ dsh -C "D:\projects\demo"  # 显式选择另一个工作区
 
 `dsh web` 在交互终端启动后会自动打开默认浏览器。如果端口已有 DSH Harness，先询问是否直接打开现有页面；选否后再询问是否关闭旧服务并在当前工作区重新启动；再次选否则返回第一问。输入 `y`/`n`（或“是”/“否”），Ctrl+C 退出。复用时沿用旧服务的工作区，重启时使用当前工作区；`--startup`/`--no-startup` 会传给本次打开的页面。`--no-open` 禁止自动打开浏览器。非交互调用遇到占用会直接返回错误，可通过 `--port` 选择其他端口。
 
-网页左下角「设置」提供可搜索的设置中心：主题、通知、个人资料、模型与自定义指令、记忆管理、归档会话、数据导出、权限和启动偏好。详情及与 ChatGPT 账户服务的对应范围见 [Harness 设置中心](docs/harness-settings.md)。
+网页左下角「设置」提供可搜索的设置中心：主题、通知、个人资料、模型与自定义指令、记忆管理、归档会话、数据导出、权限和启动偏好。模型服务配置、插件和 Skills 启停、任务执行、Git 差异审查均连接真实 DSH 运行时，详情见 [DSH 设置中心](docs/harness-settings.md)。
 
 
 更新时在源码仓库 `git pull` 后再次运行 `python scripts/install_dsh.py`。也可从任意目录使用安装脚本的绝对路径。`--root <目录>` 指定安装位置，`--debug` 安装调试版。
@@ -260,7 +260,7 @@ TCP 客户端在断线后会重新执行 `initialize`，并自动重试幂等读
 long-poll；创建任务、审批、artifact 导入等有副作用请求不会盲目重放。
 事件消费者使用 sequence cursor，因此进程重启后可从最后交付的事件继续。
 
-全局旗标（对齐 Codex）：
+DSH 全局旗标：
 
 ```bash
 cargo run -p dsh-cli -- -m deepseek-v4-flash -s workspace-write -a on-request "小改动"

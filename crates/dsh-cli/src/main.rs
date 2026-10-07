@@ -1,6 +1,9 @@
 mod app_server;
 mod cloud;
 mod harness_settings;
+mod model_service;
+mod harness_extensions;
+mod workspace_settings;
 mod mcp_server;
 mod startup_inventory;
 mod startup_web;
@@ -36,7 +39,7 @@ use tracing_subscriber::EnvFilter;
 #[derive(Parser, Debug)]
 #[command(
     name = "dsh",
-    about = "dsh-rust — OpenAI-compatible agent harness (Codex-style TUI + CLI)",
+    about = "DSH — agent harness for hosted and local models (TUI + CLI + Web)",
     long_about = "\
 dsh-rust is a two-layer coding agent for hosted and local OpenAI-compatible models.
 
@@ -215,7 +218,7 @@ enum Commands {
         #[arg(long)]
         last_message_file: Option<PathBuf>,
     },
-    /// Resume a session non-interactively (Codex `exec resume`)
+    /// Resume a DSH session non-interactively
     #[command(name = "exec-resume", allow_missing_positional = true)]
     ExecResume {
         /// Session id (or unique prefix)
@@ -293,7 +296,7 @@ enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         command: Vec<String>,
     },
-    /// Manage local, auditable Codex-compatible cloud artifacts.
+    /// Manage local, auditable DSH task artifacts.
     Cloud {
         #[command(subcommand)]
         action: Option<CloudCmd>,
@@ -2298,7 +2301,8 @@ fn boot_from_config(
 
     // Optional at boot — empty key is OK; configure later via CLI/TUI.
     let llm_config = config.to_llm_config(String::new());
-    let api_key = resolve_api_key_for_backend(&outer_home, llm_config.backend);
+    let effective_backend = load_settings(&outer_home).backend.unwrap_or(llm_config.backend);
+    let api_key = resolve_api_key_for_backend(&outer_home, effective_backend);
     let llm = DeepSeekClient::new(dsh_llm::LlmConfig {
         api_key,
         ..llm_config
@@ -2381,6 +2385,12 @@ fn boot_from_config(
 }
 
 fn seed_example_plugin(workspace: &Path, dest_root: &Path) -> Result<()> {
+    let state = dsh_skill::activation::ActivationStore::new(
+        dest_root.parent().ok_or_else(|| anyhow::anyhow!("plugin root has no parent"))?.join("meta/plugins-disabled.json"),
+    );
+    if state.disabled()?.contains("echo") {
+        return Ok(());
+    }
     let src = workspace.join("outer/plugins/echo-plugin");
     let dest = dest_root.join("echo");
     if !src.exists() {

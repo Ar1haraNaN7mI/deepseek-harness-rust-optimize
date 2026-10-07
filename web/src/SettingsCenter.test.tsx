@@ -18,8 +18,22 @@ vi.mock("./api", async (original) => ({
   ...(await original<typeof import("./api")>()),
   rpc: vi.fn(),
   post: vi.fn(),
+  bootstrap: vi.fn(),
 }));
 vi.mock("./Emblem", () => ({ Emblem: () => <span>DSH</span> }));
+vi.mock("./ModelServiceSettings", () => ({
+  ModelServiceSettings: ({ token, onChanged }: { token: string; onChanged: () => void }) => (
+    <button onClick={onChanged} data-token={token}>保存 DSH 模型连接</button>
+  ),
+}));
+vi.mock("./ExtensionSettings", () => ({
+  ExtensionSettings: ({ token }: { token: string }) => <div data-token={token}>DSH 扩展管理</div>,
+}));
+vi.mock("./WorkspaceSettings", () => ({
+  WorkspaceSettings: ({ token, section }: { token: string; section: string }) => (
+    <div data-token={token}>DSH 本机 {section}</div>
+  ),
+}));
 
 const session = {
   id: "s1",
@@ -131,9 +145,11 @@ function category(name: string) {
 beforeEach(() => {
   localStorage.clear();
   resetUiPreferences();
+  vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => {});
   vi.mocked(api.rpc).mockImplementation(async (_token, method) =>
     baseRpc(method),
   );
+  vi.mocked(api.bootstrap).mockResolvedValue(data);
 });
 afterEach(() => {
   cleanup();
@@ -163,7 +179,7 @@ describe("Settings center", () => {
     view.rerender(<SettingsCenter {...props} open />);
     expect(screen.queryByRole("button", { name: "确认" })).toBeNull();
   });
-  it("searches real categories and keeps unsupported cloud services free of pretend switches", async () => {
+  it("shows only DSH settings and routes native tools without third-party account placeholders", async () => {
     render(
       <SettingsCenter
         harness={harness()}
@@ -173,14 +189,26 @@ describe("Settings center", () => {
       />,
     );
     await ready();
-    fireEvent.change(screen.getByLabelText("搜索设置"), {
-      target: { value: "Cloud computer" },
-    });
-    expect(screen.getByText(/云电脑需要远程计算环境/)).toBeTruthy();
-    expect(screen.queryByRole("switch")).toBeNull();
-    expect(
-      screen.getByRole("link", { name: /前往 ChatGPT/ }).getAttribute("href"),
-    ).toBe("https://chatgpt.com/settings/general-settings");
+    const navigation = screen.getByRole("navigation", { name: "设置分类" });
+    const names = within(navigation).getAllByRole("button").map((button) => button.textContent);
+    expect(names).toEqual([
+      "通用", "外观", "通知", "个人资料", "执行权限", "模型服务", "已归档聊天",
+      "语音", "存储", "个性化", "宠物", "键盘", "用量", "数据控制", "插件与 Skills",
+      "本机工作区", "DSH 任务", "代码审查", "启动动画",
+    ]);
+    for (const name of names) {
+      category(name!);
+      expect(screen.getByRole("dialog").textContent).not.toMatch(/ChatGPT|Codex|OpenAI|尚未接入|云服务功能/);
+    }
+    expect(screen.queryByRole("link")).toBeNull();
+    category("本机工作区");
+    expect(screen.getByText("DSH 本机 workspace").getAttribute("data-token")).toBe("local-token");
+    category("DSH 任务");
+    expect(screen.getByText("DSH 本机 tasks")).toBeTruthy();
+    category("代码审查");
+    expect(screen.getByText("DSH 本机 review")).toBeTruthy();
+    fireEvent.change(screen.getByLabelText("搜索设置"), { target: { value: "Skills" } });
+    expect(screen.getByText("DSH 扩展管理").getAttribute("data-token")).toBe("local-token");
     fireEvent.click(screen.getByLabelText("清除搜索"));
     category("个性化");
     expect(screen.getByText(/本机全局配置已关闭学习记忆/)).toBeTruthy();
@@ -192,6 +220,50 @@ describe("Settings center", () => {
     category("用量");
     expect(screen.getByText("12")).toBeTruthy();
     expect(screen.getByText("24")).toBeTruthy();
+  });
+
+  it("refreshes the actual model and mounted inventory after a native service change", async () => {
+    const state = harness();
+    const updated = { ...data, model: { ...data.model, name: "verified-model" } };
+    vi.mocked(api.bootstrap).mockResolvedValue(updated);
+    render(<SettingsCenter harness={state} onReplay={vi.fn()} open onOpenChange={vi.fn()} />);
+    await ready();
+    category("模型服务");
+    expect(screen.getByRole("button", { name: "保存 DSH 模型连接" }).getAttribute("data-token")).toBe("local-token");
+    fireEvent.click(screen.getByRole("button", { name: "保存 DSH 模型连接" }));
+    await waitFor(() => expect(state.setData).toHaveBeenCalledWith(updated));
+    expect(api.bootstrap).toHaveBeenCalledOnce();
+    expect(state.refreshSessions).toHaveBeenCalledOnce();
+  });
+
+  it("persists custom instructions and memory choices through the real settings patch contract", async () => {
+    render(<SettingsCenter harness={harness()} onReplay={vi.fn()} open onOpenChange={vi.fn()} />);
+    await ready();
+    category("个性化");
+    fireEvent.change(screen.getByLabelText("自定义指令"), {
+      target: { value: "Answer as DSH. Use runnable examples." },
+    });
+    fireEvent.click(screen.getByRole("switch", { name: "在任务中使用已保存记忆" }));
+    fireEvent.click(screen.getByRole("button", { name: "保存更改" }));
+    await waitFor(() => expect(api.rpc).toHaveBeenCalledWith("local-token", "settings/update", {
+      patch: {
+        personality: "default",
+        characteristics: { warmth: "default", enthusiasm: "default", headers_lists: "default", emoji: "default" },
+        custom_instructions: "Answer as DSH. Use runnable examples.",
+        memory_inject: false,
+        memory_generate: true,
+      },
+    }));
+  });
+
+  it("uses installed recordings for each chosen startup step", async () => {
+    render(<SettingsCenter harness={harness()} onReplay={vi.fn()} open onOpenChange={vi.fn()} />);
+    await ready();
+    category("语音");
+    fireEvent.change(screen.getByLabelText("试听步骤"), { target: { value: "phase-3-mounted" } });
+    expect(screen.getByLabelText("试听 DSH 英文开场旁白").getAttribute("src")).toBe("/assets/voice/phase-3-mounted.wav");
+    fireEvent.change(screen.getByLabelText("试听步骤"), { target: { value: "load-warning" } });
+    expect(screen.getByLabelText("试听 DSH 英文开场旁白").getAttribute("src")).toBe("/assets/voice/load-warning.wav");
   });
 
   it("keeps the profile draft and reports actual save failure instead of claiming persistence", async () => {

@@ -9,23 +9,18 @@ import {
 import * as Dialog from "@radix-ui/react-dialog";
 import {
   ArchiveIcon,
-  AvatarIcon,
   BarChartIcon,
   BellIcon,
   BoxIcon,
-  CardStackIcon,
   CheckIcon,
   ChevronRightIcon,
   CodeIcon,
   Cross1Icon,
   DesktopIcon,
   DownloadIcon,
-  ExternalLinkIcon,
   FaceIcon,
   GearIcon,
   GlobeIcon,
-  HeartIcon,
-  IdCardIcon,
   KeyboardIcon,
   LockClosedIcon,
   MagicWandIcon,
@@ -40,7 +35,10 @@ import {
   TrashIcon,
 } from "@radix-ui/react-icons";
 import { Emblem } from "./Emblem";
-import { errorText, isAbort, post, rpc } from "./api";
+import { bootstrap, errorText, isAbort, post, rpc } from "./api";
+import { ModelServiceSettings } from "./ModelServiceSettings";
+import { ExtensionSettings } from "./ExtensionSettings";
+import { WorkspaceSettings } from "./WorkspaceSettings";
 import {
   readPreferences,
   savePreferences,
@@ -86,11 +84,6 @@ type SettingsSnapshot = {
     memory_inject: boolean;
     memory_generate: boolean;
   };
-  account: {
-    kind: string;
-    credential_configured: boolean;
-    model_ready: boolean;
-  };
   storage: {
     session_count: number;
     archived_count: number;
@@ -107,28 +100,6 @@ type SettingsSnapshot = {
     tool_call_count: number;
     event_count: number;
     token_usage_available: false;
-  };
-  capabilities: {
-    plugin_toggle: boolean;
-    mcp_connect: boolean;
-    cloud_account: boolean;
-  };
-  plugins: {
-    id: string;
-    name: string;
-    version?: string;
-    description?: string;
-    tool_count: number;
-    enabled: boolean;
-  }[];
-  mcp: {
-    servers: {
-      name: string;
-      enabled: boolean;
-      transport: string;
-      status: string;
-    }[];
-    connection_supported: boolean;
   };
 };
 type Memory = {
@@ -187,18 +158,17 @@ const categories: Category[] = [
   },
   {
     id: "security",
-    label: "安全与登录",
-    english: "Security and login",
+    label: "执行权限",
+    english: "Execution permissions",
     icon: LockClosedIcon,
-    keywords:
-      "批准 沙箱 权限 密码 MFA 通行密钥 设备 登录 高级保护 锁定 CSP device code",
+    keywords: "批准 沙箱 权限 工具 安全 研究",
   },
   {
-    id: "account",
-    label: "账户",
-    english: "Account",
-    icon: AvatarIcon,
-    keywords: "本机 模型 凭据 登录",
+    id: "model-service",
+    label: "模型服务",
+    english: "Model service",
+    icon: GlobeIcon,
+    keywords: "后端 API URL 地址 模型 密钥 凭据 连接 测试",
   },
   {
     id: "archived",
@@ -208,25 +178,11 @@ const categories: Category[] = [
     keywords: "会话 恢复 删除 档案",
   },
   {
-    id: "parental",
-    label: "家长控制",
-    english: "Parental controls",
-    icon: HeartIcon,
-    keywords: "家庭 青少年",
-  },
-  {
-    id: "trusted",
-    label: "受信任联系人",
-    english: "Trusted contact",
-    icon: IdCardIcon,
-    keywords: "紧急 联系人",
-  },
-  {
     id: "voice",
     label: "语音",
     english: "Voice",
     icon: SpeakerLoudIcon,
-    keywords: "启动 英文 配音 录音 听写 语言",
+    keywords: "启动 英文 配音 旁白 试听",
   },
   {
     id: "storage",
@@ -265,62 +221,41 @@ const categories: Category[] = [
     keywords: "统计 token 会话 工具",
   },
   {
-    id: "billing",
-    label: "账单",
-    english: "Billing",
-    icon: CardStackIcon,
-    keywords: "付款 订阅 发票 费用",
-  },
-  {
     id: "data",
     label: "数据控制",
     english: "Data controls",
     icon: BoxIcon,
-    keywords: "导出 删除 归档 训练 共享 链接 隐私 cookie 营销 重置",
+    keywords: "导出 删除 归档 会话 重命名 重置",
   },
   {
     id: "plugins",
-    label: "插件",
-    english: "Plugins",
+    label: "插件与 Skills",
+    english: "Plugins and skills",
     icon: GlobeIcon,
-    keywords: "skills MCP 扩展 连接 应用",
+    keywords: "skills 技能 扩展 安装 启用 停用 卸载",
     group: "集成",
   },
   {
-    id: "passwords",
-    label: "密码",
-    english: "Passwords",
-    icon: LockClosedIcon,
-    keywords: "保存 填充 密码管理器",
-  },
-  {
-    id: "cloud-computer",
-    label: "云电脑",
-    english: "Cloud computer",
+    id: "workspace",
+    label: "本机工作区",
+    english: "Local workspace",
     icon: DesktopIcon,
-    keywords: "远程 浏览器 虚拟机",
+    keywords: "目录 Git 分支 状态 修改 补丁 应用",
     group: "开发工具",
   },
   {
-    id: "codex-cloud",
-    label: "Codex 云端",
-    english: "Codex Cloud",
+    id: "tasks",
+    label: "DSH 任务",
+    english: "DSH tasks",
     icon: CodeIcon,
-    keywords: "代码 仓库 云 任务",
-  },
-  {
-    id: "legacy-codex-cloud",
-    label: "旧版 Codex 云端",
-    english: "Legacy Codex Cloud",
-    icon: CodeIcon,
-    keywords: "历史 代码 环境",
+    keywords: "执行 暂停 继续 取消 结果 本机",
   },
   {
     id: "code-review",
     label: "代码审查",
     english: "Code Review",
     icon: CheckIcon,
-    keywords: "GitHub pull request PR 自动审查",
+    keywords: "Git 分支 修改 差异 diff 模型 检查",
   },
   {
     id: "startup",
@@ -337,50 +272,6 @@ const defaultCharacteristics = {
   headers_lists: "default",
   emoji: "default",
 } as const;
-const cloudPanels: Record<string, { description: string; features: string[] }> =
-  {
-    parental: {
-      description:
-        "家长与青少年账户关联需要对应云服务的账户系统。本机 DSH 尚未提供家庭账户。",
-      features: ["家庭账户关联", "青少年使用设置", "监护人管理"],
-    },
-    trusted: {
-      description:
-        "受信任联系人依赖云账户及联系人验证，本机 DSH 不保存这类联系人。",
-      features: ["联系人邀请与验证", "账户支持联系"],
-    },
-    billing: {
-      description:
-        "DSH 使用你配置的模型服务，不管理 ChatGPT 订阅或统一结算模型调用费用。账单需在实际模型提供方账户中查看。",
-      features: ["订阅与付款方式", "账单和发票", "模型提供方调用费用"],
-    },
-    passwords: {
-      description:
-        "本机 DSH 尚未提供密码保险库或自动填充。模型凭据由本机配置管理，不会显示在网页上。",
-      features: ["密码保存与自动填充", "通行密钥管理"],
-    },
-    "cloud-computer": {
-      description:
-        "云电脑需要远程计算环境和对应云服务授权。本机工作区工具不会自动创建云电脑。",
-      features: ["远程浏览器", "云端桌面与环境"],
-    },
-    "codex-cloud": {
-      description:
-        "Codex 云端的仓库授权、云环境和远程任务由对应 OpenAI 账户管理，尚未接入本机 DSH。",
-      features: ["仓库与环境配置", "云端任务", "云端网络访问"],
-    },
-    "legacy-codex-cloud": {
-      description:
-        "旧版 Codex 云端的历史环境与任务属于对应云账户，本机 DSH 无法读取或更改。",
-      features: ["旧版环境", "历史云端任务"],
-    },
-    "code-review": {
-      description:
-        "自动代码审查需要云端仓库集成。本机 DSH 可以接收审查任务，但此页面尚未提供 GitHub 自动审查设置。",
-      features: ["仓库授权", "自动 PR 审查", "云端审查用量"],
-    },
-  };
-
 function Row({
   title,
   description,
@@ -471,40 +362,6 @@ function Section({
     </section>
   );
 }
-function Unavailable({
-  title = "此功能尚未接入本机 DSH",
-  description,
-  features,
-  official = true,
-}: {
-  title?: string;
-  description: string;
-  features: string[];
-  official?: boolean;
-}) {
-  return (
-    <div className="sc-unavailable">
-      <span className="sc-label">云服务功能</span>
-      <h3>{title}</h3>
-      <p>{description}</p>
-      <ul>
-        {features.map((feature) => (
-          <li key={feature}>{feature}</li>
-        ))}
-      </ul>
-      {official && (
-        <a
-          className="sc-link"
-          href="https://chatgpt.com/settings/general-settings"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          前往 ChatGPT 账户设置 <ExternalLinkIcon />
-        </a>
-      )}
-    </div>
-  );
-}
 const bytes = (value: number | undefined) =>
   value == null
     ? "—"
@@ -575,7 +432,9 @@ export function SettingsCenter({
   }>();
   const generation = useRef(0);
   const operation = useRef(false);
+  const nativeRefresh = useRef(0);
   const voice = useRef<HTMLAudioElement>(null);
+  const [voicePhase, setVoicePhase] = useState("phase-0");
   const matches = categories.filter((category) =>
     `${category.label} ${category.english} ${category.keywords}`
       .toLowerCase()
@@ -723,6 +582,30 @@ export function SettingsCenter({
     setRemote(settings);
     await harness.refreshSessions();
   }
+  async function refreshNativeSettings() {
+    if (!data) return;
+    const serial = generation.current;
+    const request = ++nativeRefresh.current;
+    try {
+      const [settings, state] = await Promise.all([
+        rpc<SettingsSnapshot>(data.token, "settings/get"),
+        bootstrap(),
+      ]);
+      if (serial !== generation.current || request !== nativeRefresh.current)
+        return;
+      setRemote(settings);
+      setDraft((previous) => previous && {
+        ...previous,
+        model: settings.effective.model,
+        thinking: settings.effective.thinking,
+      });
+      setData(state);
+      await harness.refreshSessions();
+    } catch (failure) {
+      if (serial === generation.current && request === nativeRefresh.current)
+        setError(`刷新工作台失败：${errorText(failure)}`);
+    }
+  }
   function confirmAction(
     title: string,
     text: string,
@@ -820,7 +703,6 @@ export function SettingsCenter({
       <span>保存到本机 DSH 设置</span>
     </div>
   );
-  const cloud = current && cloudPanels[current.id];
 
   function sessionManager() {
     const visible = allSessions.filter((session) =>
@@ -971,7 +853,6 @@ export function SettingsCenter({
           <p>试试“主题”“记忆”或“启动动画”。</p>
         </div>
       );
-    if (cloud) return <Unavailable {...cloud} />;
     switch (current.id) {
       case "general":
         return (
@@ -1325,57 +1206,10 @@ export function SettingsCenter({
                 security_research_mode: draft?.security_research_mode,
               })}
             </Section>
-            <Unavailable
-              title="云账户登录安全"
-              description="本机 DSH 使用本地服务连接，未接入 ChatGPT 的登录与账户保护功能。"
-              features={[
-                "通行密钥、密码与多重验证",
-                "活跃设备与登录连接",
-                "高级保护、锁定模式、CSP 与设备代码",
-              ]}
-            />
           </>
         );
-      case "account":
-        return (
-          <>
-            <Section>
-              <Row title="账户类型" description="此身份属于本机 DSH。">
-                <span className="sc-value">本机操作员</span>
-              </Row>
-              <Row title="显示名称">
-                <span className="sc-value">
-                  {data?.profile.username || "—"}
-                </span>
-              </Row>
-              <Row title="模型凭据">
-                <span className="sc-value">
-                  {remote
-                    ? remote.account.credential_configured
-                      ? "已配置"
-                      : "未配置"
-                    : "—"}
-                </span>
-              </Row>
-              <Row title="模型连接配置">
-                <span className="sc-value">
-                  {remote
-                    ? remote.account.model_ready
-                      ? "可用"
-                      : "需要配置"
-                    : "—"}
-                </span>
-              </Row>
-            </Section>
-            <p className="sc-info">
-              模型凭据通过本机环境或配置文件管理。页面不会读取或展示你的密钥内容。
-            </p>
-            <Unavailable
-              description="ChatGPT 订阅、邮箱、登录和云端身份需要在对应账户中管理。"
-              features={["邮箱与账户身份", "云端订阅", "登录方式"]}
-            />
-          </>
-        );
+      case "model-service":
+        return data ? <ModelServiceSettings token={data.token} onChanged={refreshNativeSettings} /> : null;
       case "archived":
         return (
           <Section description="归档会话保留记录，可随时恢复到侧栏。">
@@ -1429,18 +1263,39 @@ export function SettingsCenter({
           <>
             <Section>
               <Row title="启动旁白">
-                <span className="sc-value">DSH 原创预录旁白</span>
+                <span className="sc-value">DSH 固定英文启动旁白</span>
               </Row>
               <Row title="旁白语言">
                 <span className="sc-value">English</span>
               </Row>
+              <Row title="试听步骤">
+                <Select
+                  label="试听步骤"
+                  value={voicePhase}
+                  onChange={(phase) => {
+                    voice.current?.pause();
+                    setVoicePhase(phase);
+                  }}
+                  options={[
+                    ["phase-0", "01 · 启动序列"],
+                    ["phase-1", "02 · 本机工作区"],
+                    ["phase-2", "03 · 操作员身份"],
+                    ["phase-3-mounted", "04 · 已挂载能力"],
+                    ["phase-4", "05 · 加载完成"],
+                    ["phase-5", "06 · 欢迎操作员"],
+                    ["load-warning", "加载结果 · 部分异常"],
+                    ["load-unavailable", "加载结果 · 无法读取"],
+                  ]}
+                />
+              </Row>
               <div className="sc-audio">
-                <span>试听开场旁白</span>
+                <span>试听所选旁白</span>
                 <audio
+                  key={voicePhase}
                   ref={voice}
                   controls
                   preload="none"
-                  src="/assets/voice/phase-0.wav"
+                  src={`/assets/voice/${voicePhase}.wav`}
                   aria-label="试听 DSH 英文开场旁白"
                   onError={() =>
                     setError("旁白音频暂时无法读取，请确认本机资源已安装。")
@@ -1451,11 +1306,6 @@ export function SettingsCenter({
                 播放固定英文录音，不使用系统语音合成。
               </p>
             </Section>
-            <Unavailable
-              title="对话语音功能尚未接入"
-              description="本机目前提供启动旁白，不提供完整的云端语音对话与录音账户。"
-              features={["对话声音选择", "听写与语言识别", "最近录音管理"]}
-            />
           </>
         );
       case "storage":
@@ -1745,16 +1595,6 @@ export function SettingsCenter({
                 memory_generate: draft?.memory_generate,
               })}
             </Section>
-            <Unavailable
-              title="其他云端个性化功能"
-              description="以下功能需要对应服务提供的账户、搜索或多媒体能力，本机尚未提供。"
-              features={[
-                "写作风格库与参考照片",
-                "快速回答与建议提示",
-                "历史、语音及空间搜索",
-                "连接器搜索",
-              ]}
-            />
           </>
         );
       case "pets":
@@ -1778,11 +1618,6 @@ export function SettingsCenter({
                 />
               </Row>
             </Section>
-            <Unavailable
-              title="云端宠物功能"
-              description="本机可显示内置小猫，自定义云端宠物生成和上传尚未接入。"
-              features={["生成自定义宠物", "上传和同步宠物"]}
-            />
           </>
         );
       case "keyboard":
@@ -1989,89 +1824,14 @@ export function SettingsCenter({
                 </button>
               </Row>
             </Section>
-            <Unavailable
-              title="云端数据控制"
-              description="本机 DSH 不提供 ChatGPT 云账户的数据治理设置，也不会在这里更改模型提供方的数据政策。"
-              features={[
-                "共享链接、模型训练与工作网络",
-                "重置 Work、应用信息与云端归档",
-                "Cookie、营销与隐私选项",
-              ]}
-            />
           </>
         );
       case "plugins":
-        return (
-          <>
-            <Section
-              title="本机插件"
-              description="以下项目已挂载到当前运行时；本页不提供未实现的插件启停开关。"
-            >
-              {remote?.plugins.length ? (
-                remote.plugins.map((plugin) => (
-                  <details className="sc-plugin" key={plugin.id}>
-                    <summary>
-                      <span className="sc-plugin-icon">
-                        <GlobeIcon />
-                      </span>
-                      <span>
-                        <strong>{plugin.name}</strong>
-                        <small>
-                          {plugin.tool_count} 个工具
-                          {plugin.version ? ` · ${plugin.version}` : ""}
-                        </small>
-                      </span>
-                      <span className="sc-tag">
-                        {plugin.enabled ? "已挂载" : "未挂载"}
-                      </span>
-                      <ChevronRightIcon />
-                    </summary>
-                    <p>{plugin.description || "插件未提供附加说明。"}</p>
-                    <code>{plugin.id}</code>
-                  </details>
-                ))
-              ) : (
-                <p className="sc-description">当前没有已挂载的本机插件。</p>
-              )}
-            </Section>
-            <Section
-              title="MCP 服务配置"
-              description="显示本机已配置的服务。配置状态不代表已经建立连接。"
-            >
-              {remote?.mcp.servers.length ? (
-                remote.mcp.servers.map((server) => (
-                  <Row
-                    key={server.name}
-                    title={server.name}
-                    description={server.transport}
-                  >
-                    <span className="sc-value">
-                      {server.enabled ? "已配置" : "配置已停用"}
-                    </span>
-                  </Row>
-                ))
-              ) : (
-                <p className="sc-description">当前没有 MCP 服务配置。</p>
-              )}
-              <p className="sc-info">此页面尚未提供 MCP 建连操作。</p>
-            </Section>
-            <Section title="Skills">
-              <Row title="已挂载能力">
-                <span className="sc-value">{data?.skills.length ?? "—"}</span>
-              </Row>
-              <div className="sc-skill-names">
-                {data?.skills.map((skill) => (
-                  <span
-                    key={skill.source + skill.name}
-                    title={skill.description}
-                  >
-                    {skill.name}
-                  </span>
-                ))}
-              </div>
-            </Section>
-          </>
-        );
+        return data ? <ExtensionSettings token={data.token} onChanged={refreshNativeSettings} /> : null;
+      case "workspace":
+      case "tasks":
+      case "code-review":
+        return data ? <WorkspaceSettings token={data.token} section={current.id === "code-review" ? "review" : current.id} onChanged={refreshNativeSettings} /> : null;
       case "startup":
         return (
           <>

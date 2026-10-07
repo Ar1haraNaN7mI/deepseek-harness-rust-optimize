@@ -104,6 +104,8 @@ struct CachedBody {
 
 pub struct SkillCatalog {
     records: RwLock<HashMap<String, SkillRecord>>,
+    shadowed: RwLock<HashMap<String, Vec<SkillRecord>>>,
+    activation: crate::activation::ActivationStore,
     body_cache: RwLock<HashMap<String, CachedBody>>,
     df_cache: RwLock<Option<(u64, HashMap<String, usize>)>>,
     generation: AtomicU64,
@@ -115,6 +117,10 @@ impl SkillCatalog {
         let _ = std::fs::create_dir_all(&meta_dir);
         Self {
             records: RwLock::new(HashMap::new()),
+            shadowed: RwLock::new(HashMap::new()),
+            activation: crate::activation::ActivationStore::new(
+                meta_dir.join("skills-disabled.json"),
+            ),
             body_cache: RwLock::new(HashMap::new()),
             df_cache: RwLock::new(None),
             generation: AtomicU64::new(0),
@@ -215,12 +221,19 @@ impl SkillCatalog {
             enriched.insert(name, record);
         }
         *self.records.write() = enriched;
+        self.shadowed.write().clear();
         self.body_cache.write().clear();
         self.bump();
         skipped.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.path.cmp(&b.path)));
         for event in skipped.into_iter().chain(loaded) {
             observe(event);
         }
+    }
+
+    /// Mount a skill path from a plugin (or other outer source) without full rediscovery.
+    pub fn validate_path(path: &Path) -> anyhow::Result<()> {
+        parse_skill_file(path, SkillSource::Plugin)?;
+        Ok(())
     }
 
     /// Mount a skill path from a plugin (or other outer source) without full rediscovery.
@@ -248,6 +261,13 @@ impl SkillCatalog {
         self.body_cache.write().remove(&name);
         self.bump();
         if let Some(previous) = replaced {
+            if previous.summary.path != path {
+                self.shadowed
+                    .write()
+                    .entry(name.clone())
+                    .or_default()
+                    .push(previous.clone());
+            }
             observe(SkillLoadEvent::from_record(
                 &previous,
                 SkillLoadStatus::Skipped,
@@ -263,6 +283,7 @@ impl SkillCatalog {
             .records
             .read()
             .values()
+            .filter(|record| self.activation.enabled(&record.summary.name))
             .map(|r| r.summary.clone())
             .collect();
         list.sort_by(|a, b| a.name.cmp(&b.name));
@@ -283,6 +304,14 @@ impl SkillCatalog {
     }
 
     pub fn get(&self, name: &str) -> Option<SkillRecord> {
+        if !self.activation.enabled(name) {
+            return None;
+        }
+        self.inspect(name)
+    }
+
+    /// Management can inspect a disabled skill without exposing it to the model.
+    pub fn inspect(&self, name: &str) -> Option<SkillRecord> {
         let records = self.records.read();
         let base = records.get(name).cloned()?;
         drop(records);
@@ -343,6 +372,62 @@ impl SkillCatalog {
 
     pub fn meta_dir(&self) -> &Path {
         &self.meta_dir
+    }
+
+    pub fn management_list(&self) -> anyhow::Result<Vec<(SkillSummary, bool)>> {
+        let disabled = self.activation.disabled()?;
+        let mut all = self
+            .records
+            .read()
+            .values()
+            .map(|record| {
+                (
+                    record.summary.clone(),
+                    !disabled.contains(&record.summary.name),
+                )
+            })
+            .collect::<Vec<_>>();
+        all.sort_by(|a, b| a.0.name.cmp(&b.0.name));
+        Ok(all)
+    }
+
+    pub fn set_enabled(&self, name: &str, enabled: bool) -> anyhow::Result<()> {
+        if !self.records.read().contains_key(name) {
+            anyhow::bail!("unknown skill: {name}")
+        }
+        self.activation.set_enabled(name, enabled)?;
+        self.body_cache.write().remove(name);
+        self.bump();
+        Ok(())
+    }
+
+    /// Unmount plugin-owned instructions and restore any skill they shadowed.
+    pub fn unmount_root(&self, root: &Path) {
+        let mut records = self.records.write();
+        let mut shadowed = self.shadowed.write();
+        for stack in shadowed.values_mut() {
+            stack.retain(|record| !record.summary.path.starts_with(root));
+        }
+        let names = records
+            .iter()
+            .filter(|(_, record)| record.summary.path.starts_with(root))
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>();
+        for name in names {
+            records.remove(&name);
+            if let Some(stack) = shadowed.get_mut(&name) {
+                while let Some(previous) = stack.pop() {
+                    if previous.summary.path.is_file() {
+                        records.insert(name.clone(), previous);
+                        break;
+                    }
+                }
+            }
+            self.body_cache.write().remove(&name);
+        }
+        drop(shadowed);
+        drop(records);
+        self.bump();
     }
 }
 
@@ -557,6 +642,53 @@ mod observed_tests {
                 .starts_with("dsh-skill-observed-"));
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn disabled_skills_stay_out_of_routing_and_loading_after_restart() {
+        let fixture = Fixture::new();
+        let path = fixture.write(
+            "skills/review/SKILL.md",
+            "---\nname: review\n---\nReview source code.",
+        );
+        let catalog = SkillCatalog::new(fixture.0.join("meta"));
+        catalog.mount_path(&path, SkillSource::OuterHome).unwrap();
+        catalog.set_enabled("review", false).unwrap();
+        assert!(catalog.get("review").is_none());
+        assert!(catalog.list().is_empty());
+        assert!(!catalog.management_list().unwrap()[0].1);
+        assert!(catalog.inspect("review").is_some());
+        let restarted = SkillCatalog::new(fixture.0.join("meta"));
+        restarted.mount_path(&path, SkillSource::OuterHome).unwrap();
+        assert!(restarted.get("review").is_none());
+        restarted.set_enabled("review", true).unwrap();
+        assert!(restarted.get("review").is_some());
+        assert_eq!(restarted.list().len(), 1);
+    }
+
+    #[test]
+    fn failed_activation_write_does_not_change_running_catalog() {
+        let fixture = Fixture::new();
+        let path = fixture.write("skill.md", "---\nname: review\n---\nReview source code.");
+        let catalog = SkillCatalog::new(fixture.0.join("meta"));
+        catalog.mount_path(&path, SkillSource::OuterHome).unwrap();
+        std::fs::create_dir(fixture.0.join("meta/skills-disabled.json")).unwrap();
+        assert!(catalog.set_enabled("review", false).is_err());
+        assert!(catalog.get("review").is_some());
+    }
+
+    #[test]
+    fn unmount_plugin_restores_the_skill_it_shadowed() {
+        let fixture = Fixture::new();
+        let original = fixture.write("skill.md", "---\nname: shared\n---\nOriginal");
+        let plugin = fixture.write("plugin/SKILL.md", "---\nname: shared\n---\nPlugin");
+        let catalog = SkillCatalog::new(fixture.0.join("meta"));
+        catalog
+            .mount_path(&original, SkillSource::OuterHome)
+            .unwrap();
+        catalog.mount_path(&plugin, SkillSource::Plugin).unwrap();
+        catalog.unmount_root(&fixture.0.join("plugin"));
+        assert_eq!(catalog.get("shared").unwrap().summary.path, original);
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! Outer-layer session settings (Codex-aligned TUI/agent preferences).
+//! Persistent DSH terminal, model and agent preferences.
 
 use crate::permissions::PermissionMode;
 use anyhow::{Context, Result};
@@ -15,6 +15,16 @@ pub struct SessionSettings {
     pub model: Option<String>,
     #[serde(default)]
     pub thinking: Option<bool>,
+    #[serde(default)]
+    pub backend: Option<dsh_llm::LlmBackend>,
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+    #[serde(default)]
+    pub send_local_api_key: Option<bool>,
     #[serde(default)]
     pub sidebar: Option<bool>,
     #[serde(default)]
@@ -70,6 +80,11 @@ impl Default for SessionSettings {
             permissions: PermissionMode::default(),
             model: None,
             thinking: None,
+            backend: None,
+            base_url: None,
+            temperature: None,
+            max_tokens: None,
+            send_local_api_key: None,
             sidebar: None,
             show_thinking: None,
             personality: None,
@@ -121,6 +136,11 @@ pub struct PersonalityCharacteristics {
 pub struct SettingsPatch {
     pub model: Option<String>,
     pub thinking: Option<bool>,
+    pub backend: Option<dsh_llm::LlmBackend>,
+    pub base_url: Option<String>,
+    pub temperature: Option<f32>,
+    pub max_tokens: Option<u32>,
+    pub send_local_api_key: Option<bool>,
     pub personality: Option<String>,
     pub custom_instructions: Option<String>,
     pub characteristics: Option<PersonalityCharacteristics>,
@@ -135,6 +155,23 @@ pub struct SettingsPatch {
 
 impl SettingsPatch {
     pub(crate) fn apply(self, settings: &mut SessionSettings) -> Result<()> {
+        if let Some(enabled) = self.send_local_api_key {
+            settings.send_local_api_key = Some(enabled);
+        }
+        if let Some(backend) = self.backend {
+            settings.backend = Some(backend);
+        }
+        if let Some(base_url) = self.base_url {
+            let base_url = base_url.trim().trim_end_matches('/');
+            validate_model_endpoint(base_url)?;
+            settings.base_url = Some(base_url.to_owned());
+        }
+        if let Some(temperature) = self.temperature {
+            settings.temperature = Some(temperature);
+        }
+        if let Some(max_tokens) = self.max_tokens {
+            settings.max_tokens = Some(max_tokens);
+        }
         if let Some(model) = self.model {
             let model = model.trim();
             anyhow::ensure!(
@@ -189,6 +226,21 @@ impl SettingsPatch {
 
 impl SessionSettings {
     pub fn validate(&self) -> Result<()> {
+        if let Some(url) = &self.base_url {
+            validate_model_endpoint(url)?;
+        }
+        if let Some(value) = self.temperature {
+            anyhow::ensure!(
+                value.is_finite() && (0.0..=2.0).contains(&value),
+                "temperature must be between 0 and 2"
+            );
+        }
+        if let Some(value) = self.max_tokens {
+            anyhow::ensure!(
+                (1..=131072).contains(&value),
+                "max_tokens must be between 1 and 131072"
+            );
+        }
         anyhow::ensure!(
             self.custom_instructions.chars().count() <= CUSTOM_INSTRUCTIONS_MAX_CHARS,
             "Custom instructions must be at most {CUSTOM_INSTRUCTIONS_MAX_CHARS} characters"
@@ -236,6 +288,22 @@ impl SessionSettings {
         }
         lines.join("\n")
     }
+}
+
+/// Keep credentials separate from the endpoint that is displayed in settings.
+pub fn validate_model_endpoint(value: &str) -> Result<()> {
+    anyhow::ensure!(
+        value.len() <= 2048 && !value.chars().any(char::is_control),
+        "Invalid model service URL"
+    );
+    let url =
+        reqwest::Url::parse(value).map_err(|_| anyhow::anyhow!("Invalid model service URL"))?;
+    anyhow::ensure!(
+        matches!(url.scheme(), "http" | "https") && url.host_str().is_some(),
+        "Model service URL must use HTTP or HTTPS"
+    );
+    anyhow::ensure!(url.username().is_empty() && url.password().is_none() && url.query().is_none() && url.fragment().is_none(), "Put credentials in the API key field; service URL cannot contain user info, query or fragment");
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

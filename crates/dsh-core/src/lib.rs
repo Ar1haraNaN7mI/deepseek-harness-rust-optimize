@@ -222,12 +222,13 @@ impl Runtime {
             .write()
             .set_security_research_mode(settings.security_research_mode);
 
-        if let Some(model) = settings.model {
-            runtime.llm.set_model(model);
+        if let Some(model) = &settings.model {
+            runtime.llm.set_model(model.clone());
         }
         if let Some(thinking) = settings.thinking {
             runtime.llm.set_thinking(thinking);
         }
+        runtime.apply_model_service(&settings);
         runtime.sync_personalization();
 
         runtime.sync_model_optimization();
@@ -342,6 +343,7 @@ impl Runtime {
         if let Some(thinking) = next.thinking {
             self.llm.set_thinking(thinking);
         }
+        self.apply_model_service(&next);
         *self.permissions.write() = next.permissions;
         self.prompt
             .write()
@@ -353,6 +355,24 @@ impl Runtime {
 
     pub fn sync_personalization(&self) {
         self.apply_personalization(&self.settings.read());
+    }
+
+    fn apply_model_service(&self, settings: &SessionSettings) {
+        if let Some(enabled) = settings.send_local_api_key {
+            self.llm.set_send_local_api_key(enabled);
+        }
+        if let Some(backend) = settings.backend {
+            self.llm.set_backend(backend);
+        }
+        if let Some(base_url) = &settings.base_url {
+            self.llm.set_base_url(base_url.clone());
+        }
+        if let Some(temperature) = settings.temperature {
+            self.llm.set_temperature(temperature);
+        }
+        if let Some(max_tokens) = settings.max_tokens {
+            self.llm.set_max_tokens(max_tokens);
+        }
     }
 
     fn apply_personalization(&self, settings: &SessionSettings) {

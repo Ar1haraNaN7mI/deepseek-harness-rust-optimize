@@ -1,0 +1,34 @@
+.ws-code {
+  padding: 13px;
+  background: var(--sc-field);
+  border: 1px solid var(--sc-line);
+  border-radius: 7px;
+  font: 11px/1.65 var(--mono);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 280px;
+  overflow: auto;
+  margin: 12px 0;
+}
+.ws-mono { font-family: var(--mono); }
+.ws-list { display: grid; gap: 12px; margin: 16px 0; }
+.ws-item, .ws-result { padding: 14px; border: 1px solid var(--sc-line); border-radius: 9px; min-width: 0; }
+.ws-result { margin-top: 18px; }
+.ws-item-heading { display: flex; align-items: flex-start; gap: 14px; justify-content: space-between; margin-bottom: 7px; }
+.ws-item-heading > strong { font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; white-space: pre-wrap; max-height: 6.4em; overflow: auto; }
+.ws-subtle { color: var(--sc-muted); font-size: 10px; overflow-wrap: anywhere; }
+.ws-item > .sc-actions { margin-top: 13px; }
+.ws-result > p { font-size: 12px; line-height: 1.7; }
+.ws-item details, .ws-result details { font-size: 11px; margin-top: 14px; }
+.ws-item summary, .ws-result summary { cursor: pointer; color: var(--sc-muted); }
+.ws-event { border-top: 1px solid var(--sc-line); margin-top: 12px; padding-top: 12px; }
+.ws-event pre { white-space: pre-wrap; overflow-wrap: anywhere; font: 11px/1.6 var(--mono); max-height: 180px; overflow: auto; }
+.ws-markdown { font-size: 12px; line-height: 1.8; overflow-wrap: anywhere; }
+.ws-markdown > * { margin: 10px 0; }
+.ws-markdown ul, .ws-markdown ol { padding-left: 20px; }
+.ws-markdown pre { overflow: auto; padding: 12px; background: var(--sc-field); }
+.ws-markdown h1, .ws-markdown h2, .ws-markdown h3 { font-size: 14px; }
+.ws-markdown table { display: block; max-width: 100%; overflow: auto; }
+.ws-markdown a { color: var(--blue); }
+.sc-field > .sc-select { display: block; margin-top: 9px; }
+@media (max-width: 540px) { .ws-item-heading { flex-wrap: wrap; } .ws-code { font-size: 10px; padding: 10px; } }

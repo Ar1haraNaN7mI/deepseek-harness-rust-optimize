@@ -54,21 +54,37 @@ pub fn load_plugin_dir(root: &Path) -> Result<LoadedPlugin> {
     let manifest_path = find_manifest(root)?;
     let text = fs::read_to_string(&manifest_path)
         .with_context(|| format!("read {}", manifest_path.display()))?;
-    let manifest: PluginManifest = if manifest_path.file_name().and_then(|s| s.to_str())
-        == Some("package.json")
-    {
-        adapt_package_json(&text)?
-    } else if manifest_path.extension().and_then(|s| s.to_str()) == Some("json") {
-        serde_json::from_str(&text)?
-    } else {
-        serde_yaml::from_str(&text)?
-    };
+    let manifest: PluginManifest =
+        if manifest_path.file_name().and_then(|s| s.to_str()) == Some("package.json") {
+            adapt_package_json(&text)?
+        } else if manifest_path.extension().and_then(|s| s.to_str()) == Some("json") {
+            serde_json::from_str(&text)?
+        } else {
+            serde_yaml::from_str(&text)?
+        };
 
     if manifest.id.trim().is_empty() {
         bail!("plugin id required");
     }
     if !is_valid_id(&manifest.id) {
         bail!("invalid plugin id: {}", manifest.id);
+    }
+    for relative in manifest.entry.iter().chain(manifest.skills.iter()) {
+        let path = Path::new(relative);
+        if path.is_absolute()
+            || path.components().any(|component| {
+                !matches!(
+                    component,
+                    std::path::Component::Normal(_) | std::path::Component::CurDir
+                )
+            })
+        {
+            bail!("plugin entry and skill paths must stay inside the plugin directory: {relative}");
+        }
+        let resolved = root.join(path);
+        if resolved.exists() && !resolved.canonicalize()?.starts_with(root.canonicalize()?) {
+            bail!("plugin resource resolves outside its directory: {relative}");
+        }
     }
 
     let entry_script = if let Some(entry) = &manifest.entry {
@@ -177,10 +193,7 @@ fn adapt_package_json(text: &str) -> Result<PluginManifest> {
                         .and_then(|v| v.as_str())
                         .unwrap_or("adapted tool")
                         .to_string(),
-                    parameters: t
-                        .get("parameters")
-                        .cloned()
-                        .unwrap_or_else(default_params),
+                    parameters: t.get("parameters").cloned().unwrap_or_else(default_params),
                     rhai_fn: None,
                 });
             }
@@ -230,16 +243,22 @@ fn is_valid_id(id: &str) -> bool {
 pub fn install_plugin_from_path(src: &Path, dest_root: &Path) -> Result<PathBuf> {
     let loaded = load_plugin_dir(src)?;
     fs::create_dir_all(dest_root)?;
+    let source = src.canonicalize()?;
+    let destination = dest_root.canonicalize()?;
+    if destination.starts_with(&source) {
+        bail!("plugin install destination must not be inside its source directory");
+    }
 
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
+        .map(|d| d.as_nanos())
         .unwrap_or(0);
     let staging = dest_root.join(format!(".staging-{}-{}", loaded.manifest.id, stamp));
-    if staging.exists() {
-        fs::remove_dir_all(&staging)?;
+    fs::create_dir(&staging)?;
+    if let Err(error) = copy_dir(src, &staging) {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(error);
     }
-    copy_dir(src, &staging)?;
 
     // Validate staged copy before swapping.
     let staged = load_plugin_dir(&staging)?;
@@ -285,6 +304,12 @@ fn copy_dir(src: &Path, dest: &Path) -> Result<()> {
     fs::create_dir_all(dest)?;
     for entry in walkdir::WalkDir::new(src) {
         let entry = entry?;
+        if entry.path_is_symlink() {
+            bail!(
+                "plugin installation does not copy symbolic links: {}",
+                entry.path().display()
+            );
+        }
         let rel = entry.path().strip_prefix(src)?;
         let target = dest.join(rel);
         if entry.file_type().is_dir() {

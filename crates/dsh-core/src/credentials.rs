@@ -68,13 +68,34 @@ pub fn load_api_key(outer_home: &Path) -> Option<String> {
 
 pub fn save_api_key(outer_home: &Path, api_key: &str) -> Result<PathBuf> {
     let key = api_key.trim();
-    if key.is_empty() {
-        anyhow::bail!("API key must not be empty");
-    }
+    anyhow::ensure!(
+        !key.is_empty() && key.len() <= 8192 && !key.chars().any(char::is_control),
+        "API key must contain 1..8192 printable characters"
+    );
     fs::create_dir_all(outer_home).with_context(|| format!("create {}", outer_home.display()))?;
     let path = credentials_path(outer_home);
     let body = format!("# dsh-rust outer credentials (do not commit)\nDEEPSEEK_API_KEY={key}\n");
-    fs::write(&path, body).with_context(|| format!("write {}", path.display()))?;
+    let temp = outer_home.join(format!(".credentials-{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| -> Result<()> {
+        use std::io::Write;
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temp)?;
+        file.write_all(body.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temp, &path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result.with_context(|| format!("write {}", path.display()))?;
     // Keep process env in sync for this session.
     std::env::set_var("DEEPSEEK_API_KEY", key);
     std::env::set_var("DSH_LLM_API_KEY", key);

@@ -96,6 +96,10 @@ fn clear_memory_prompt(runtime: &Runtime) {
 /// included. These can embed secrets even when the outer config is harmless.
 pub(crate) fn snapshot(runtime: &Runtime) -> Result<Value> {
     let settings = runtime.settings.read().clone();
+    let mut public_settings = serde_json::to_value(&settings)?;
+    // Connection details have a dedicated sanitized endpoint. Keep the broad
+    // settings response credential-free even if another caller set a raw URL.
+    public_settings.as_object_mut().unwrap().remove("base_url");
     let llm = runtime.llm.config();
     let mut session_count = 0_u64;
     let mut archived_count = 0_u64;
@@ -152,7 +156,7 @@ pub(crate) fn snapshot(runtime: &Runtime) -> Result<Value> {
             "memory_available":runtime.config.learn.enabled,
             "memory_inject":runtime.config.learn.enabled && settings.memory_inject,
             "memory_generate":runtime.config.learn.enabled && settings.memory_generate},
-        "settings":settings,
+        "settings":public_settings,
         "account":{"kind":"local","credential_configured":runtime.llm.has_api_key(),"model_ready":runtime.llm.is_ready()},
         "storage":{"session_count":session_count,"archived_count":archived_count,
             "session_bytes":session_bytes,"memory_bytes":memory_bytes,"event_bytes":event_bytes,
@@ -160,7 +164,7 @@ pub(crate) fn snapshot(runtime: &Runtime) -> Result<Value> {
         "usage":{"session_count":session_count,"user_message_count":user_message_count,
             "assistant_message_count":assistant_message_count,"message_count":user_message_count+assistant_message_count,
             "tool_call_count":tool_call_count,"event_count":runtime.events.latest_sequence(),"token_usage_available":false},
-        "capabilities":{"plugin_toggle":false,"mcp_connect":false,"cloud_account":false},
+        "capabilities":{"plugin_toggle":runtime.plugins.read().is_some(),"mcp_connect":false,"cloud_account":false},
         "plugins":plugins,"mcp":{"servers":servers,"connection_supported":false}
     }))
 }
@@ -444,6 +448,15 @@ mod tests {
                 json!({"patch":{"personality":"unknown"}})
             )
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn general_settings_never_serialize_connection_urls() {
+        let fixture = Fixture::new();
+        fixture.runtime().settings.write().base_url = Some("https://private-user:private-password@example.invalid?key=private-token".into());
+        let value = fixture.call("settings/get", json!({})).unwrap();
+        assert!(value["settings"].get("base_url").is_none());
+        assert!(!value.to_string().contains("private-"));
     }
 
     #[tokio::test]

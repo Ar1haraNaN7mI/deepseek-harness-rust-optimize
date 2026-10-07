@@ -14,7 +14,7 @@ use std::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::{Mutex, Semaphore},
+    sync::{watch, Mutex, Semaphore},
 };
 
 struct Host {
@@ -28,6 +28,21 @@ struct Host {
     runtime: Option<Arc<Runtime>>,
     assets: Option<PathBuf>,
     startup_override: Option<bool>,
+    service: Option<HarnessService>,
+}
+
+struct HarnessService {
+    instance_id: String,
+    shutdown: watch::Sender<bool>,
+}
+
+impl HarnessService {
+    fn new() -> Self {
+        Self {
+            instance_id: uuid::Uuid::new_v4().to_string(),
+            shutdown: watch::channel(false).0,
+        }
+    }
 }
 
 pub async fn serve(
@@ -54,6 +69,7 @@ pub async fn serve(
         runtime: None,
         assets: None,
         startup_override: None,
+        service: None,
     });
     accept_connections(listener, host).await
 }
@@ -62,18 +78,16 @@ pub async fn serve(
 /// a second agent, start another scheduler, or consume the next-CLI preference.
 pub async fn serve_harness(
     runtime: Arc<Runtime>,
-    port: u16,
+    listener: TcpListener,
     assets: Option<PathBuf>,
     startup_override: Option<bool>,
+    open_browser: bool,
 ) -> Result<()> {
-    let cwd = std::env::current_dir().context("locate the current directory for Harness assets")?;
-    let executable = std::env::current_exe().ok();
-    let assets = resolve_harness_assets(assets.as_deref(), executable.as_deref(), &cwd)?;
-    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
-        .await
-        .context("bind Harness web host (choose another --port if it is in use)")?;
+    let assets = locate_frontend_assets(assets.as_deref())?;
+    anyhow::ensure!(listener.local_addr()?.ip().is_loopback(), "Harness listener must bind to loopback");
     let authority = listener.local_addr()?.to_string();
-    println!("DSH Harness: http://{authority}/");
+    let url = crate::web_launch::launch_url(&authority, startup_override);
+    println!("DSH Harness: {url}");
     println!(
         "Workspace: {}\nCtrl+C to stop.",
         runtime.workspace_root.display()
@@ -89,8 +103,25 @@ pub async fn serve_harness(
         runtime: Some(runtime),
         assets: Some(assets),
         startup_override,
+        service: Some(HarnessService::new()),
     });
+    if open_browser {
+        if let Err(error) = crate::web_launch::open_browser(&url) {
+            eprintln!("Could not open the browser: {error}. Open {url} manually.");
+        }
+    }
     accept_connections(listener, host).await
+}
+
+/// Check a requested installation before the launcher stops an existing host.
+pub fn validate_frontend_assets(assets: Option<&Path>) -> Result<()> {
+    locate_frontend_assets(assets).map(|_| ())
+}
+
+fn locate_frontend_assets(assets: Option<&Path>) -> Result<PathBuf> {
+    let cwd = std::env::current_dir().context("locate the current directory for Harness assets")?;
+    let executable = std::env::current_exe().ok();
+    resolve_harness_assets(assets, executable.as_deref(), &cwd)
 }
 
 fn validate_harness_assets(path: &Path) -> Result<PathBuf> {
@@ -137,7 +168,12 @@ fn resolve_harness_assets(
 
 async fn accept_connections(listener: TcpListener, host: Arc<Host>) -> Result<()> {
     let permits = Arc::new(Semaphore::new(64));
+    let mut shutdown = host.service.as_ref().map(|service| service.shutdown.subscribe());
     loop {
+        // Watch retains a shutdown requested before this loop subscribed.
+        if shutdown.as_ref().is_some_and(|receiver| *receiver.borrow()) {
+            return Ok(());
+        }
         tokio::select! {
             accepted = listener.accept() => {
                 let (socket, _) = accepted?;
@@ -148,6 +184,12 @@ async fn accept_connections(listener: TcpListener, host: Arc<Host>) -> Result<()
                     if let Err(error) = tokio::time::timeout(Duration::from_secs(130), handle(socket, host)).await { tracing::debug!(%error, "web connection timed out"); }
                 });
             }
+            _ = async {
+                match shutdown.as_mut() {
+                    Some(receiver) => { let _ = receiver.changed().await; }
+                    None => std::future::pending::<()>().await,
+                }
+            } => return Ok(()),
             _ = tokio::signal::ctrl_c() => return Ok(()),
         }
     }
@@ -273,7 +315,9 @@ fn allowed(request: &Request, host: &Host) -> bool {
     {
         return false;
     }
-    request.method != "POST" || request.headers.get("x-dsh-token") == Some(&host.token)
+    let requires_token = request.method == "POST"
+        || request.path.split('?').next() == Some("/api/harness/service");
+    !requires_token || request.headers.get("x-dsh-token") == Some(&host.token)
 }
 
 fn asset(path: &str) -> Option<(&'static str, &'static str)> {
@@ -485,6 +529,32 @@ async fn handle(mut socket: TcpStream, host: Arc<Host>) -> Result<()> {
     }
     let path = request.path.split('?').next().unwrap_or(&request.path);
     match (request.method.as_str(), path) {
+        ("GET", "/api/harness/service") if host.runtime.is_some() && host.service.is_some() => {
+            let service = host.service.as_ref().unwrap();
+            json_response(&mut socket, 200, json!({
+                "service":"dsh-harness", "protocol_version":1,
+                "instance_id":service.instance_id, "pid":std::process::id(),
+                "workspace":host.workspace, "can_shutdown":true,
+            })).await
+        }
+        ("POST", "/api/harness/shutdown") if host.runtime.is_some() && host.service.is_some() => {
+            let payload: Value = match serde_json::from_slice(&request.body) {
+                Ok(value) => value,
+                Err(_) => return json_response(&mut socket, 400, json!({"error":"Invalid JSON request"})).await,
+            };
+            let Some(instance_id) = payload.get("instance_id").and_then(Value::as_str).filter(|value| !value.is_empty()) else {
+                return json_response(&mut socket, 400, json!({"error":"instance_id must be a non-empty string"})).await;
+            };
+            let service = host.service.as_ref().unwrap();
+            if instance_id != service.instance_id {
+                return json_response(&mut socket, 409, json!({"error":"The Harness instance has changed; probe it again before restarting"})).await;
+            }
+            // Finish the acknowledgement before the listener exits and its
+            // owning CLI runtime begins shutdown. send_replace is sticky.
+            json_response(&mut socket, 200, json!({"accepted":true,"instance_id":service.instance_id})).await?;
+            service.shutdown.send_replace(true);
+            Ok(())
+        }
         ("GET", "/api/harness/bootstrap") if host.runtime.is_some() => {
             match bootstrap(&host, host.runtime.as_ref().unwrap()) {
                 Ok(value) => json_response(&mut socket, 200, value).await,
@@ -688,6 +758,10 @@ mod tests {
     }
 
     async fn harness(llm_endpoint: Option<String>) -> TestHost {
+        test_host(llm_endpoint, true).await
+    }
+
+    async fn test_host(llm_endpoint: Option<String>, mounted: bool) -> TestHost {
         let root = std::env::temp_dir().join(format!("dsh-harness-http-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&root).unwrap();
         let root = root.canonicalize().unwrap();
@@ -737,9 +811,10 @@ mod tests {
             token: uuid::Uuid::new_v4().to_string(),
             sound: false,
             inventory: Mutex::new(None),
-            runtime: Some(runtime),
-            assets: Some(assets),
+            runtime: mounted.then_some(runtime),
+            assets: mounted.then_some(assets),
             startup_override: None,
+            service: mounted.then(HarnessService::new),
         });
         let shared = host.clone();
         let task = tokio::spawn(async move {
@@ -755,17 +830,23 @@ mod tests {
         payload: Value,
         token: bool,
     ) -> (u16, Value) {
+        http_with_token(host, method, path, payload, token.then_some(host.token.as_str())).await
+    }
+
+    async fn http_with_token(
+        host: &Host,
+        method: &str,
+        path: &str,
+        payload: Value,
+        token: Option<&str>,
+    ) -> (u16, Value) {
         let mut socket = TcpStream::connect(&host.authority).await.unwrap();
         let body = if method == "POST" {
             serde_json::to_vec(&payload).unwrap()
         } else {
             vec![]
         };
-        let auth = if token {
-            format!("X-DSH-Token: {}\r\n", host.token)
-        } else {
-            String::new()
-        };
+        let auth = token.map(|token| format!("X-DSH-Token: {token}\r\n")).unwrap_or_default();
         let headers = format!("{method} {path} HTTP/1.1\r\nHost: {}\r\nOrigin: http://{}\r\n{auth}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",host.authority,host.authority,body.len());
         socket.write_all(headers.as_bytes()).await.unwrap();
         socket.write_all(&body).await.unwrap();
@@ -794,6 +875,57 @@ mod tests {
         .await;
         assert_eq!(status, 200);
         value
+    }
+
+    #[tokio::test]
+    async fn harness_service_shutdown_requires_auth_and_identity_then_releases_port() {
+        let mut server = harness(None).await;
+        let host = &server.host;
+        assert_eq!(http(host, "GET", "/api/harness/service", Value::Null, false).await.0, 403);
+        let (status, service) = http(host, "GET", "/api/harness/service", Value::Null, true).await;
+        assert_eq!(status, 200);
+        assert_eq!(service["service"], "dsh-harness");
+        assert_eq!(service["protocol_version"], 1);
+        assert_eq!(service["pid"], std::process::id());
+        assert_eq!(service["workspace"], json!(host.workspace));
+        assert_eq!(service["can_shutdown"], true);
+        assert!(!service.to_string().contains(&host.token));
+        let instance = service["instance_id"].as_str().unwrap();
+        assert!(!instance.is_empty());
+        assert_ne!(instance, HarnessService::new().instance_id);
+        let body = json!({"instance_id":instance});
+        assert_eq!(http(host, "POST", "/api/harness/shutdown", body.clone(), false).await.0, 403);
+        assert_eq!(http_with_token(host, "POST", "/api/harness/shutdown", body.clone(), Some("incorrect-token")).await.0, 403);
+        assert_eq!(http(host, "POST", "/api/harness/shutdown", json!({}), true).await.0, 400);
+        assert_eq!(http(host, "POST", "/api/harness/shutdown", json!({"instance_id":"stale-instance"}), true).await.0, 409);
+        assert_eq!(http(host, "GET", "/api/harness/bootstrap", Value::Null, false).await.0, 200);
+        let (status, acknowledged) = http(host, "POST", "/api/harness/shutdown", body, true).await;
+        assert_eq!(status, 200);
+        assert_eq!(acknowledged, json!({"accepted":true,"instance_id":instance}));
+        tokio::time::timeout(Duration::from_secs(2), &mut server.task).await.unwrap().unwrap();
+        let listener = TcpListener::bind(&host.authority).await.unwrap();
+        assert_eq!(listener.local_addr().unwrap().to_string(), host.authority);
+    }
+
+    #[tokio::test]
+    async fn harness_service_shutdown_is_sticky_before_accept_subscribes() {
+        let mut server = harness(None).await;
+        server.task.abort();
+        assert!((&mut server.task).await.unwrap_err().is_cancelled());
+        let listener = TcpListener::bind(&server.host.authority).await.unwrap();
+        server.host.service.as_ref().unwrap().shutdown.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(2), accept_connections(listener, server.host.clone()))
+            .await.unwrap().unwrap();
+        TcpListener::bind(&server.host.authority).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn standalone_preview_does_not_expose_harness_service_or_shutdown() {
+        let server = test_host(None, false).await;
+        for (method, path) in [("GET", "/api/harness/service"), ("POST", "/api/harness/shutdown")] {
+            assert_eq!(http(&server.host, method, path, json!({"instance_id":"anything"}), true).await.0, 404);
+        }
+        assert_eq!(http(&server.host, "GET", "/startup-preview.html", Value::Null, false).await.0, 200);
     }
 
     #[tokio::test]
@@ -920,6 +1052,7 @@ mod tests {
                 runtime: Some(runtime.clone()),
                 assets: None,
                 startup_override: override_enabled,
+                service: None,
             };
             let value = bootstrap(&host, runtime).unwrap();
             assert_eq!(
@@ -1107,6 +1240,7 @@ mod tests {
             runtime: None,
             assets: None,
             startup_override: None,
+            service: None,
         };
         let mut r = Request {
             method: "GET".into(),

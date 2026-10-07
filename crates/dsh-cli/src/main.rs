@@ -3,6 +3,8 @@ mod cloud;
 mod mcp_server;
 mod startup_inventory;
 mod startup_web;
+mod web_launch;
+mod web_legacy;
 
 use cloud::CloudProvider;
 
@@ -183,6 +185,9 @@ enum Commands {
         /// Override frontend assets (default: installed share/dsh/web, then ./web/dist)
         #[arg(long)]
         assets: Option<PathBuf>,
+        /// Print the URL without automatically opening a browser window
+        #[arg(long)]
+        no_open: bool,
     },
 
     /// Interactive TUI (default) — boots even without API key
@@ -751,9 +756,7 @@ async fn run(cli: Cli) -> Result<()> {
             };
             dsh_tui::preview_startup_with_context(config.tui.startup, context).await?;
         }
-        Some(Commands::Web { port, assets }) => {
-            let boot = boot_tui(&workspace, config_path.as_ref(), &cli)?;
-            apply_cli_overrides(&boot.runtime, &cli)?;
+        Some(Commands::Web { port, assets, no_open }) => {
             let startup_override = if cli.no_startup {
                 Some(false)
             } else if cli.startup {
@@ -761,7 +764,20 @@ async fn run(cli: Cli) -> Result<()> {
             } else {
                 None
             };
-            startup_web::serve_harness(boot.runtime, port, assets, startup_override).await?;
+            let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin())
+                && std::io::IsTerminal::is_terminal(&std::io::stdout());
+            let Some(listener) = web_launch::prepare(port, &workspace, startup_override, interactive, !no_open, || {
+                // Reuse needs no new Runtime or local assets. A new/replacement
+                // service must validate before stopping the existing service.
+                anyhow::ensure!(!workspace.exists() || workspace.is_dir(), "工作区路径必须是目录：{}", workspace.display());
+                load_app_config(&workspace, config_path.as_ref())?;
+                startup_web::validate_frontend_assets(assets.as_deref())
+            }).await? else {
+                return Ok(());
+            };
+            let boot = boot_tui(&workspace, config_path.as_ref(), &cli)?;
+            apply_cli_overrides(&boot.runtime, &cli)?;
+            startup_web::serve_harness(boot.runtime, listener, assets, startup_override, interactive && !no_open).await?;
         }
         None => {
             let boot = boot_tui(&workspace, config_path.as_ref(), &cli)?;
@@ -2553,11 +2569,11 @@ mod startup_cli_tests {
     #[test]
     fn harness_web_command_accepts_assets_and_global_startup_preferences() {
         let cli = Cli::try_parse_from(["dsh", "web"]).unwrap();
-        assert!(matches!(cli.command, Some(Commands::Web { port: 8770, assets: None })));
+        assert!(matches!(cli.command, Some(Commands::Web { port: 8770, assets: None, no_open: false })));
         let cli = Cli::try_parse_from([
             "dsh", "web", "--port", "8870", "--assets", "web/dist", "--startup", "--silent",
         ]).unwrap();
-        assert!(matches!(cli.command, Some(Commands::Web { port: 8870, assets: Some(ref path) }) if path == Path::new("web/dist")));
+        assert!(matches!(cli.command, Some(Commands::Web { port: 8870, assets: Some(ref path), .. }) if path == Path::new("web/dist")));
         let mut config = AppConfig::builtin_default();
         apply_startup_overrides(&mut config, &cli);
         assert!(config.tui.startup.enabled);

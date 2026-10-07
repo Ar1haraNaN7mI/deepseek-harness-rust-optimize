@@ -3,7 +3,7 @@ name = "dsh-llm"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "DeepSeek V4 OpenAI-compatible streaming LLM client"
+description = "OpenAI-compatible streaming LLM client for hosted and local open-source backends"
 
 [dependencies]
 anyhow.workspace = true

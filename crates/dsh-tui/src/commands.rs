@@ -3,9 +3,9 @@
 use crate::keymap::{KEYMAP_DEFAULTS, KEYMAP_HELP};
 use crate::theme::CellKind;
 use dsh_core::{
-    clear_api_key, ApprovalPolicy, PermissionMode, SandboxMode, DEFAULT_FLAGS, PERMISSION_HELP,
-    PERSONALITIES, PETS, STATUSLINE_FIELDS, THEMES, TITLE_FIELDS, APPROVAL_HELP, SANDBOX_HELP,
-    Runtime, Session,
+    clear_api_key, ApprovalPolicy, GoalSpec, PermissionMode, RetryPolicy, Runtime, SandboxMode,
+    Session, TaskRecord, TaskState, APPROVAL_HELP, DEFAULT_FLAGS, PERMISSION_HELP, PERSONALITIES,
+    PETS, SANDBOX_HELP, STATUSLINE_FIELDS, THEMES, TITLE_FIELDS,
 };
 use parking_lot::RwLock;
 use std::path::{Path, PathBuf};
@@ -72,10 +72,7 @@ pub fn help_topic(topic: &str) -> String {
             out.push_str(KEYMAP_HELP);
             out
         }
-        other => format!(
-            "Unknown help topic `{other}`.\n\n{}",
-            help_overview()
-        ),
+        other => format!("Unknown help topic `{other}`.\n\n{}", help_overview()),
     }
 }
 
@@ -133,16 +130,26 @@ fn section_agent() -> String {
     s.push_str("AGENT\n");
     s.push_str("────────────────────────────────────────\n");
     s.push_str(&row("/model [name]", "Show or switch the active model"));
-    s.push_str(&row("/permissions [mode]", "read-only | auto | full-access"));
+    s.push_str(&row(
+        "/permissions [mode]",
+        "read-only | auto | full-access",
+    ));
     s.push_str(&row("/approval [policy]", "never | on-request | untrusted"));
-    s.push_str(&row("/sandbox [mode]", "read-only | workspace-write | danger-full-access"));
+    s.push_str(&row(
+        "/sandbox [mode]",
+        "read-only | workspace-write | danger-full-access",
+    ));
+    s.push_str(&row(
+        "/security-research [on|off]",
+        "Suppress generic cyber-safety refusal boilerplate",
+    ));
     s.push_str(&row("/approvals", "Alias of /permissions"));
     s.push_str(&row("/approve", "Retry last permission-denied tool"));
     s.push_str(&row("/thinking", "Toggle thinking display in TUI"));
     s.push_str(&row("/fast", "Toggle fast mode (disable thinking)"));
     s.push_str(&row("/plan [msg]", "Ask for an execution plan first"));
     s.push_str(&row("/review [msg]", "Review the working tree"));
-    s.push_str(&row("/goal …", "set|edit|pause|resume|view|clear"));
+    s.push_str(&row("/goal …", "set|edit|verify|pause|resume|view|clear"));
     s.push_str(&row("/personality [name]", "Response style preset"));
     s.push_str(&row("/mention <path>", "Point the agent at a path"));
     s.push_str(&row("/ide", "Pull local IDE/workspace hints"));
@@ -189,8 +196,14 @@ fn section_setup() -> String {
     s.push_str(&row("/init", "Write AGENTS.md scaffold"));
     s.push_str(&row("/import", "Import Claude-style project hints"));
     s.push_str(&row("/feedback", "Write a local diagnostic dump"));
-    s.push_str(&row("/setup-default-sandbox", "Reset sandbox / perms helper"));
-    s.push_str(&row("/sandbox-add-read-dir <p>", "Extra readable directory"));
+    s.push_str(&row(
+        "/setup-default-sandbox",
+        "Reset sandbox / perms helper",
+    ));
+    s.push_str(&row(
+        "/sandbox-add-read-dir <p>",
+        "Extra readable directory",
+    ));
     s.push_str("\nCLI equivalents\n");
     s.push_str("  dsh login                 dsh config set-api-key\n");
     s.push_str("  dsh doctor                diagnostics\n");
@@ -213,6 +226,7 @@ pub const SLASH_COMMANDS: &[&str] = &[
     "/permissions",
     "/approval",
     "/sandbox",
+    "/security-research",
     "/approvals",
     "/approve",
     "/status",
@@ -546,7 +560,7 @@ pub fn handle_slash(ctx: &mut SlashCtx<'_>, text: &str) -> SlashEffect {
                 return SlashEffect::None;
             }
             let name = rest.to_string();
-            ctx.runtime.llm.set_model(&name);
+            ctx.runtime.set_model(&name);
             *ctx.model = name.clone();
             {
                 let mut s = ctx.runtime.settings.write();
@@ -595,6 +609,40 @@ pub fn handle_slash(ctx: &mut SlashCtx<'_>, text: &str) -> SlashEffect {
             }
             SlashEffect::None
         }
+        "/security-research" | "/security" => {
+            if rest.is_empty() {
+                let enabled = ctx.runtime.settings.read().security_research_mode;
+                push_sys(
+                    ctx,
+                    "security-research",
+                    format!(
+                        "security research mode: {}\nusage: /security-research on|off",
+                        if enabled { "on" } else { "off" }
+                    ),
+                );
+                return SlashEffect::None;
+            }
+            let enabled = match rest.to_ascii_lowercase().as_str() {
+                "on" | "true" | "yes" | "1" | "enable" | "enabled" => true,
+                "off" | "false" | "no" | "0" | "disable" | "disabled" => false,
+                _ => {
+                    push_err(ctx, "security-research", "usage: /security-research on|off");
+                    return SlashEffect::None;
+                }
+            };
+            match ctx.runtime.set_security_research_mode(enabled) {
+                Ok(()) => push_ok(
+                    ctx,
+                    "security-research",
+                    format!(
+                        "security research mode → {}",
+                        if enabled { "on" } else { "off" }
+                    ),
+                ),
+                Err(err) => push_err(ctx, "security-research", format!("failed: {err}")),
+            }
+            SlashEffect::None
+        }
         "/approval" => {
             if rest.is_empty() {
                 let policy = ctx.runtime.settings.read().approval;
@@ -607,11 +655,7 @@ pub fn handle_slash(ctx: &mut SlashCtx<'_>, text: &str) -> SlashEffect {
             }
             match ApprovalPolicy::parse(rest) {
                 Some(policy) => match ctx.runtime.set_approval(policy) {
-                    Ok(()) => push_ok(
-                        ctx,
-                        "approval",
-                        format!("approval → {}", policy.label()),
-                    ),
+                    Ok(()) => push_ok(ctx, "approval", format!("approval → {}", policy.label())),
                     Err(e) => push_err(ctx, "approval", format!("failed: {e}")),
                 },
                 None => push_err(
@@ -640,11 +684,7 @@ pub fn handle_slash(ctx: &mut SlashCtx<'_>, text: &str) -> SlashEffect {
                         push_ok(
                             ctx,
                             "sandbox",
-                            format!(
-                                "sandbox → {} (permissions={})",
-                                mode.label(),
-                                perm.label()
-                            ),
+                            format!("sandbox → {} (permissions={})", mode.label(), perm.label()),
                         );
                     }
                     Err(e) => push_err(ctx, "sandbox", format!("failed: {e}")),
@@ -674,7 +714,11 @@ pub fn handle_slash(ctx: &mut SlashCtx<'_>, text: &str) -> SlashEffect {
                 SlashEffect::QueuePrompt(prompt)
             }
             None => {
-                push_sys(ctx, "approve", "nothing to approve — no recent denied tool action");
+                push_sys(
+                    ctx,
+                    "approve",
+                    "nothing to approve — no recent denied tool action",
+                );
                 SlashEffect::None
             }
         },
@@ -684,17 +728,24 @@ pub fn handle_slash(ctx: &mut SlashCtx<'_>, text: &str) -> SlashEffect {
             let thinking = settings
                 .thinking
                 .unwrap_or(ctx.runtime.llm.config().thinking);
+            let profile = ctx.runtime.model_profile();
+            let llm_config = ctx.runtime.llm.config();
             let events = ctx.session.read().events.len();
             let tools = ctx.runtime.tools.names();
             push_sys(
                 ctx,
                 "status",
                 format!(
-                    "session: {}\nmodel: {}\npermissions: {} ({})\nthinking: {}\nvim: {}  raw: {}\npersonality: {}\napi: {}\ncwd: {}\nevents: {}\nskills: {} · plugins: {}\ntools: {}",
+                    "session: {}\nmodel: {}\nbackend: {}\nllm-ready: {}  fallbacks: {}\noptimization: {}\npermissions: {} ({})\nsecurity-research: {}\nthinking: {}\nvim: {}  raw: {}\npersonality: {}\napi: {}\ncwd: {}\nevents: {}\nskills: {} · plugins: {}\ntools: {}",
                     ctx.session_id,
                     ctx.model,
+                    llm_config.backend.label(),
+                    ctx.runtime.llm.is_ready(),
+                    llm_config.fallbacks.len(),
+                    profile.summary(),
                     perm.label(),
                     perm.description(),
+                    if settings.security_research_mode { "on" } else { "off" },
                     thinking,
                     settings.vim_mode,
                     settings.raw_mode,
@@ -830,7 +881,7 @@ pub fn handle_slash(ctx: &mut SlashCtx<'_>, text: &str) -> SlashEffect {
                 ids.iter()
                     .find(|id| id.starts_with(&prefix) || id == &&prefix)
                     .cloned()
-                    .or_else(|| Some(prefix))
+                    .or(Some(prefix))
             };
             let Some(id) = target else {
                 push_err(ctx, "resume", "no session to resume");
@@ -1000,9 +1051,7 @@ pub fn handle_slash(ctx: &mut SlashCtx<'_>, text: &str) -> SlashEffect {
                 push_sys(
                     ctx,
                     "agent",
-                    format!(
-                        "agent threads (sessions):\n{listing}\nuse /resume <id> to switch"
-                    ),
+                    format!("agent threads (sessions):\n{listing}\nuse /resume <id> to switch"),
                 );
             }
             SlashEffect::None
@@ -1127,7 +1176,11 @@ pub fn handle_slash(ctx: &mut SlashCtx<'_>, text: &str) -> SlashEffect {
                 s.statusline = fields.clone();
             }
             let _ = ctx.runtime.persist_settings();
-            push_ok(ctx, "statusline", format!("statusline → {}", fields.join(" ")));
+            push_ok(
+                ctx,
+                "statusline",
+                format!("statusline → {}", fields.join(" ")),
+            );
             SlashEffect::None
         }
         "/theme" => {
@@ -1388,6 +1441,10 @@ fn handle_goal(ctx: &mut SlashCtx<'_>, rest: &str) -> SlashEffect {
                 push_err(ctx, "goal", format!("usage: /goal {sub} <text>"));
                 return SlashEffect::None;
             }
+            if let Err(err) = create_goal_task(ctx, arg) {
+                push_err(ctx, "goal", format!("failed to create durable task: {err}"));
+                return SlashEffect::None;
+            }
             {
                 let mut s = ctx.session.write();
                 s.goal = Some(arg.to_string());
@@ -1397,13 +1454,74 @@ fn handle_goal(ctx: &mut SlashCtx<'_>, rest: &str) -> SlashEffect {
             push_ok(ctx, "goal", format!("goal set: {arg}"));
             SlashEffect::None
         }
+        "verify" => {
+            let Some(task) = ctx.runtime.tasks.task_for_session(&ctx.session.read().id) else {
+                push_err(ctx, "goal", "set a goal before adding verification");
+                return SlashEffect::None;
+            };
+            if matches!(task.state, TaskState::Completed | TaskState::Cancelled) {
+                push_err(
+                    ctx,
+                    "goal",
+                    "terminal tasks cannot change verification criteria",
+                );
+                return SlashEffect::None;
+            }
+            let result = if arg.eq_ignore_ascii_case("clear") {
+                ctx.runtime
+                    .tasks
+                    .update_task(&task.id, |task| task.goal.verification.clear())
+            } else if arg.is_empty() {
+                push_err(
+                    ctx,
+                    "goal",
+                    "usage: /goal verify <criterion> (or /goal verify clear)",
+                );
+                return SlashEffect::None;
+            } else {
+                ctx.runtime.tasks.update_task(&task.id, |task| {
+                    if !task.goal.verification.iter().any(|value| value == arg) {
+                        task.goal.verification.push(arg.to_string());
+                    }
+                })
+            };
+            match result {
+                Ok(updated) => push_ok(
+                    ctx,
+                    "goal",
+                    format!("verification criteria: {}", updated.goal.verification.len()),
+                ),
+                Err(err) => push_err(ctx, "goal", format!("failed to update verification: {err}")),
+            }
+            SlashEffect::None
+        }
         "pause" => {
+            if ctx.session.read().goal.is_none() {
+                push_err(ctx, "goal", "no goal to pause");
+                return SlashEffect::None;
+            }
+            let task = ctx.runtime.tasks.task_for_session(&ctx.session.read().id);
+            if let Some(task) = task {
+                if matches!(
+                    task.state,
+                    TaskState::Queued
+                        | TaskState::Running
+                        | TaskState::WaitingApproval
+                        | TaskState::WaitingEvent
+                ) {
+                    let _ = ctx.runtime.pause_active_task(&task.id);
+                    if let Err(err) = ctx
+                        .runtime
+                        .tasks
+                        .transition_task(&task.id, TaskState::Paused)
+                    {
+                        push_err(ctx, "goal", format!("failed to pause durable task: {err}"));
+                        return SlashEffect::None;
+                    }
+                }
+            }
             {
                 let mut s = ctx.session.write();
-                if s.goal.is_none() {
-                    push_err(ctx, "goal", "no goal to pause");
-                    return SlashEffect::None;
-                }
                 s.goal_paused = true;
             }
             ctx.runtime.sessions.persist_now(ctx.session);
@@ -1411,12 +1529,28 @@ fn handle_goal(ctx: &mut SlashCtx<'_>, rest: &str) -> SlashEffect {
             SlashEffect::None
         }
         "resume" => {
+            if ctx.session.read().goal.is_none() {
+                push_err(ctx, "goal", "no goal to resume");
+                return SlashEffect::None;
+            }
+            let task = ctx.runtime.tasks.task_for_session(&ctx.session.read().id);
+            if let Some(task) = task {
+                if matches!(
+                    task.state,
+                    TaskState::Paused | TaskState::WaitingApproval | TaskState::WaitingEvent
+                ) {
+                    if let Err(err) = ctx
+                        .runtime
+                        .tasks
+                        .transition_task(&task.id, TaskState::Queued)
+                    {
+                        push_err(ctx, "goal", format!("failed to queue durable task: {err}"));
+                        return SlashEffect::None;
+                    }
+                }
+            }
             {
                 let mut s = ctx.session.write();
-                if s.goal.is_none() {
-                    push_err(ctx, "goal", "no goal to resume");
-                    return SlashEffect::None;
-                }
                 s.goal_paused = false;
             }
             ctx.runtime.sessions.persist_now(ctx.session);
@@ -1424,6 +1558,18 @@ fn handle_goal(ctx: &mut SlashCtx<'_>, rest: &str) -> SlashEffect {
             SlashEffect::None
         }
         "clear" => {
+            if let Some(task) = ctx.runtime.tasks.task_for_session(&ctx.session.read().id) {
+                if matches!(
+                    task.state,
+                    TaskState::Queued | TaskState::Paused | TaskState::Failed
+                ) {
+                    let _ = ctx.runtime.cancel_active_task(&task.id);
+                    let _ = ctx
+                        .runtime
+                        .tasks
+                        .transition_task(&task.id, TaskState::Cancelled);
+                }
+            }
             {
                 let mut s = ctx.session.write();
                 s.goal = None;
@@ -1434,11 +1580,18 @@ fn handle_goal(ctx: &mut SlashCtx<'_>, rest: &str) -> SlashEffect {
             SlashEffect::None
         }
         // Treat bare text as set when first token is not a known subcommand.
-        other if !rest.is_empty() && arg.is_empty() && !matches!(
-            other,
-            "set" | "edit" | "pause" | "resume" | "view" | "show" | "clear"
-        ) =>
+        other
+            if !rest.is_empty()
+                && arg.is_empty()
+                && !matches!(
+                    other,
+                    "set" | "edit" | "pause" | "resume" | "view" | "show" | "clear"
+                ) =>
         {
+            if let Err(err) = create_goal_task(ctx, rest) {
+                push_err(ctx, "goal", format!("failed to create durable task: {err}"));
+                return SlashEffect::None;
+            }
             {
                 let mut s = ctx.session.write();
                 s.goal = Some(rest.to_string());
@@ -1457,6 +1610,47 @@ fn handle_goal(ctx: &mut SlashCtx<'_>, rest: &str) -> SlashEffect {
             SlashEffect::None
         }
     }
+}
+
+fn create_goal_task(ctx: &SlashCtx<'_>, goal: &str) -> anyhow::Result<TaskRecord> {
+    let session_id = ctx.session.read().id.clone();
+    let previous = ctx.runtime.tasks.task_for_session(&session_id);
+    let mut task = TaskRecord::new_with_retry_policy(
+        GoalSpec::new(goal),
+        RetryPolicy {
+            max_attempts: ctx.runtime.config.agent.retry_max_attempts,
+            backoff_secs: ctx.runtime.config.agent.retry_backoff_secs,
+            max_backoff_secs: ctx.runtime.config.agent.retry_max_backoff_secs,
+        },
+    )
+    .map_err(anyhow::Error::msg)?;
+    task.session_id = Some(session_id.clone());
+    task.parent_task_id = previous.as_ref().map(|previous| previous.id.clone());
+    let created = ctx.runtime.tasks.create_task(task)?;
+    if let Some(previous) = previous {
+        if !matches!(previous.state, TaskState::Completed | TaskState::Cancelled) {
+            let _ = ctx.runtime.cancel_active_task(&previous.id);
+            if let Err(error) = ctx
+                .runtime
+                .tasks
+                .transition_task(&previous.id, TaskState::Cancelled)
+            {
+                tracing::debug!(
+                    error = %error,
+                    task_id = %previous.id,
+                    "previous goal could not be superseded"
+                );
+            }
+            let _ = ctx.runtime.record_system_event(
+                "task.superseded",
+                &serde_json::json!({
+                    "task_id": created.id,
+                    "parent_task_id": previous.id,
+                }),
+            );
+        }
+    }
+    Ok(created)
 }
 
 fn handle_memories(ctx: &mut SlashCtx<'_>, rest: &str) -> SlashEffect {
@@ -1508,7 +1702,11 @@ fn handle_memories(ctx: &mut SlashCtx<'_>, rest: &str) -> SlashEffect {
                 }
             }
             let _ = ctx.runtime.persist_settings();
-            push_ok(ctx, "memories", format!("memory_{which}={}", if on { "on" } else { "off" }));
+            push_ok(
+                ctx,
+                "memories",
+                format!("memory_{which}={}", if on { "on" } else { "off" }),
+            );
         }
         _ => {
             push_err(
@@ -1554,9 +1752,7 @@ fn handle_experimental(ctx: &mut SlashCtx<'_>, rest: &str) -> SlashEffect {
                 push_err(
                     ctx,
                     "experimental",
-                    format!(
-                        "unknown flag `{flag}` — try /experimental list"
-                    ),
+                    format!("unknown flag `{flag}` — try /experimental list"),
                 );
                 return SlashEffect::None;
             }
@@ -1631,11 +1827,7 @@ fn push_help_blocks(ctx: &mut SlashCtx<'_>, body: &str) {
             ctx.lines.push(UiLine {
                 kind: CellKind::System,
                 text: line.to_string(),
-                header: if i == 0 {
-                    Some("help".into())
-                } else {
-                    None
-                },
+                header: if i == 0 { Some("help".into()) } else { None },
                 running: false,
                 ok: None,
             });
@@ -1708,7 +1900,7 @@ fn copy_clipboard(text: &str) -> anyhow::Result<()> {
         if !status.success() {
             anyhow::bail!("clip exited with {status}");
         }
-        return Ok(());
+        Ok(())
     }
     #[cfg(not(windows))]
     {
@@ -1836,10 +2028,7 @@ fn import_claude_hints(cwd: &Path) -> String {
         );
     }
     if !claude_md.exists() && !claude_dir.exists() {
-        lines.insert(
-            0,
-            "no .claude or CLAUDE.md found in workspace".into(),
-        );
+        lines.insert(0, "no .claude or CLAUDE.md found in workspace".into());
     } else {
         lines.push(
             "import status: detected Claude-style project files (read-only note; no auto-merge)."
@@ -1854,10 +2043,7 @@ fn write_feedback_dump(ctx: &SlashCtx<'_>) -> anyhow::Result<PathBuf> {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let path = ctx
-        .runtime
-        .outer_home
-        .join(format!("feedback-{ts}.txt"));
+    let path = ctx.runtime.outer_home.join(format!("feedback-{ts}.txt"));
     let body = debug_config_dump(ctx);
     let header = format!(
         "dsh-rust feedback dump\nsession: {}\nmodel: {}\ncwd: {}\napi: {}\n\n",
@@ -1885,7 +2071,7 @@ fn debug_config_dump(ctx: &SlashCtx<'_>) -> String {
         "permissions={}\nmodel={:?}\nthinking={:?}\nsidebar={:?}\nshow_thinking={:?}\n\
          personality={:?}\nvim_mode={}\nraw_mode={}\nmemory_inject={}\nmemory_generate={}\n\
          statusline={:?}\ntitle_fields={:?}\ntheme={:?}\npet={:?}\n\
-         experimental.network_proxy={}\nexperimental.prevent_sleep={}\nextra_read_dirs={:?}",
+         experimental.network_proxy={}\nexperimental.prevent_sleep={}\nsecurity_research_mode={}\nextra_read_dirs={:?}",
         settings.permissions.label(),
         settings.model,
         settings.thinking,
@@ -1902,6 +2088,7 @@ fn debug_config_dump(ctx: &SlashCtx<'_>) -> String {
         settings.pet,
         settings.experimental.network_proxy,
         settings.experimental.prevent_sleep,
+        settings.security_research_mode,
         settings.extra_read_dirs,
     );
     format!(

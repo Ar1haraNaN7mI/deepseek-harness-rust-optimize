@@ -1,17 +1,24 @@
+mod app_server;
+mod cloud;
 mod mcp_server;
+mod startup_inventory;
+mod startup_web;
+
+use cloud::CloudProvider;
 
 use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{generate, shells};
 use dsh_core::{
     api_key_status, check_command, clear_api_key, load_features, load_mcp, load_policy_file,
-    load_settings, merge_policies, register_builtin_tools, register_learn_tools, resolve_api_key,
-    save_api_key, save_features, save_mcp, save_settings, strictest, AgentEvent, AgentLoop,
-    AppConfig, ApprovalPolicy, PermissionMode, Runtime, SandboxMode, Session, APPROVAL_HELP,
-    PERMISSION_HELP, SANDBOX_HELP,
+    load_settings, merge_policies, register_builtin_tools, register_learn_tools,
+    resolve_api_key_for_backend, save_api_key, save_features, save_mcp, save_settings, strictest,
+    AgentEvent, AgentEventContext, AgentLoop, AppConfig, ApprovalPolicy, EventStore,
+    ModelOptimizationMode, PermissionMode, Runtime, SandboxMode, Session, TaskRecord, TaskState,
+    APPROVAL_HELP, PERMISSION_HELP, SANDBOX_HELP,
 };
 use dsh_fs::{FsService, PathGuard, PathGuardConfig};
-use dsh_llm::DeepSeekClient;
+use dsh_llm::{DeepSeekClient, LlmBackend};
 use dsh_plugin::{install_plugin_from_path, register_plugin_tools, PluginRegistry};
 use dsh_skill::{register_skill_tools, SkillCatalog};
 use dsh_tools::ToolRegistry;
@@ -26,9 +33,9 @@ use tracing_subscriber::EnvFilter;
 #[derive(Parser, Debug)]
 #[command(
     name = "dsh",
-    about = "dsh-rust — DeepSeek agent harness (Codex-style TUI + CLI)",
+    about = "dsh-rust — OpenAI-compatible agent harness (Codex-style TUI + CLI)",
     long_about = "\
-dsh-rust is a two-layer DeepSeek coding agent.
+dsh-rust is a two-layer coding agent for hosted and local OpenAI-compatible models.
 
   dsh                 interactive TUI (default)
   dsh \"fix bugs\"     TUI and auto-send prompt
@@ -37,10 +44,14 @@ dsh-rust is a two-layer DeepSeek coding agent.
   dsh resume --last   continue last session
   dsh doctor          local diagnostics
   dsh login           save API key
+  dsh startup         preview the terminal startup sequence
+  dsh --startup       play startup, then enter the interactive TUI
+  dsh web             serve the local Harness web app
 
 Inside the TUI, type /help for formatted slash-command help.
 Global flags: -m/--model, -s/--sandbox, -a/--ask-for-approval, -c/--config-override,
-  --add-dir, -C/--cd, --yolo, --enable/--disable, --search, --permissions, --workspace
+  --add-dir, -C/--cd, --yolo, --enable/--disable, --search, --permissions, --workspace,
+  --startup, --no-startup, --silent
 "
 )]
 struct Cli {
@@ -50,9 +61,33 @@ struct Cli {
     #[arg(long, global = true)]
     config: Option<PathBuf>,
 
+    /// Play the startup animation for this interactive TUI or web invocation
+    #[arg(long, global = true, conflicts_with = "no_startup")]
+    startup: bool,
+
+    /// Skip the startup animation for this invocation
+    #[arg(long, global = true, conflicts_with = "startup")]
+    no_startup: bool,
+
+    /// Mute startup sound for this invocation
+    #[arg(long, global = true)]
+    silent: bool,
+
     /// Override model for this invocation (e.g. deepseek-v4-flash)
     #[arg(short = 'm', long, global = true)]
     model: Option<String>,
+
+    /// OpenAI-compatible backend preset (deepseek|ollama|llama_cpp|vllm|sglang|litellm|localai|tgi|mlx_lm|lm_studio)
+    #[arg(long, global = true)]
+    backend: Option<String>,
+
+    /// Force model optimization branch: auto|small|standard|off
+    #[arg(long = "model-optimization", global = true)]
+    model_optimization: Option<String>,
+
+    /// Explicit model parameter count in billions (overrides model-id inference)
+    #[arg(long = "model-size-b", global = true)]
+    model_size_b: Option<f32>,
 
     /// Override permission mode for this invocation (read-only|auto|full-access)
     #[arg(long, global = true)]
@@ -66,7 +101,7 @@ struct Cli {
     #[arg(short = 'a', long = "ask-for-approval", global = true)]
     ask_for_approval: Option<String>,
 
-    /// Override config key=value (repeatable). Known keys: model, thinking, permissions
+    /// Override config key=value (repeatable). Known keys: model, backend, thinking, permissions
     #[arg(short = 'c', long = "config-override", global = true)]
     config_override: Vec<String>,
 
@@ -106,8 +141,50 @@ struct Cli {
     command: Option<Commands>,
 }
 
+impl Cli {
+    fn validate_startup_flags(&self) -> std::result::Result<(), clap::Error> {
+        // Clap validates conflicts within each command scope before propagating
+        // globals, so also check flags split across a subcommand boundary.
+        if self.startup && self.no_startup {
+            return Err(<Self as clap::CommandFactory>::command().error(
+                clap::error::ErrorKind::ArgumentConflict,
+                "--startup cannot be used with --no-startup",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Subcommand, Debug, Clone)]
 enum Commands {
+    /// Preview the startup animation without creating a session or starting agents
+    Startup {
+        #[command(subcommand)]
+        action: Option<StartupCmd>,
+        #[arg(long, value_parser = ["dark", "light"])]
+        theme: Option<String>,
+        /// Playback speed multiplier (0.25..3.0)
+        #[arg(long, value_parser = parse_startup_speed)]
+        speed: Option<f32>,
+        /// Confirm three checkpoints with any left click, Enter, or Space (default)
+        #[arg(long, conflicts_with = "auto_play")]
+        interactive: bool,
+        /// Play all six phases automatically without interaction
+        #[arg(long = "auto", conflicts_with = "interactive")]
+        auto_play: bool,
+        /// Show a static startup frame
+        #[arg(long)]
+        reduced_motion: bool,
+    },
+    /// Serve the local Harness web app with real sessions, skills and plugins
+    Web {
+        #[arg(long, default_value_t = 8770)]
+        port: u16,
+        /// Override frontend assets (default: installed share/dsh/web, then ./web/dist)
+        #[arg(long)]
+        assets: Option<PathBuf>,
+    },
+
     /// Interactive TUI (default) — boots even without API key
     Tui {
         #[arg(long)]
@@ -133,7 +210,7 @@ enum Commands {
         last_message_file: Option<PathBuf>,
     },
     /// Resume a session non-interactively (Codex `exec resume`)
-    #[command(name = "exec-resume")]
+    #[command(name = "exec-resume", allow_missing_positional = true)]
     ExecResume {
         /// Session id (or unique prefix)
         id: Option<String>,
@@ -165,7 +242,7 @@ enum Commands {
         #[arg(long)]
         force: bool,
     },
-    /// Persist DeepSeek API key (alias of `config set-api-key`)
+    /// Persist the active LLM API key (alias of `config set-api-key`)
     Login {
         /// API key value (or omit to read from stdin)
         key: Option<String>,
@@ -210,18 +287,18 @@ enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         command: Vec<String>,
     },
-    /// Codex cloud chats (not applicable — DeepSeek local harness)
+    /// Manage local, auditable Codex-compatible cloud artifacts.
     Cloud {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
+        #[command(subcommand)]
+        action: Option<CloudCmd>,
     },
-    /// Codex app-server (protocol bridge stub)
+    /// JSON-RPC 2.0 app-server over stdio or TCP.
     #[command(name = "app-server")]
     AppServer {
         #[arg(long)]
         listen: Option<String>,
     },
-    /// Remote control daemon (stub)
+    /// Long-running remote-control compatible supervisor.
     #[command(name = "remote-control")]
     RemoteControl {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -229,11 +306,50 @@ enum Commands {
     },
     /// Open desktop app (stub — use TUI)
     App,
+    /// Run the durable scheduler until Ctrl+C.
+    Daemon {
+        /// Status output interval in seconds.
+        #[arg(long, default_value_t = 5)]
+        interval: u64,
+        /// Emit one JSON status object per interval.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Read durable protocol events from the local event log.
+    Events {
+        /// Return events with sequence greater than this value.
+        #[arg(long, default_value_t = 0)]
+        after: u64,
+        /// Maximum number of events to print.
+        #[arg(long, default_value_t = 500)]
+        limit: usize,
+        /// Emit one JSON array instead of pretty text.
+        #[arg(long)]
+        json: bool,
+        /// Keep waiting for new events until Ctrl+C.
+        #[arg(long)]
+        follow: bool,
+        /// Long-poll interval used by --follow.
+        #[arg(long, default_value_t = 30_000)]
+        wait_ms: u64,
+    },
     /// Run dsh as an MCP server over stdio
     #[command(name = "mcp-server")]
     McpServer,
-    /// Apply cloud diff locally (stub)
-    Apply,
+    /// Apply a local cloud artifact through PathGuard.
+    Apply {
+        /// Artifact id, stored artifact JSON path, or raw patch path.
+        artifact: Option<String>,
+        /// Validate and show the plan without writing files.
+        #[arg(long)]
+        dry_run: bool,
+        /// Emit a machine-readable JSON result.
+        #[arg(long)]
+        json: bool,
+        /// Optional TCP app-server address used to fetch the artifact.
+        #[arg(long, env = "DSH_APP_SERVER")]
+        server: Option<String>,
+    },
     /// Check execpolicy rule files
     Execpolicy {
         #[command(subcommand)]
@@ -273,13 +389,69 @@ enum Commands {
         #[command(subcommand)]
         action: SessionCmd,
     },
+    /// Inspect and resume durable long-running tasks.
+    Task {
+        #[command(subcommand)]
+        action: TaskCmd,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+enum StartupCmd {
+    /// Set a one-use choice for the next interactive CLI startup
+    Next {
+        #[arg(value_parser = ["on", "off"])]
+        mode: String,
+    },
+    /// Serve the immersive HTML startup with real local catalogs (no agent session)
+    Web {
+        #[arg(long, default_value_t = 8769)]
+        port: u16,
+    },
+    /// Show or persist the identity shared by the web and terminal startup
+    Profile {
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        badge: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+enum CloudCmd {
+    /// List imported artifacts.
+    List {
+        #[arg(long)]
+        json: bool,
+        /// Optional TCP app-server address (for example 127.0.0.1:4567).
+        #[arg(long, env = "DSH_APP_SERVER")]
+        server: Option<String>,
+    },
+    /// Show one artifact, including its patch and integrity digest.
+    Show {
+        id: String,
+        #[arg(long)]
+        json: bool,
+        /// Optional TCP app-server address (for example 127.0.0.1:4567).
+        #[arg(long, env = "DSH_APP_SERVER")]
+        server: Option<String>,
+    },
+    /// Import a raw SEARCH/REPLACE patch or artifact JSON document.
+    Import {
+        path: PathBuf,
+        #[arg(long)]
+        json: bool,
+        /// Optional TCP app-server address (for example 127.0.0.1:4567).
+        #[arg(long, env = "DSH_APP_SERVER")]
+        server: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug, Clone)]
 enum ConfigCmd {
     /// Show whether an API key is configured (masked)
     Status,
-    /// Persist DeepSeek API key under ~/.dsh-rust/credentials.env
+    /// Persist the active LLM API key under ~/.dsh-rust/credentials.env
     SetApiKey {
         /// API key value (or omit to read from stdin)
         key: Option<String>,
@@ -287,13 +459,11 @@ enum ConfigCmd {
     /// Remove stored API key
     ClearApiKey,
     /// Show or set permission mode (read-only|auto|full-access)
-    Permissions {
-        mode: Option<String>,
-    },
+    Permissions { mode: Option<String> },
     /// Show or set default model
-    Model {
-        name: Option<String>,
-    },
+    Model { name: Option<String> },
+    /// Show or set authorized security-research prompt mode (on|off).
+    SecurityResearch { mode: Option<String> },
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -303,15 +473,62 @@ enum SessionCmd {
         #[arg(long)]
         all: bool,
     },
-    Show { id: String },
-    Archive { session: String },
-    Unarchive { session: String },
+    Show {
+        id: String,
+    },
+    Archive {
+        session: String,
+    },
+    Unarchive {
+        session: String,
+    },
     Delete {
         session: String,
         #[arg(long)]
         force: bool,
     },
-    Rename { id: String, name: String },
+    Rename {
+        id: String,
+        name: String,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+enum TaskCmd {
+    /// List durable tasks (terminal tasks are hidden unless --all).
+    List {
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show one task and its execution attempts.
+    Show {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Resume a queued, paused, or failed task.
+    Resume {
+        id: String,
+        #[arg(long)]
+        prompt: Option<String>,
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        last_message_file: Option<PathBuf>,
+    },
+    /// Pause a task before its next run.
+    Pause { id: String },
+    /// Add or clear a declarative completion verification criterion.
+    Verify {
+        id: String,
+        criterion: Option<String>,
+        #[arg(long)]
+        clear: bool,
+    },
+    /// Cancel a task that has not reached a terminal state.
+    Cancel { id: String },
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -334,14 +551,20 @@ enum McpCmd {
 enum FeaturesCmd {
     /// List feature flags
     List,
-    Enable { name: String },
-    Disable { name: String },
+    Enable {
+        name: String,
+    },
+    Disable {
+        name: String,
+    },
 }
 
 #[derive(Subcommand, Debug, Clone)]
 enum PluginCmd {
     List,
-    Add { path: PathBuf },
+    Add {
+        path: PathBuf,
+    },
     Reload,
     /// Manage plugin marketplace sources
     Marketplace {
@@ -380,11 +603,14 @@ enum ExecpolicyCmd {
 enum DebugCmd {
     /// Print known LLM model ids as JSON
     Models,
+    /// Print OpenAI-compatible local backend presets as JSON
+    Backends,
+    /// Explain the active <70B optimization branch
+    #[command(name = "model-profile")]
+    ModelProfile,
     /// Build system prompt + derive_messages for an empty session
     #[command(name = "prompt-input")]
-    PromptInput {
-        prompt: Option<String>,
-    },
+    PromptInput { prompt: Option<String> },
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -411,21 +637,55 @@ struct Boot {
     plugins: Arc<PluginRegistry>,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+async fn cloud_provider(outer_home: &Path, server: Option<&str>) -> Result<Box<dyn CloudProvider>> {
+    if let Some(server) = server {
+        Ok(Box::new(cloud::RemoteCloudProvider::connect(server).await?))
+    } else {
+        Ok(Box::new(cloud::LocalCloudProvider::new(
+            outer_home.to_path_buf(),
+        )))
+    }
+}
+
+fn main() -> Result<()> {
     load_dotenv_files();
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse()?))
+        .with_writer(std::io::stderr)
         .with_target(false)
         .init();
 
+    // Parse outside the async dispatcher so Clap's temporary command builders
+    // do not share its large poll stack frame on the Windows main thread.
     let cli = Cli::parse();
-
+    if let Err(error) = cli.validate_startup_flags() {
+        error.exit();
+    }
     if let Some(ref cd) = cli.cd {
         std::env::set_current_dir(cd)
             .map_err(|e| anyhow::anyhow!("failed to cd to {}: {e}", cd.display()))?;
     }
+    if let Some(Commands::Completion { ref shell }) = cli.command {
+        return print_completion(shell);
+    }
+    run(cli)
+}
 
+fn print_completion(shell: &str) -> Result<()> {
+    let mut cmd = Cli::command();
+    let mut out = std::io::stdout();
+    match shell.to_lowercase().as_str() {
+        "bash" => generate(shells::Bash, &mut cmd, "dsh", &mut out),
+        "zsh" => generate(shells::Zsh, &mut cmd, "dsh", &mut out),
+        "fish" => generate(shells::Fish, &mut cmd, "dsh", &mut out),
+        "powershell" | "pwsh" => generate(shells::PowerShell, &mut cmd, "dsh", &mut out),
+        other => anyhow::bail!("unsupported shell `{other}` (expected bash|zsh|fish|powershell)"),
+    }
+    Ok(())
+}
+
+#[tokio::main]
+async fn run(cli: Cli) -> Result<()> {
     let workspace = cli
         .workspace
         .clone()
@@ -433,11 +693,83 @@ async fn main() -> Result<()> {
     let config_path = cli.config.clone();
 
     match cli.command.clone() {
-        None => {
-            let boot = boot_full(&workspace, config_path.as_ref())?;
+        Some(Commands::Startup {
+            action,
+            theme,
+            speed,
+            interactive,
+            auto_play,
+            reduced_motion,
+        }) => {
+            let mut config = load_app_config(&workspace, config_path.as_ref())?;
+            let outer_home = config.resolve_outer_home()?;
+            let roots = plugin_roots(&outer_home, &workspace.join(&config.paths.workspace_outer), &workspace);
+            match action {
+                Some(StartupCmd::Next { mode }) => {
+                    dsh_core::set_next_startup(&outer_home, mode == "on")?;
+                    println!("next interactive startup: {mode} (one use)");
+                    return Ok(());
+                }
+                Some(StartupCmd::Web { port }) => {
+                    return startup_web::serve(workspace, outer_home, roots, port, !cli.silent && config.tui.startup.sound).await;
+                }
+                Some(StartupCmd::Profile { name, badge }) => {
+                    let mut profile = dsh_core::load_startup_profile(&outer_home)?;
+                    let changed = name.is_some() || badge.is_some();
+                    if let Some(name) = name { profile.username = name; }
+                    if let Some(badge) = badge { profile.badge_id = badge; }
+                    if changed { dsh_core::save_startup_profile(&outer_home, &profile)?; }
+                    println!("{}", serde_json::to_string_pretty(&dsh_core::load_startup_profile(&outer_home)?)?);
+                    return Ok(());
+                }
+                None => (),
+            }
+            apply_startup_overrides(&mut config, &cli);
+            config.tui.startup.enabled = !cli.no_startup;
+            if let Some(theme) = theme {
+                config.tui.startup.theme = theme;
+            }
+            if let Some(speed) = speed {
+                config.tui.startup.speed = speed;
+            }
+            if interactive {
+                config.tui.startup.interactive = true;
+            }
+            if auto_play {
+                config.tui.startup.interactive = false;
+            }
+            if reduced_motion {
+                config.tui.startup.reduced_motion = true;
+            }
+            config.tui.startup.validate()?;
+            let loaded = startup_inventory::load(&workspace, &outer_home, &roots, |_| {});
+            let context = dsh_tui::StartupContext {
+                profile: dsh_core::load_startup_profile(&outer_home)?,
+                skill_names: loaded.skills.list().into_iter().map(|s| s.name).collect(),
+                plugin_names: loaded.plugins.routing_summaries().into_iter().map(|p| p.name).collect(),
+                inventory_loaded: true,
+            };
+            dsh_tui::preview_startup_with_context(config.tui.startup, context).await?;
+        }
+        Some(Commands::Web { port, assets }) => {
+            let boot = boot_tui(&workspace, config_path.as_ref(), &cli)?;
             apply_cli_overrides(&boot.runtime, &cli)?;
-            let has_key = boot.runtime.llm.has_api_key();
+            let startup_override = if cli.no_startup {
+                Some(false)
+            } else if cli.startup {
+                Some(true)
+            } else {
+                None
+            };
+            startup_web::serve_harness(boot.runtime, port, assets, startup_override).await?;
+        }
+        None => {
+            let boot = boot_tui(&workspace, config_path.as_ref(), &cli)?;
+            apply_cli_overrides(&boot.runtime, &cli)?;
+            let has_key = llm_ready(&boot.runtime);
             let opts = TuiOptions {
+                startup_enabled: cli.startup,
+                startup_disabled: cli.no_startup,
                 model: boot.runtime.llm.config().model.clone(),
                 cwd: workspace.display().to_string(),
                 show_thinking: boot.runtime.config.tui.show_thinking,
@@ -451,10 +783,12 @@ async fn main() -> Result<()> {
             run_tui(boot.runtime, opts).await?;
         }
         Some(Commands::Tui { session }) => {
-            let boot = boot_full(&workspace, config_path.as_ref())?;
+            let boot = boot_tui(&workspace, config_path.as_ref(), &cli)?;
             apply_cli_overrides(&boot.runtime, &cli)?;
-            let has_key = boot.runtime.llm.has_api_key();
+            let has_key = llm_ready(&boot.runtime);
             let opts = TuiOptions {
+                startup_enabled: cli.startup,
+                startup_disabled: cli.no_startup,
                 model: boot.runtime.llm.config().model.clone(),
                 cwd: workspace.display().to_string(),
                 show_thinking: boot.runtime.config.tui.show_thinking,
@@ -471,7 +805,7 @@ async fn main() -> Result<()> {
             let boot = boot_full(&workspace, config_path.as_ref())?;
             apply_cli_overrides(&boot.runtime, &cli)?;
             require_api_key(&boot.runtime)?;
-            run_headless(boot.runtime, prompt, session, false, None).await?;
+            run_headless(boot.runtime, prompt, session, false, None, None).await?;
         }
         Some(Commands::Exec {
             prompt,
@@ -482,7 +816,7 @@ async fn main() -> Result<()> {
             let boot = boot_full(&workspace, config_path.as_ref())?;
             apply_cli_overrides(&boot.runtime, &cli)?;
             require_api_key(&boot.runtime)?;
-            run_headless(boot.runtime, prompt, session, json, last_message_file).await?;
+            run_headless(boot.runtime, prompt, session, json, last_message_file, None).await?;
         }
         Some(Commands::ExecResume {
             id,
@@ -510,11 +844,12 @@ async fn main() -> Result<()> {
                 Some(session_id),
                 json,
                 last_message_file,
+                None,
             )
             .await?;
         }
         Some(Commands::Fork { id, last }) => {
-            let boot = boot_full(&workspace, config_path.as_ref())?;
+            let boot = boot_tui(&workspace, config_path.as_ref(), &cli)?;
             apply_cli_overrides(&boot.runtime, &cli)?;
             let store = &boot.runtime.sessions;
             let source_id = if last || id.is_none() {
@@ -530,8 +865,10 @@ async fn main() -> Result<()> {
             let session = store.insert(forked);
             let session_id = session.read().id.clone();
             eprintln!("forked {source_id} → {session_id}");
-            let has_key = boot.runtime.llm.has_api_key();
+            let has_key = llm_ready(&boot.runtime);
             let opts = TuiOptions {
+                startup_enabled: cli.startup,
+                startup_disabled: cli.no_startup,
                 model: boot.runtime.llm.config().model.clone(),
                 cwd: workspace.display().to_string(),
                 show_thinking: boot.runtime.config.tui.show_thinking,
@@ -583,9 +920,9 @@ async fn main() -> Result<()> {
                 }
                 McpCmd::Add { name, command } => {
                     let mut parts = command.into_iter();
-                    let cmd = parts
-                        .next()
-                        .ok_or_else(|| anyhow::anyhow!("usage: dsh mcp add <name> -- <cmd> [args...]"))?;
+                    let cmd = parts.next().ok_or_else(|| {
+                        anyhow::anyhow!("usage: dsh mcp add <name> -- <cmd> [args...]")
+                    })?;
                     let args: Vec<String> = parts.collect();
                     mcp.add_stdio(&name, cmd, args);
                     let path = save_mcp(&outer_home, &mcp)?;
@@ -633,20 +970,7 @@ async fn main() -> Result<()> {
                 load_paths(&workspace, config_path.as_ref())?;
             print_doctor_report(&workspace, &config, &outer_home, &workspace_outer)?;
         }
-        Some(Commands::Completion { shell }) => {
-            let mut cmd = Cli::command();
-            let bin = "dsh";
-            let mut out = std::io::stdout();
-            match shell.to_lowercase().as_str() {
-                "bash" => generate(shells::Bash, &mut cmd, bin, &mut out),
-                "zsh" => generate(shells::Zsh, &mut cmd, bin, &mut out),
-                "fish" => generate(shells::Fish, &mut cmd, bin, &mut out),
-                "powershell" | "pwsh" => generate(shells::PowerShell, &mut cmd, bin, &mut out),
-                other => anyhow::bail!(
-                    "unsupported shell `{other}` (expected bash|zsh|fish|powershell)"
-                ),
-            }
-        }
+        Some(Commands::Completion { .. }) => unreachable!("completion is handled before runtime startup"),
         Some(Commands::Review {
             uncommitted,
             base,
@@ -656,17 +980,20 @@ async fn main() -> Result<()> {
             let boot = boot_full(&workspace, config_path.as_ref())?;
             apply_cli_overrides(&boot.runtime, &cli)?;
             require_api_key(&boot.runtime)?;
-            let review_prompt =
-                build_review_prompt(uncommitted, base.as_deref(), commit.as_deref(), prompt.as_deref());
-            run_headless(boot.runtime, review_prompt, None, false, None).await?;
+            let review_prompt = build_review_prompt(
+                uncommitted,
+                base.as_deref(),
+                commit.as_deref(),
+                prompt.as_deref(),
+            );
+            run_headless(boot.runtime, review_prompt, None, false, None, None).await?;
         }
         Some(Commands::Update) => {
             println!("dsh-rust does not self-update.");
-            println!("Update with one of:");
-            println!("  cargo install --path crates/dsh-cli --force");
+            println!("From your source checkout, run:");
             println!("  git pull");
-            println!("  cargo build -p dsh-cli --release");
-            println!("Or rebuild from your clone after fetching the latest commits.");
+            println!("  python scripts/install_dsh.py");
+            println!("This updates both the installed command and its Harness web assets.");
         }
         Some(Commands::Sandbox { command }) => {
             let (_config, _outer_home, _workspace_outer) =
@@ -676,36 +1003,199 @@ async fn main() -> Result<()> {
             );
             run_sandbox_command(&workspace, &command)?;
         }
-        Some(Commands::Cloud { args }) => {
-            let _ = args;
-            println!(
-                "dsh cloud: not available — dsh-rust is a local DeepSeek harness (no Codex Cloud).\nUse: dsh exec / dsh resume / dsh review"
-            );
+        Some(Commands::Cloud { action }) => {
+            let (_config, outer_home, _workspace_outer) =
+                load_paths(&workspace, config_path.as_ref())?;
+            match action {
+                None => {
+                    println!("dsh cloud manages local artifacts; use: dsh cloud list|show|import");
+                }
+                Some(CloudCmd::List { json, server }) => {
+                    let provider = cloud_provider(&outer_home, server.as_deref()).await?;
+                    let artifacts = provider.list().await?;
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&artifacts)?);
+                    } else if artifacts.is_empty() {
+                        println!("(no cloud artifacts)");
+                    } else {
+                        for artifact in artifacts {
+                            println!(
+                                "{}\t{}\t{}",
+                                artifact.id,
+                                artifact.created_at,
+                                artifact.source.replace(['\r', '\n'], " ")
+                            );
+                        }
+                    }
+                }
+                Some(CloudCmd::Show { id, json, server }) => {
+                    let provider = cloud_provider(&outer_home, server.as_deref()).await?;
+                    let artifact = provider.load(&workspace, &id).await?;
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&artifact)?);
+                    } else {
+                        println!("id: {}", artifact.id);
+                        println!("created_at: {}", artifact.created_at);
+                        println!("source: {}", artifact.source);
+                        println!("workspace: {}", artifact.workspace);
+                        println!("sha256: {}", artifact.sha256);
+                        println!("patch:\n{}", artifact.patch);
+                    }
+                }
+                Some(CloudCmd::Import { path, json, server }) => {
+                    let remote = server.is_some();
+                    let provider = cloud_provider(&outer_home, server.as_deref()).await?;
+                    let artifact = provider.import(&workspace, &path).await;
+                    match artifact {
+                        Ok(artifact) => {
+                            if !remote {
+                                let _ = cloud::record_event_at(
+                                    &outer_home,
+                                    "cloud.artifact.imported",
+                                    serde_json::json!({
+                                        "artifact_id": artifact.id,
+                                        "sha256": artifact.sha256,
+                                        "source": artifact.source,
+                                        "workspace": artifact.workspace,
+                                    }),
+                                );
+                            }
+                            if json {
+                                println!("{}", serde_json::to_string_pretty(&artifact)?);
+                            } else {
+                                if remote {
+                                    println!("imported {} via app-server", artifact.id);
+                                } else {
+                                    println!(
+                                        "imported {} → {}",
+                                        artifact.id,
+                                        cloud::artifact_path(&outer_home, &artifact.id)?.display()
+                                    );
+                                }
+                                println!("sha256: {}", artifact.sha256);
+                            }
+                        }
+                        Err(err) => {
+                            if !remote {
+                                let _ = cloud::record_event_at(
+                                    &outer_home,
+                                    "cloud.artifact.rejected",
+                                    serde_json::json!({
+                                        "source": path.display().to_string(),
+                                        "workspace": workspace.display().to_string(),
+                                        "error": err.to_string(),
+                                    }),
+                                );
+                            }
+                            return Err(err);
+                        }
+                    }
+                }
+            }
         }
         Some(Commands::AppServer { listen }) => {
-            println!(
-                "dsh app-server: stub. Local protocol server is not shipped.\nRequested listen: {}\nUse the TUI (`dsh`) or `dsh exec` instead.",
-                listen.unwrap_or_else(|| "stdio://".into())
-            );
+            let boot = boot_full(&workspace, config_path.as_ref())?;
+            apply_cli_overrides(&boot.runtime, &cli)?;
+            app_server::run_app_server(boot.runtime, listen).await?;
         }
         Some(Commands::RemoteControl { args }) => {
-            let _ = args;
-            println!(
-                "dsh remote-control: stub. Pairing / daemon control is Codex-cloud specific.\nUse the local TUI instead."
-            );
+            let mut interval = 5_u64;
+            let mut json = false;
+            let mut iter = args.into_iter();
+            while let Some(arg) = iter.next() {
+                if arg == "--json" {
+                    json = true;
+                } else if let Some(value) = arg.strip_prefix("--interval=") {
+                    interval = value.parse().unwrap_or(5);
+                } else if arg == "--interval" {
+                    interval = iter
+                        .next()
+                        .and_then(|value| value.parse().ok())
+                        .unwrap_or(5);
+                }
+            }
+            let boot = boot_full(&workspace, config_path.as_ref())?;
+            apply_cli_overrides(&boot.runtime, &cli)?;
+            run_daemon(boot.runtime, interval, json).await?;
         }
         Some(Commands::App) => {
-            println!("dsh app: no desktop app. Launch the TUI with `dsh` (or `dsh tui`).");
+            let boot = boot_tui(&workspace, config_path.as_ref(), &cli)?;
+            apply_cli_overrides(&boot.runtime, &cli)?;
+            let opts = TuiOptions {
+                startup_enabled: cli.startup,
+                startup_disabled: cli.no_startup,
+                model: boot.runtime.llm.config().model.clone(),
+                cwd: workspace.display().to_string(),
+                show_thinking: boot.runtime.config.tui.show_thinking,
+                sidebar: boot.runtime.config.tui.sidebar,
+                skill_names: boot.skills.list().into_iter().map(|s| s.name).collect(),
+                plugin_names: plugin_ids(&boot.plugins),
+                session_id: None,
+                has_api_key: llm_ready(&boot.runtime),
+                initial_prompt: cli.prompt.clone(),
+            };
+            run_tui(boot.runtime, opts).await?;
+        }
+        Some(Commands::Daemon { interval, json }) => {
+            let boot = boot_full(&workspace, config_path.as_ref())?;
+            apply_cli_overrides(&boot.runtime, &cli)?;
+            run_daemon(boot.runtime, interval, json).await?;
+        }
+        Some(Commands::Events {
+            after,
+            limit,
+            json,
+            follow,
+            wait_ms,
+        }) => {
+            let boot = boot_full(&workspace, config_path.as_ref())?;
+            apply_cli_overrides(&boot.runtime, &cli)?;
+            if follow {
+                run_event_follow(boot.runtime, after, limit, json, wait_ms).await?;
+            } else {
+                let events = read_events_after(&boot.runtime, after, limit)?;
+                print_events(&events, json)?;
+            }
         }
         Some(Commands::McpServer) => {
             let boot = boot_full(&workspace, config_path.as_ref())?;
             apply_cli_overrides(&boot.runtime, &cli)?;
             mcp_server::run_mcp_server(boot.runtime).await?;
         }
-        Some(Commands::Apply) => {
-            println!(
-                "dsh apply: Codex cloud diffs are not supported.\nApply local patches with git or ask the agent: dsh exec \"apply this patch…\""
-            );
+        Some(Commands::Apply {
+            artifact,
+            dry_run,
+            json,
+            server,
+        }) => {
+            let Some(artifact) = artifact else {
+                println!("usage: dsh apply <artifact-id-or-path> [--dry-run] [--json]");
+                return Ok(());
+            };
+            let boot = boot_full(&workspace, config_path.as_ref())?;
+            apply_cli_overrides(&boot.runtime, &cli)?;
+            let provider = cloud_provider(&boot.runtime.outer_home, server.as_deref()).await?;
+            let outcome = cloud::apply_artifact_with_provider(
+                &boot.runtime,
+                provider.as_ref(),
+                &artifact,
+                dry_run,
+            )
+            .await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&outcome)?);
+            } else if dry_run {
+                println!("validated {} (dry-run)", outcome.artifact_id);
+                println!("files: {}  hunks: {}", outcome.files.len(), outcome.hunks);
+                for operation in outcome.operations {
+                    println!("  {operation}");
+                }
+            } else {
+                println!("applied {}", outcome.artifact_id);
+                if let Some(report) = outcome.report {
+                    println!("{report}");
+                }
+            }
         }
         Some(Commands::Execpolicy { action }) => match action {
             ExecpolicyCmd::Check {
@@ -732,10 +1222,8 @@ async fn main() -> Result<()> {
                 let decision = if per_file.is_empty() {
                     merged_result.decision
                 } else {
-                    let results: Vec<_> = policies
-                        .iter()
-                        .map(|p| check_command(p, &joined))
-                        .collect();
+                    let results: Vec<_> =
+                        policies.iter().map(|p| check_command(p, &joined)).collect();
                     strictest(&results)
                 };
                 let out = serde_json::json!({
@@ -762,12 +1250,40 @@ async fn main() -> Result<()> {
                     "deepseek-v4-flash",
                     "deepseek-chat",
                     "deepseek-reasoner",
+                    "qwen2.5:14b",
+                    "llama-3.1-8b-instruct",
+                    "mistral-7b-instruct",
                 ];
                 println!("{}", serde_json::to_string(&models)?);
+            }
+            DebugCmd::Backends => {
+                let backends: Vec<_> = LlmBackend::ALL
+                    .into_iter()
+                    .map(|backend| {
+                        serde_json::json!({
+                            "id": backend.id(),
+                            "label": backend.label(),
+                            "default_base_url": backend.default_base_url(),
+                            "requires_api_key": backend.requires_api_key(),
+                            "local": backend.is_local(),
+                            "tool_calling_template_dependent": backend.tool_calling_is_template_dependent(),
+                        })
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&backends)?);
+            }
+            DebugCmd::ModelProfile => {
+                let boot = boot_full(&workspace, config_path.as_ref())?;
+                apply_cli_overrides(&boot.runtime, &cli)?;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&boot.runtime.model_profile())?
+                );
             }
             DebugCmd::PromptInput { prompt } => {
                 let boot = boot_full(&workspace, config_path.as_ref())?;
                 apply_cli_overrides(&boot.runtime, &cli)?;
+                boot.runtime.sync_model_optimization();
                 let system = boot.runtime.prompt.read().render();
                 let mut session = Session::new();
                 if let Some(p) = prompt {
@@ -784,7 +1300,7 @@ async fn main() -> Result<()> {
             }
         },
         Some(Commands::Resume { id, last, all }) => {
-            let boot = boot_full(&workspace, config_path.as_ref())?;
+            let boot = boot_tui(&workspace, config_path.as_ref(), &cli)?;
             apply_cli_overrides(&boot.runtime, &cli)?;
             let store = &boot.runtime.sessions;
             let ids = store.list_ids();
@@ -807,8 +1323,10 @@ async fn main() -> Result<()> {
                 anyhow::bail!("no sessions to resume. Start with: dsh");
             };
             let _ = store.get_or_load(&session_id)?;
-            let has_key = boot.runtime.llm.has_api_key();
+            let has_key = llm_ready(&boot.runtime);
             let opts = TuiOptions {
+                startup_enabled: cli.startup,
+                startup_disabled: cli.no_startup,
                 model: boot.runtime.llm.config().model.clone(),
                 cwd: workspace.display().to_string(),
                 show_thinking: boot.runtime.config.tui.show_thinking,
@@ -833,6 +1351,14 @@ async fn main() -> Result<()> {
                         outer_home.join("credentials.env").display()
                     );
                     println!("permissions: {}", settings.permissions.label());
+                    println!(
+                        "security research mode: {}",
+                        if settings.security_research_mode {
+                            "on"
+                        } else {
+                            "off"
+                        }
+                    );
                     if let Some(m) = settings.model {
                         println!("model: {m}");
                     }
@@ -885,6 +1411,35 @@ async fn main() -> Result<()> {
                         }
                     }
                 }
+                ConfigCmd::SecurityResearch { mode } => {
+                    let mut settings = load_settings(&outer_home);
+                    match mode {
+                        None => println!(
+                            "security research mode: {}",
+                            if settings.security_research_mode {
+                                "on"
+                            } else {
+                                "off"
+                            }
+                        ),
+                        Some(value) => {
+                            let enabled = match value.trim().to_ascii_lowercase().as_str() {
+                                "on" | "true" | "yes" | "1" | "enable" | "enabled" => true,
+                                "off" | "false" | "no" | "0" | "disable" | "disabled" => false,
+                                _ => anyhow::bail!(
+                                    "unknown security research mode `{value}` (expected on|off)"
+                                ),
+                            };
+                            settings.security_research_mode = enabled;
+                            let path = save_settings(&outer_home, &settings)?;
+                            println!(
+                                "security research mode → {}\nsaved {}",
+                                if enabled { "on" } else { "off" },
+                                path.display()
+                            );
+                        }
+                    }
+                }
             }
         }
         Some(Commands::Plugin { action }) => {
@@ -902,10 +1457,7 @@ async fn main() -> Result<()> {
                     None
                 },
             );
-            let plugins = Arc::new(PluginRegistry::new(
-                tools.clone(),
-                outer_home.join("meta"),
-            ));
+            let plugins = Arc::new(PluginRegistry::new(tools.clone(), outer_home.join("meta")));
             plugins.attach_skills(skills.clone());
             let roots = plugin_roots(&outer_home, &workspace_outer, &workspace);
             seed_example_plugin(&workspace, &outer_home.join("plugins"))?;
@@ -996,6 +1548,172 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        Some(Commands::Task { action }) => {
+            let boot = boot_full(&workspace, config_path.as_ref())?;
+            apply_cli_overrides(&boot.runtime, &cli)?;
+            match action {
+                TaskCmd::List { all, json } => {
+                    let mut tasks = boot.runtime.tasks.tasks();
+                    if !all {
+                        tasks.retain(|task| {
+                            !matches!(task.state, TaskState::Completed | TaskState::Cancelled)
+                        });
+                    }
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&tasks)?);
+                    } else if tasks.is_empty() {
+                        println!("(no tasks)");
+                    } else {
+                        for task in tasks {
+                            println!(
+                                "{}\t{:?}\t{}",
+                                task.id,
+                                task.state,
+                                task.goal.outcome.replace(['\r', '\n'], " ")
+                            );
+                        }
+                    }
+                }
+                TaskCmd::Show { id, json } => {
+                    let task = resolve_task(&boot.runtime, &id)?;
+                    let runs = boot
+                        .runtime
+                        .tasks
+                        .runs()
+                        .into_iter()
+                        .filter(|run| run.task_id == task.id)
+                        .collect::<Vec<_>>();
+                    let checkpoint = boot.runtime.tasks.latest_checkpoint(&task.id);
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "task": task,
+                                "runs": runs,
+                                "latest_checkpoint": checkpoint,
+                            }))?
+                        );
+                    } else {
+                        println!("id: {}", task.id);
+                        println!("state: {:?}", task.state);
+                        println!("goal: {}", task.goal.outcome);
+                        println!(
+                            "session: {}",
+                            task.session_id.as_deref().unwrap_or("(none)")
+                        );
+                        println!("runs: {}", runs.len());
+                        if let Some(run) = runs.last() {
+                            println!(
+                                "latest run: {} attempt={} state={:?}",
+                                run.id, run.attempt, run.state
+                            );
+                        }
+                        if let Some(checkpoint) = checkpoint {
+                            println!(
+                                "checkpoint: {} step={} event_sequence={}",
+                                checkpoint.id, checkpoint.step_index, checkpoint.event_sequence
+                            );
+                        }
+                    }
+                }
+                TaskCmd::Resume {
+                    id,
+                    prompt,
+                    json,
+                    last_message_file,
+                } => {
+                    let task = resolve_task(&boot.runtime, &id)?;
+                    if matches!(task.state, TaskState::Completed | TaskState::Cancelled) {
+                        anyhow::bail!("task {} is terminal ({:?})", task.id, task.state);
+                    }
+                    let session_id = task
+                        .session_id
+                        .clone()
+                        .ok_or_else(|| anyhow::anyhow!("task {} has no session", task.id))?;
+                    let runtime = boot.runtime;
+                    let session = runtime.sessions.get_or_load(&session_id)?;
+                    if session.read().goal_paused {
+                        session.write().goal_paused = false;
+                        runtime.sessions.persist_now(&session);
+                    }
+                    require_api_key(&runtime)?;
+                    run_headless(
+                        runtime,
+                        prompt.unwrap_or(task.goal.outcome),
+                        Some(session_id),
+                        json,
+                        last_message_file,
+                        Some(task.id),
+                    )
+                    .await?;
+                }
+                TaskCmd::Pause { id } => {
+                    let task = resolve_task(&boot.runtime, &id)?;
+                    if matches!(
+                        task.state,
+                        TaskState::Queued
+                            | TaskState::Running
+                            | TaskState::WaitingApproval
+                            | TaskState::WaitingEvent
+                    ) {
+                        let _ = boot.runtime.pause_active_task(&task.id);
+                        boot.runtime
+                            .tasks
+                            .transition_task(&task.id, TaskState::Paused)?;
+                    }
+                    println!("paused {}", task.id);
+                }
+                TaskCmd::Verify {
+                    id,
+                    criterion,
+                    clear,
+                } => {
+                    let task = resolve_task(&boot.runtime, &id)?;
+                    if matches!(task.state, TaskState::Completed | TaskState::Cancelled) {
+                        anyhow::bail!("terminal tasks cannot change verification criteria");
+                    }
+                    if clear {
+                        boot.runtime
+                            .tasks
+                            .update_task(&task.id, |task| task.goal.verification.clear())?;
+                    } else {
+                        let criterion = criterion
+                            .filter(|value| !value.trim().is_empty())
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "provide a criterion or use --clear (e.g. file_exists:dist/app)"
+                                )
+                            })?;
+                        boot.runtime.tasks.update_task(&task.id, |task| {
+                            if !task
+                                .goal
+                                .verification
+                                .iter()
+                                .any(|value| value == &criterion)
+                            {
+                                task.goal.verification.push(criterion.clone());
+                            }
+                        })?;
+                    }
+                    let updated = boot.runtime.tasks.task(&task.id).expect("task remains");
+                    println!(
+                        "verification criteria for {}: {}",
+                        task.id,
+                        updated.goal.verification.len()
+                    );
+                }
+                TaskCmd::Cancel { id } => {
+                    let task = resolve_task(&boot.runtime, &id)?;
+                    if !matches!(task.state, TaskState::Completed | TaskState::Cancelled) {
+                        let _ = boot.runtime.cancel_active_task(&task.id);
+                        boot.runtime
+                            .tasks
+                            .transition_task(&task.id, TaskState::Cancelled)?;
+                    }
+                    println!("cancelled {}", task.id);
+                }
+            }
+        }
     }
 
     Ok(())
@@ -1010,14 +1728,15 @@ fn apply_cli_overrides(runtime: &Runtime, cli: &Cli) -> Result<()> {
         let val = v.trim();
         match key {
             "model" => {
-                runtime.llm.set_model(val.to_string());
+                runtime.set_model(val.to_string());
                 runtime.settings.write().model = Some(val.to_string());
             }
+            "backend" => {
+                let backend: LlmBackend = val.parse().map_err(anyhow::Error::msg)?;
+                runtime.set_backend(backend);
+            }
             "thinking" => {
-                let on = matches!(
-                    val.to_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                );
+                let on = matches!(val.to_lowercase().as_str(), "1" | "true" | "yes" | "on");
                 runtime.llm.set_thinking(on);
                 runtime.settings.write().thinking = Some(on);
             }
@@ -1028,15 +1747,33 @@ fn apply_cli_overrides(runtime: &Runtime, cli: &Cli) -> Result<()> {
                 *runtime.permissions.write() = mode;
                 runtime.settings.write().permissions = mode;
             }
-            other => anyhow::bail!(
-                "unknown config key `{other}` (known: model, thinking, permissions)"
-            ),
+            other => {
+                anyhow::bail!(
+                    "unknown config key `{other}` (known: model, backend, thinking, permissions)"
+                )
+            }
         }
     }
 
     if let Some(m) = &cli.model {
-        runtime.llm.set_model(m.clone());
+        runtime.set_model(m.clone());
         runtime.settings.write().model = Some(m.clone());
+    }
+    if let Some(backend) = &cli.backend {
+        runtime.set_backend(backend.parse().map_err(anyhow::Error::msg)?);
+    }
+    if let Some(mode) = &cli.model_optimization {
+        let mode: ModelOptimizationMode = mode.parse().map_err(anyhow::Error::msg)?;
+        std::env::set_var("DSH_MODEL_OPTIMIZATION", mode.label());
+    }
+    if let Some(size) = cli.model_size_b {
+        if !size.is_finite() || size <= 0.0 {
+            anyhow::bail!("--model-size-b must be a positive finite number");
+        }
+        std::env::set_var("DSH_MODEL_SIZE_B", size.to_string());
+    }
+    if cli.model_optimization.is_some() || cli.model_size_b.is_some() {
+        runtime.sync_model_optimization();
     }
     if let Some(p) = &cli.permissions {
         let Some(mode) = PermissionMode::parse(p) else {
@@ -1157,20 +1894,26 @@ fn handle_marketplace(outer_home: &Path, action: MarketplaceCmd) -> Result<()> {
 }
 
 fn require_api_key(runtime: &Runtime) -> Result<()> {
-    if !runtime.llm.has_api_key() {
+    let config = runtime.llm.config();
+    if !runtime.llm.is_ready() {
         anyhow::bail!(
-            "no API key configured. Run: dsh login  (or: dsh config set-api-key <KEY>)\n{}",
+            "no usable LLM endpoint configured for {}. Run: dsh login  (or configure a local fallback in [llm.fallbacks])\n{}",
+            config.backend.label(),
             api_key_status(&runtime.outer_home)
         );
     }
     Ok(())
 }
 
+fn llm_ready(runtime: &Runtime) -> bool {
+    runtime.llm.is_ready()
+}
+
 fn set_api_key_interactive(outer_home: &Path, key: Option<String>) -> Result<()> {
     let key = match key {
         Some(k) => k,
         None => {
-            eprint!("paste DeepSeek API key: ");
+            eprint!("paste LLM API key: ");
             let mut buf = String::new();
             std::io::stdin().read_line(&mut buf)?;
             buf.trim().to_string()
@@ -1190,6 +1933,22 @@ fn delete_session(store: &dsh_core::SessionStore, session: &str, force: bool) ->
     store.delete(&id)?;
     println!("deleted {id}");
     Ok(())
+}
+
+fn resolve_task(runtime: &Runtime, query: &str) -> Result<TaskRecord> {
+    let tasks = runtime.tasks.tasks();
+    if let Some(task) = tasks.iter().find(|task| task.id == query) {
+        return Ok(task.clone());
+    }
+    let matches: Vec<_> = tasks
+        .iter()
+        .filter(|task| task.id.starts_with(query))
+        .collect();
+    match matches.as_slice() {
+        [task] => Ok((*task).clone()),
+        [] => anyhow::bail!("task not found: {query}"),
+        _ => anyhow::bail!("task prefix is ambiguous: {query}"),
+    }
 }
 
 fn build_review_prompt(
@@ -1246,11 +2005,24 @@ fn print_doctor_report(
     );
     match &settings.model {
         Some(m) => println!("model (settings): {m}"),
-        None => println!(
-            "model (settings): (default) {}",
-            config.llm.model
-        ),
+        None => println!("model (settings): (default) {}", config.llm.model),
     }
+    let effective_llm = config.to_llm_config(String::new());
+    let backend = effective_llm.backend;
+    println!(
+        "llm backend:       {} ({})",
+        backend.label(),
+        effective_llm.base_url
+    );
+    println!("llm fallbacks:     {}", effective_llm.fallbacks.len());
+    let profile = dsh_core::ModelProfile::for_model(
+        settings
+            .model
+            .as_deref()
+            .unwrap_or(effective_llm.model.as_str()),
+        &config.llm.optimization,
+    );
+    println!("model optimization: {}", profile.summary());
     if let Some(t) = settings.thinking {
         println!("thinking:         {t}");
     }
@@ -1303,10 +2075,7 @@ fn run_sandbox_command(cwd: &Path, command: &[String]) -> Result<()> {
     // Prefer a foreground OS process so stdout/stderr stream immediately.
     // BgTerminals remains available for in-agent background jobs.
     let (prog, args) = command.split_first().expect("non-empty");
-    let output = StdCommand::new(prog)
-        .args(args)
-        .current_dir(cwd)
-        .output()?;
+    let output = StdCommand::new(prog).args(args).current_dir(cwd).output()?;
     let mut stdout = std::io::stdout();
     stdout.write_all(&output.stdout)?;
     let mut stderr = std::io::stderr();
@@ -1329,15 +2098,41 @@ fn load_dotenv_files() {
     }
 }
 
+fn load_app_config(workspace: &Path, config_path: Option<&PathBuf>) -> Result<AppConfig> {
+    if let Some(path) = config_path {
+        AppConfig::load(path)
+    } else {
+        AppConfig::load_default(workspace)
+    }
+}
+
+fn apply_startup_overrides(config: &mut AppConfig, cli: &Cli) {
+    if cli.startup {
+        config.tui.startup.enabled = true;
+    }
+    if cli.no_startup {
+        config.tui.startup.enabled = false;
+    }
+    if cli.silent {
+        config.tui.startup.sound = false;
+    }
+}
+
+fn parse_startup_speed(value: &str) -> std::result::Result<f32, String> {
+    let speed: f32 = value
+        .parse()
+        .map_err(|_| "speed must be a number between 0.25 and 3.0".to_string())?;
+    if !speed.is_finite() || !(0.25..=3.0).contains(&speed) {
+        return Err("speed must be a number between 0.25 and 3.0".into());
+    }
+    Ok(speed)
+}
+
 fn load_paths(
     workspace: &Path,
     config_path: Option<&PathBuf>,
 ) -> Result<(AppConfig, PathBuf, PathBuf)> {
-    let config = if let Some(p) = config_path {
-        AppConfig::load(p)?
-    } else {
-        AppConfig::load_default(workspace)?
-    };
+    let config = load_app_config(workspace, config_path)?;
     let outer_home = config.resolve_outer_home()?;
     let workspace_outer = workspace.join(&config.paths.workspace_outer);
     std::fs::create_dir_all(outer_home.join("plugins"))?;
@@ -1362,15 +2157,138 @@ fn plugin_ids(plugins: &PluginRegistry) -> Vec<String> {
         .collect()
 }
 
-fn boot_full(workspace: &PathBuf, config_path: Option<&PathBuf>) -> Result<Boot> {
+async fn run_daemon(runtime: Arc<Runtime>, interval: u64, json: bool) -> Result<()> {
+    let cadence = std::time::Duration::from_secs(interval.max(1));
+    let mut ticker = tokio::time::interval(cadence);
+    eprintln!(
+        "dsh daemon running (poll={}s, scheduler enabled={}); press Ctrl+C to stop",
+        interval.max(1),
+        runtime.scheduler.snapshot().enabled
+    );
+    let ctrl_c = tokio::signal::ctrl_c();
+    tokio::pin!(ctrl_c);
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                let snapshot = runtime.scheduler.snapshot();
+                if json {
+                    println!("{}", serde_json::to_string(&snapshot)?);
+                } else {
+                    println!(
+                        "scheduler started={} active={} ticks={} scheduled={} retries={} recovered={} errors={}",
+                        snapshot.started,
+                        snapshot.active_runs,
+                        snapshot.tick_count,
+                        snapshot.scheduled_runs,
+                        snapshot.retry_promotions,
+                        snapshot.recovered_runs,
+                        snapshot.errors,
+                    );
+                }
+                std::io::stdout().flush()?;
+            }
+            result = &mut ctrl_c => {
+                result?;
+                break;
+            }
+        }
+    }
+    runtime.stop_scheduler_and_wait().await;
+    Ok(())
+}
+
+fn read_events_after(
+    runtime: &Runtime,
+    sequence: u64,
+    limit: usize,
+) -> Result<Vec<dsh_core::EventEnvelope>> {
+    let limit = limit.clamp(1, 5000);
+    runtime.events.read_after_limit(sequence, limit)
+}
+
+fn print_events(events: &[dsh_core::EventEnvelope], json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string(events)?);
+    } else {
+        for event in events {
+            println!(
+                "#{:>6} {} source={:?} task={} run={}",
+                event.sequence,
+                event.event_type,
+                event.source,
+                event.task_id.as_deref().unwrap_or("-"),
+                event.run_id.as_deref().unwrap_or("-")
+            );
+        }
+    }
+    std::io::stdout().flush()?;
+    Ok(())
+}
+
+async fn run_event_follow(
+    runtime: Arc<Runtime>,
+    after: u64,
+    limit: usize,
+    json: bool,
+    wait_ms: u64,
+) -> Result<()> {
+    let mut sequence = after;
+    let wait = std::time::Duration::from_millis(wait_ms.clamp(50, 120_000));
+    let ctrl_c = tokio::signal::ctrl_c();
+    tokio::pin!(ctrl_c);
+    eprintln!("following events after sequence {sequence}; press Ctrl+C to stop");
+    loop {
+        let events = read_events_after(&runtime, sequence, limit)?;
+        if !events.is_empty() {
+            sequence = events
+                .last()
+                .map(|event| event.sequence)
+                .unwrap_or(sequence);
+            print_events(&events, json)?;
+            continue;
+        }
+        let notified = runtime.event_notify.notified();
+        tokio::select! {
+            result = &mut ctrl_c => {
+                result?;
+                break;
+            }
+            _ = notified => {}
+            _ = tokio::time::sleep(wait) => {}
+        }
+    }
+    runtime.stop_scheduler_and_wait().await;
+    Ok(())
+}
+
+fn boot_full(workspace: &Path, config_path: Option<&PathBuf>) -> Result<Boot> {
     let (config, outer_home, workspace_outer) = load_paths(workspace, config_path)?;
+    boot_from_config(workspace, config, outer_home, workspace_outer)
+}
+
+fn boot_tui(workspace: &Path, config_path: Option<&PathBuf>, cli: &Cli) -> Result<Boot> {
+    let (mut config, outer_home, workspace_outer) = load_paths(workspace, config_path)?;
+    apply_startup_overrides(&mut config, cli);
+    boot_from_config(workspace, config, outer_home, workspace_outer)
+}
+
+fn boot_from_config(
+    workspace: &Path,
+    config: AppConfig,
+    outer_home: PathBuf,
+    workspace_outer: PathBuf,
+) -> Result<Boot> {
 
     // Optional at boot — empty key is OK; configure later via CLI/TUI.
-    let api_key = resolve_api_key(&outer_home);
-    let llm = DeepSeekClient::new(config.to_llm_config(api_key))?;
+    let llm_config = config.to_llm_config(String::new());
+    let api_key = resolve_api_key_for_backend(&outer_home, llm_config.backend);
+    let llm = DeepSeekClient::new(dsh_llm::LlmConfig {
+        api_key,
+        ..llm_config
+    })?;
 
     let guard = PathGuard::new(PathGuardConfig {
-        workspace_root: workspace.clone(),
+        workspace_root: workspace.to_path_buf(),
         outer_home: outer_home.clone(),
         workspace_outer: workspace_outer.clone(),
         deny_core_writes: config.guard.deny_core_writes,
@@ -1381,7 +2299,7 @@ fn boot_full(workspace: &PathBuf, config_path: Option<&PathBuf>) -> Result<Boot>
     let tools = Arc::new(ToolRegistry::new());
     register_builtin_tools(&tools, fs);
 
-    let runtime = Runtime::bootstrap(config, workspace.clone(), llm, tools.clone())?;
+    let runtime = Runtime::bootstrap(config, workspace.to_path_buf(), llm, tools.clone())?;
     register_learn_tools(&tools, runtime.learn.clone());
 
     let skills = Arc::new(SkillCatalog::new(runtime.outer_home.join("meta")));
@@ -1403,11 +2321,7 @@ fn boot_full(workspace: &PathBuf, config_path: Option<&PathBuf>) -> Result<Boot>
         runtime.outer_home.join("meta"),
     ));
     plugins.attach_skills(skills.clone());
-    let roots = plugin_roots(
-        &runtime.outer_home,
-        &runtime.workspace_outer,
-        workspace,
-    );
+    let roots = plugin_roots(&runtime.outer_home, &runtime.workspace_outer, workspace);
     seed_example_plugin(workspace, &runtime.outer_home.join("plugins"))?;
     plugins.discover_and_load(&roots);
     plugins.start_hot_reload();
@@ -1438,6 +2352,8 @@ fn boot_full(workspace: &PathBuf, config_path: Option<&PathBuf>) -> Result<Boot>
         prompt.set_section("learn", runtime.learn.prompt_section("bootstrap"));
     }
 
+    runtime.start_scheduler();
+
     Ok(Boot {
         runtime,
         skills,
@@ -1464,6 +2380,7 @@ async fn run_headless(
     session_id: Option<String>,
     json: bool,
     last_message_file: Option<PathBuf>,
+    task_id: Option<String>,
 ) -> Result<()> {
     let session = if let Some(id) = session_id {
         runtime.sessions.get_or_load(&id)?
@@ -1473,17 +2390,55 @@ async fn run_headless(
     if !json {
         eprintln!("session={}", session.read().id);
     }
+    let event_runtime = runtime.clone();
     let agent = AgentLoop::new(runtime);
     let (tx, mut rx) = tokio::sync::mpsc::channel(256);
-    let _handle = agent.run_turn(session.clone(), prompt, tx).await?;
+    let requested_task_id = task_id.clone();
+    let handle = if let Some(task_id) = task_id {
+        agent.run_task(task_id, session.clone(), prompt, tx).await?
+    } else {
+        agent.run_turn(session.clone(), prompt, tx).await?
+    };
     let mut last_message = String::new();
+    let mut protocol_context = AgentEventContext::for_session(session.read().id.clone());
+    protocol_context.task_id = requested_task_id;
     while let Some(ev) = rx.recv().await {
         if json {
-            emit_ndjson(&ev);
+            if let AgentEvent::TurnStarted(id) = &ev {
+                protocol_context.turn_id = Some(id.clone());
+                // A requested task id is authoritative. Falling back to the
+                // session's latest task is only appropriate for a plain
+                // interactive turn; otherwise a concurrently updated task in
+                // the same session could steal event correlation.
+                if protocol_context.task_id.is_none() {
+                    if let Some(task) = event_runtime.tasks.task_for_session(&session.read().id) {
+                        protocol_context.task_id = Some(task.id.clone());
+                    }
+                }
+                if let Some(task_id) = protocol_context.task_id.as_deref() {
+                    event_runtime.register_agent_handle(task_id.to_string(), handle.clone());
+                    protocol_context.run_id = event_runtime
+                        .tasks
+                        .latest_run_for_task(task_id)
+                        .map(|run| run.id);
+                }
+            }
+            let envelope = ev.to_protocol_event(&protocol_context);
+            let envelope = match event_runtime.record_event(envelope) {
+                Ok(persisted) => persisted,
+                Err(err) => {
+                    eprintln!("failed to persist JSON event: {err}");
+                    ev.to_protocol_event(&protocol_context)
+                }
+            };
+            emit_ndjson(&envelope);
             if let AgentEvent::TextDelta(t) = &ev {
                 last_message.push_str(t);
             }
             if matches!(ev, AgentEvent::Done) {
+                if let Some(task_id) = protocol_context.task_id.as_deref() {
+                    event_runtime.clear_agent_handle(task_id);
+                }
                 break;
             }
             continue;
@@ -1496,15 +2451,15 @@ async fn run_headless(
             AgentEvent::ThoughtTick { t, note } => eprintln!("[ctm:{t}] {note}"),
             AgentEvent::ToolStarted { name, .. } => eprintln!("\n[tool] {name}"),
             AgentEvent::ToolFinished {
-                name,
-                ok,
-                preview,
-                ..
+                name, ok, preview, ..
             } => eprintln!("[tool:{name}] ok={ok} {preview}"),
             AgentEvent::Error(e) => eprintln!("error: {e}"),
             AgentEvent::Done => break,
             _ => {}
         }
+    }
+    if let Some(task_id) = protocol_context.task_id.as_deref() {
+        event_runtime.clear_agent_handle(task_id);
     }
     if !json {
         println!();
@@ -1523,42 +2478,179 @@ async fn run_headless(
     Ok(())
 }
 
-fn emit_ndjson(ev: &AgentEvent) {
-    let value = match ev {
-        AgentEvent::TurnStarted(id) => serde_json::json!({"type":"turn_started","id":id}),
-        AgentEvent::TurnEnded(id) => serde_json::json!({"type":"turn_ended","id":id}),
-        AgentEvent::TextDelta(t) => serde_json::json!({"type":"text_delta","text":t}),
-        AgentEvent::ReasoningDelta(t) => serde_json::json!({"type":"reasoning_delta","text":t}),
-        AgentEvent::ThoughtTick { t, note } => {
-            serde_json::json!({"type":"thought_tick","t":t,"note":note})
+fn emit_ndjson(event: &dsh_protocol::EventEnvelope) {
+    match serde_json::to_string(event) {
+        Ok(value) => println!("{value}"),
+        Err(err) => eprintln!("failed to encode JSON event: {err}"),
+    }
+}
+
+#[cfg(test)]
+mod startup_cli_tests {
+    use super::*;
+
+    #[test]
+    fn exec_resume_accepts_the_required_prompt_with_or_without_a_session() {
+        let cli = Cli::try_parse_from(["dsh", "exec-resume", "--last", "continue"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::ExecResume { id: None, last: true, ref prompt, .. }) if prompt == "continue"));
+        let cli = Cli::try_parse_from(["dsh", "exec-resume", "session-id", "continue"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::ExecResume { id: Some(ref id), last: false, ref prompt, .. }) if id == "session-id" && prompt == "continue"));
+    }
+
+    #[test]
+    fn startup_opt_in_is_global_and_preserves_the_selected_command() {
+        for arguments in [
+            vec!["dsh", "--startup"],
+            vec!["dsh", "tui", "--startup"],
+            vec!["dsh", "resume", "--last", "--startup"],
+            vec!["dsh", "fork", "--last", "--startup"],
+            vec!["dsh", "app", "--startup"],
+            vec!["dsh", "web", "--startup"],
+            vec!["dsh", "exec", "hello", "--startup"],
+            vec!["dsh", "startup", "--startup"],
+        ] {
+            let cli = Cli::try_parse_from(&arguments).unwrap();
+            assert!(cli.startup, "{arguments:?}");
+            assert!(!cli.no_startup);
+            let mut config = AppConfig::builtin_default();
+            apply_startup_overrides(&mut config, &cli);
+            assert!(config.tui.startup.enabled);
+            assert!(config.tui.startup.sound);
         }
-        AgentEvent::ToolStarted { name, call_id } => {
-            serde_json::json!({"type":"tool_started","name":name,"call_id":call_id})
+        let cli = Cli::try_parse_from(["dsh", "resume", "--last", "--startup"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::Resume { last: true, .. })));
+        let cli = Cli::try_parse_from(["dsh", "--startup", "exec", "hello"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::Exec { .. })));
+        let cli = Cli::try_parse_from(["dsh", "--startup", "startup"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::Startup { .. })));
+    }
+
+    #[test]
+    fn startup_opt_in_is_optional_and_conflicts_with_opt_out() {
+        let cli = Cli::try_parse_from(["dsh"]).unwrap();
+        let mut config = AppConfig::builtin_default();
+        apply_startup_overrides(&mut config, &cli);
+        assert!(!cli.startup);
+        assert!(!config.tui.startup.enabled);
+        for arguments in [
+            vec!["dsh", "--startup", "--no-startup"],
+            vec!["dsh", "--startup", "tui", "--no-startup"],
+            vec!["dsh", "--no-startup", "tui", "--startup"],
+            vec!["dsh", "resume", "--startup", "--no-startup"],
+            vec!["dsh", "web", "--startup", "--no-startup"],
+        ] {
+            let error = Cli::try_parse_from(arguments)
+                .and_then(|cli| cli.validate_startup_flags())
+                .unwrap_err();
+            assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
         }
-        AgentEvent::ToolFinished {
-            name,
-            call_id,
-            ok,
-            preview,
-        } => serde_json::json!({
-            "type":"tool_finished",
-            "name":name,
-            "call_id":call_id,
-            "ok":ok,
-            "preview":preview
-        }),
-        AgentEvent::Error(e) => serde_json::json!({"type":"error","message":e}),
-        AgentEvent::ApprovalNeeded {
-            call_id,
-            name,
-            summary,
-        } => serde_json::json!({
-            "type":"approval_needed",
-            "call_id":call_id,
-            "name":name,
-            "summary":summary
-        }),
-        AgentEvent::Done => serde_json::json!({"type":"done"}),
-    };
-    println!("{value}");
+        let cli = Cli::try_parse_from(["dsh", "--startup", "--silent"]).unwrap();
+        apply_startup_overrides(&mut config, &cli);
+        assert!(config.tui.startup.enabled);
+        assert!(!config.tui.startup.sound);
+    }
+
+    #[test]
+    fn harness_web_command_accepts_assets_and_global_startup_preferences() {
+        let cli = Cli::try_parse_from(["dsh", "web"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::Web { port: 8770, assets: None })));
+        let cli = Cli::try_parse_from([
+            "dsh", "web", "--port", "8870", "--assets", "web/dist", "--startup", "--silent",
+        ]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::Web { port: 8870, assets: Some(ref path) }) if path == Path::new("web/dist")));
+        let mut config = AppConfig::builtin_default();
+        apply_startup_overrides(&mut config, &cli);
+        assert!(config.tui.startup.enabled);
+        assert!(!config.tui.startup.sound);
+    }
+
+    #[test]
+    fn local_web_and_persistent_profile_commands_parse() {
+        let cli = Cli::try_parse_from(["dsh", "startup", "web", "--port", "8877"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::Startup { action: Some(StartupCmd::Web { port: 8877 }), .. })));
+        let cli = Cli::try_parse_from(["dsh", "startup", "profile", "--name", "CatShark"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::Startup { action: Some(StartupCmd::Profile { name: Some(ref name), .. }), .. }) if name == "CatShark"));
+    }
+
+    #[test]
+    fn startup_preview_accepts_local_options_and_global_silent() {
+        let cli = Cli::try_parse_from([
+            "dsh",
+            "startup",
+            "--theme",
+            "light",
+            "--speed",
+            "1.5",
+            "--interactive",
+            "--silent",
+        ])
+        .unwrap();
+        assert!(cli.silent);
+        match cli.command {
+            Some(Commands::Startup {
+                action,
+                theme,
+                speed,
+                interactive,
+                auto_play,
+                reduced_motion,
+            }) => {
+                assert!(action.is_none());
+                assert_eq!(theme.as_deref(), Some("light"));
+                assert_eq!(speed, Some(1.5));
+                assert!(interactive);
+                assert!(!auto_play);
+                assert!(!reduced_motion);
+            }
+            command => panic!("unexpected command: {command:?}"),
+        }
+    }
+
+    #[test]
+    fn global_flags_disable_only_startup_presentation() {
+        let cli = Cli::try_parse_from(["dsh", "--no-startup", "--silent", "resume", "--last"])
+            .unwrap();
+        let mut config = AppConfig::builtin_default();
+        apply_startup_overrides(&mut config, &cli);
+        assert!(!config.tui.startup.enabled);
+        assert!(!config.tui.startup.sound);
+        assert_eq!(config.tui.startup.speed, 1.0);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Resume { last: true, .. })
+        ));
+    }
+
+    #[test]
+    fn preview_rejects_invalid_speed_and_theme() {
+        for value in ["0", "NaN", "inf", "4"] {
+            assert!(Cli::try_parse_from(["dsh", "startup", "--speed", value]).is_err());
+        }
+        assert!(Cli::try_parse_from(["dsh", "startup", "--theme", "unknown"]).is_err());
+    }
+
+    #[test]
+    fn next_startup_control_parses_on_and_off() {
+        for mode in ["on", "off"] {
+            let cli = Cli::try_parse_from(["dsh", "startup", "next", mode]).unwrap();
+            match cli.command {
+                Some(Commands::Startup {
+                    action: Some(StartupCmd::Next { mode: actual }),
+                    ..
+                }) => {
+                    assert_eq!(actual, mode);
+                }
+                command => panic!("unexpected command: {command:?}"),
+            }
+        }
+        assert!(Cli::try_parse_from(["dsh", "startup", "next", "invalid"]).is_err());
+    }
+
+    #[test]
+    fn automatic_preview_is_explicit_and_conflicts_with_interactive() {
+        let cli = Cli::try_parse_from(["dsh", "startup", "--auto"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::Startup { auto_play: true, interactive: false, .. })));
+        assert!(Cli::try_parse_from(["dsh", "startup", "--auto", "--interactive"]).is_err());
+        assert!(AppConfig::builtin_default().tui.startup.interactive);
+    }
 }

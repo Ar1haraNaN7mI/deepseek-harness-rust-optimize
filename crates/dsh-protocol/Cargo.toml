@@ -1,0 +1,12 @@
+[package]
+name = "dsh-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Stable event and task protocol models shared by dsh-rust frontends"
+
+[dependencies]
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true

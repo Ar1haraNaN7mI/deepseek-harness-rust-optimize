@@ -1,6 +1,7 @@
 //! Outer-layer credentials (API keys). Never stored under the core crate tree.
 
 use anyhow::{Context, Result};
+use dsh_llm::LlmBackend;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -10,15 +11,36 @@ pub fn credentials_path(outer_home: &Path) -> PathBuf {
     outer_home.join(CREDENTIALS_FILE)
 }
 
-/// Resolve DeepSeek API key from (in order):
-/// 1. process env `DEEPSEEK_API_KEY`
+/// Resolve an LLM API key from (in order):
+/// 1. process env `DEEPSEEK_API_KEY`, `DSH_LLM_API_KEY`, `OPENAI_API_KEY`
 /// 2. outer `credentials.env`
 /// 3. empty string (boot still succeeds; configure later)
 pub fn resolve_api_key(outer_home: &Path) -> String {
-    if let Ok(key) = std::env::var("DEEPSEEK_API_KEY") {
-        let key = key.trim().to_string();
-        if !key.is_empty() {
-            return key;
+    resolve_api_key_with_variables(
+        outer_home,
+        &["DEEPSEEK_API_KEY", "DSH_LLM_API_KEY", "OPENAI_API_KEY"],
+    )
+}
+
+/// Resolve credentials with a backend-aware precedence. In particular, a
+/// globally configured `OPENAI_API_KEY` must not accidentally be sent to the
+/// hosted DeepSeek endpoint when `DEEPSEEK_API_KEY` is absent.
+pub fn resolve_api_key_for_backend(outer_home: &Path, backend: LlmBackend) -> String {
+    let variables = if backend == LlmBackend::DeepSeek {
+        ["DEEPSEEK_API_KEY", "DSH_LLM_API_KEY", "OPENAI_API_KEY"]
+    } else {
+        ["DSH_LLM_API_KEY", "OPENAI_API_KEY", "DEEPSEEK_API_KEY"]
+    };
+    resolve_api_key_with_variables(outer_home, &variables)
+}
+
+fn resolve_api_key_with_variables(outer_home: &Path, variables: &[&str]) -> String {
+    for variable in variables {
+        if let Ok(key) = std::env::var(variable) {
+            let key = key.trim().to_string();
+            if !key.is_empty() {
+                return key;
+            }
         }
     }
     load_api_key(outer_home).unwrap_or_default()
@@ -32,10 +54,12 @@ pub fn load_api_key(outer_home: &Path) -> Option<String> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        if let Some(rest) = line.strip_prefix("DEEPSEEK_API_KEY=") {
-            let v = rest.trim().trim_matches('"').trim().to_string();
-            if !v.is_empty() {
-                return Some(v);
+        for variable in ["DSH_LLM_API_KEY", "OPENAI_API_KEY", "DEEPSEEK_API_KEY"] {
+            if let Some(rest) = line.strip_prefix(&format!("{variable}=")) {
+                let v = rest.trim().trim_matches('"').trim().to_string();
+                if !v.is_empty() {
+                    return Some(v);
+                }
             }
         }
     }
@@ -47,15 +71,13 @@ pub fn save_api_key(outer_home: &Path, api_key: &str) -> Result<PathBuf> {
     if key.is_empty() {
         anyhow::bail!("API key must not be empty");
     }
-    fs::create_dir_all(outer_home)
-        .with_context(|| format!("create {}", outer_home.display()))?;
+    fs::create_dir_all(outer_home).with_context(|| format!("create {}", outer_home.display()))?;
     let path = credentials_path(outer_home);
-    let body = format!(
-        "# dsh-rust outer credentials (do not commit)\nDEEPSEEK_API_KEY={key}\n"
-    );
+    let body = format!("# dsh-rust outer credentials (do not commit)\nDEEPSEEK_API_KEY={key}\n");
     fs::write(&path, body).with_context(|| format!("write {}", path.display()))?;
     // Keep process env in sync for this session.
     std::env::set_var("DEEPSEEK_API_KEY", key);
+    std::env::set_var("DSH_LLM_API_KEY", key);
     Ok(path)
 }
 
@@ -65,23 +87,30 @@ pub fn clear_api_key(outer_home: &Path) -> Result<()> {
         fs::remove_file(&path).with_context(|| format!("remove {}", path.display()))?;
     }
     std::env::remove_var("DEEPSEEK_API_KEY");
+    std::env::remove_var("DSH_LLM_API_KEY");
     Ok(())
 }
 
 pub fn api_key_status(outer_home: &Path) -> String {
-    let from_env = std::env::var("DEEPSEEK_API_KEY")
-        .ok()
-        .filter(|s| !s.trim().is_empty());
+    let from_env = ["DEEPSEEK_API_KEY", "DSH_LLM_API_KEY", "OPENAI_API_KEY"]
+        .into_iter()
+        .find_map(|variable| {
+            std::env::var(variable)
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .map(|value| (variable, value))
+        });
     let from_file = load_api_key(outer_home);
     match (from_env, from_file) {
-        (Some(k), _) => format!("configured (env, …{})", mask_tail(&k)),
+        (Some((variable, k)), _) => format!("configured ({variable}, …{})", mask_tail(&k)),
         (None, Some(k)) => format!(
             "configured ({} , …{})",
             credentials_path(outer_home).display(),
             mask_tail(&k)
         ),
-        (None, None) => "not configured — run `dsh config set-api-key <KEY>` or TUI `/apikey <KEY>`"
-            .into(),
+        (None, None) => {
+            "not configured — run `dsh config set-api-key <KEY>` or TUI `/apikey <KEY>`".into()
+        }
     }
 }
 

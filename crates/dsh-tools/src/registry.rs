@@ -1,4 +1,4 @@
-use crate::types::{ToolDefinition, ToolHandler};
+use crate::types::{validate_tool_arguments, ToolCall, ToolDefinition, ToolError, ToolHandler};
 use indexmap::IndexMap;
 use parking_lot::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -57,6 +57,19 @@ impl ToolRegistry {
         self.tools.read().get(name).cloned()
     }
 
+    pub fn definition(&self, name: &str) -> Option<ToolDefinition> {
+        self.get(name).map(|handler| handler.definition())
+    }
+
+    /// Resolve and validate a call before any policy prompt or side effect.
+    pub fn preflight(&self, call: &ToolCall) -> Result<ToolDefinition, ToolError> {
+        let Some(definition) = self.definition(&call.name) else {
+            return Err(ToolError::Message(format!("unknown tool: {}", call.name)));
+        };
+        validate_tool_arguments(&definition, &call.arguments)?;
+        Ok(definition)
+    }
+
     pub fn definitions(&self) -> Vec<ToolDefinition> {
         let gen = self.generation();
         if let Some((g, defs)) = self.defs_cache.read().as_ref() {
@@ -64,12 +77,8 @@ impl ToolRegistry {
                 return defs.clone();
             }
         }
-        let defs: Vec<ToolDefinition> = self
-            .tools
-            .read()
-            .values()
-            .map(|h| h.definition())
-            .collect();
+        let defs: Vec<ToolDefinition> =
+            self.tools.read().values().map(|h| h.definition()).collect();
         *self.defs_cache.write() = Some((gen, defs.clone()));
         defs
     }

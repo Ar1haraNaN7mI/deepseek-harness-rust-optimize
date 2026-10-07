@@ -25,7 +25,12 @@ impl FeatureFlags {
         self.flags
             .get(name)
             .copied()
-            .or_else(|| DEFAULT_FLAGS.iter().find(|(k, _)| *k == name).map(|(_, v)| *v))
+            .or_else(|| {
+                DEFAULT_FLAGS
+                    .iter()
+                    .find(|(k, _)| *k == name)
+                    .map(|(_, v)| *v)
+            })
             .unwrap_or(false)
     }
 

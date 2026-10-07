@@ -21,12 +21,30 @@ pub struct LearnEpisode {
     pub note: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LearnFeedback {
+    pub id: String,
+    pub at: DateTime<Utc>,
+    pub task_id: String,
+    pub run_id: String,
+    pub goal: String,
+    pub attempt: u32,
+    pub ok: bool,
+    pub note: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct LearnState {
+    #[serde(default)]
     pub weights: HashMap<String, f32>,
+    #[serde(default)]
     pub episodes: Vec<LearnEpisode>,
     /// Capability co-activation counts for CTM-style sync priors.
+    #[serde(default)]
     pub sync_pairs: HashMap<String, u32>,
+    /// Durable task/run outcomes used to bias future routing.
+    #[serde(default)]
+    pub feedback: Vec<LearnFeedback>,
 }
 
 pub struct LearnStore {
@@ -78,13 +96,7 @@ impl LearnStore {
         }
     }
 
-    pub fn record_tool_outcome(
-        &self,
-        query: &str,
-        tool: &str,
-        ok: bool,
-        note: impl Into<String>,
-    ) {
+    pub fn record_tool_outcome(&self, query: &str, tool: &str, ok: bool, note: impl Into<String>) {
         self.record_tool_outcome_detailed(query, tool, None, ok, note);
     }
 
@@ -134,6 +146,65 @@ impl LearnStore {
         }
         drop(state);
         self.dirty.store(true, Ordering::Relaxed);
+    }
+
+    /// Record a durable task outcome and feed it back into routing weights.
+    /// Recent episodes matching the goal receive a smaller reinforcement so
+    /// successful paths become easier to rediscover while failures cool them.
+    pub fn record_task_outcome(
+        &self,
+        task_id: &str,
+        run_id: &str,
+        goal: &str,
+        attempt: u32,
+        ok: bool,
+        note: impl Into<String>,
+    ) {
+        let note = note.into();
+        let recalled = self.recall(goal, 8);
+        let delta = if ok { 0.5 } else { -0.35 };
+        let mut state = self.state.write();
+        state.feedback.push(LearnFeedback {
+            id: Uuid::new_v4().to_string(),
+            at: Utc::now(),
+            task_id: task_id.to_string(),
+            run_id: run_id.to_string(),
+            goal: goal.chars().take(240).collect(),
+            attempt: attempt.max(1),
+            ok,
+            note: note.chars().take(500).collect(),
+        });
+        if state.feedback.len() > 500 {
+            let drain = state.feedback.len() - 500;
+            state.feedback.drain(0..drain);
+        }
+        for episode in recalled {
+            bump(
+                &mut state.weights,
+                &format!("tool:{}", episode.tool),
+                delta * 0.5,
+            );
+            if let Some(skill) = episode.skill {
+                bump(&mut state.weights, &format!("skill:{skill}"), delta * 0.5);
+            }
+            if let Some(plugin) = episode.plugin {
+                bump(&mut state.weights, &format!("plugin:{plugin}"), delta * 0.5);
+            }
+        }
+        for token in goal
+            .split_whitespace()
+            .map(|token| token.trim_matches(|ch: char| !ch.is_alphanumeric() && ch != '_'))
+            .filter(|token| token.len() >= 3)
+            .take(8)
+        {
+            bump(&mut state.weights, &format!("goal:{token}"), delta * 0.25);
+        }
+        drop(state);
+        self.dirty.store(true, Ordering::Relaxed);
+    }
+
+    pub fn feedback(&self) -> Vec<LearnFeedback> {
+        self.state.read().feedback.clone()
     }
 
     pub fn weights(&self) -> HashMap<String, f32> {
@@ -236,5 +307,30 @@ fn sync_key(a: &str, b: &str) -> String {
         format!("{a}|{b}")
     } else {
         format!("{b}|{a}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn task_feedback_is_durable_and_reinforces_matching_paths() {
+        let root = std::env::temp_dir().join(format!("dsh-learn-{}", Uuid::new_v4()));
+        let store = LearnStore::open(&root);
+        store.record_tool_outcome("ship feature", "skill_load", true, "loaded");
+        store.record_tool_outcome_detailed(
+            "ship feature",
+            "plugin.echo.run",
+            Some("release"),
+            true,
+            "ran",
+        );
+        let before = store.weights();
+        store.record_task_outcome("task-1", "run-1", "ship feature", 1, true, "verified");
+        assert_eq!(store.feedback().len(), 1);
+        assert!(store.weights().get("goal:ship").copied().unwrap_or(0.0) > 0.0);
+        assert!(store.weights().len() >= before.len());
+        let _ = fs::remove_dir_all(root);
     }
 }

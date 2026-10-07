@@ -2,6 +2,10 @@
 /target/
 **/target/
 target/dsh-build2/
+node_modules/
+__pycache__/
+*.pyc
+*.tsbuildinfo
 
 # Rust / cargo
 **/*.rs.bk

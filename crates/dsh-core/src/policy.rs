@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 use crate::permissions::PermissionMode;
+use dsh_tools::{ToolCapability, ToolMetadata, ToolRisk};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
@@ -69,6 +70,35 @@ impl ApprovalPolicy {
                 ) || n.contains("install")
             }
             Self::Untrusted => !is_read,
+        }
+    }
+
+    /// Capability-aware approval decision.  Empty metadata is intentionally
+    /// left to the legacy name-based rule so existing external tools keep
+    /// their historical behavior.
+    pub fn requires_metadata(&self, metadata: &ToolMetadata) -> bool {
+        if metadata.capabilities.is_empty() {
+            return false;
+        }
+        let read_only = metadata
+            .capabilities
+            .iter()
+            .all(|capability| matches!(capability, ToolCapability::Read | ToolCapability::Network));
+        match self {
+            Self::Never => false,
+            Self::OnRequest => {
+                metadata.requires_approval
+                    || matches!(metadata.risk, ToolRisk::High | ToolRisk::Critical)
+                    || metadata.capabilities.iter().any(|capability| {
+                        matches!(
+                            capability,
+                            ToolCapability::Write
+                                | ToolCapability::Process
+                                | ToolCapability::Plugin
+                        )
+                    })
+            }
+            Self::Untrusted => !read_only,
         }
     }
 }
@@ -138,3 +168,14 @@ sandbox mode (Codex -s):
   workspace-write      — read/edit/run in workspace (default)
   danger-full-access   — unrestricted tools (PathGuard still protects core)
 ";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn network_reads_are_not_prompted_under_on_request() {
+        assert!(!ApprovalPolicy::OnRequest.requires_metadata(&ToolMetadata::network()));
+        assert!(ApprovalPolicy::OnRequest.requires_metadata(&ToolMetadata::process()));
+    }
+}

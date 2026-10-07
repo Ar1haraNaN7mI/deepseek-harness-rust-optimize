@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/dsh-protocol",
+    "crates/dsh-app-client",
     "crates/dsh-core",
     "crates/dsh-llm",
     "crates/dsh-tools",
@@ -51,6 +53,8 @@ parking_lot = "0.12"
 indexmap = { version = "2", features = ["serde"] }
 
 dsh-core = { path = "crates/dsh-core" }
+dsh-protocol = { path = "crates/dsh-protocol" }
+dsh-app-client = { path = "crates/dsh-app-client" }
 dsh-llm = { path = "crates/dsh-llm" }
 dsh-tools = { path = "crates/dsh-tools" }
 dsh-fs = { path = "crates/dsh-fs" }

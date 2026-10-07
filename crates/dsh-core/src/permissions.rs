@@ -1,5 +1,6 @@
 //! Codex-like permission presets for what the agent may do without asking.
 
+use dsh_tools::{ToolCapability, ToolMetadata};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -70,6 +71,23 @@ impl PermissionMode {
         }
     }
 
+    /// Capability-aware equivalent of [`Self::allows_tool`].
+    ///
+    /// Empty capability metadata means a legacy definition; callers should
+    /// fall back to the name-based rule in that case.
+    pub fn allows_metadata(self, metadata: &ToolMetadata) -> bool {
+        match self {
+            Self::FullAccess | Self::Auto => true,
+            Self::ReadOnly => {
+                !metadata.capabilities.is_empty()
+                    && metadata.capabilities.iter().all(|capability| {
+                        matches!(capability, ToolCapability::Read | ToolCapability::Network)
+                    })
+                    && !metadata.requires_approval
+            }
+        }
+    }
+
     pub fn deny_reason(self, name: &str) -> String {
         format!(
             "permission mode `{}` blocks tool `{name}`. Switch with /permissions auto|full-access",
@@ -92,3 +110,14 @@ permissions presets (Codex-aligned):
 Usage: /permissions [read-only|auto|full-access]
 Aliases: /approvals
 ";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_only_keeps_network_reads_compatible() {
+        assert!(PermissionMode::ReadOnly.allows_metadata(&ToolMetadata::network()));
+        assert!(!PermissionMode::ReadOnly.allows_metadata(&ToolMetadata::write()));
+    }
+}

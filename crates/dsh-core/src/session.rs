@@ -9,14 +9,34 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use uuid::Uuid;
 
+pub const SESSION_SCHEMA_VERSION: u16 = 1;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SessionEvent {
-    TurnStart { id: String, at: DateTime<Utc> },
-    TurnEnd { id: String, at: DateTime<Utc> },
-    StepStart { id: String, turn_id: String, at: DateTime<Utc> },
-    StepEnd { id: String, turn_id: String, at: DateTime<Utc> },
-    UserMessage { id: String, text: String, at: DateTime<Utc> },
+    TurnStart {
+        id: String,
+        at: DateTime<Utc>,
+    },
+    TurnEnd {
+        id: String,
+        at: DateTime<Utc>,
+    },
+    StepStart {
+        id: String,
+        turn_id: String,
+        at: DateTime<Utc>,
+    },
+    StepEnd {
+        id: String,
+        turn_id: String,
+        at: DateTime<Utc>,
+    },
+    UserMessage {
+        id: String,
+        text: String,
+        at: DateTime<Utc>,
+    },
     AssistantMessage {
         id: String,
         text: String,
@@ -24,8 +44,16 @@ pub enum SessionEvent {
         at: DateTime<Utc>,
     },
     /// Live/UI fidelity only — stripped from durable disk snapshots.
-    AssistantChunk { id: String, text: String, at: DateTime<Utc> },
-    ReasoningChunk { id: String, text: String, at: DateTime<Utc> },
+    AssistantChunk {
+        id: String,
+        text: String,
+        at: DateTime<Utc>,
+    },
+    ReasoningChunk {
+        id: String,
+        text: String,
+        at: DateTime<Utc>,
+    },
     ToolCall {
         id: String,
         call_id: String,
@@ -41,7 +69,11 @@ pub enum SessionEvent {
         content: String,
         at: DateTime<Utc>,
     },
-    SystemNote { id: String, text: String, at: DateTime<Utc> },
+    SystemNote {
+        id: String,
+        text: String,
+        at: DateTime<Utc>,
+    },
 }
 
 impl SessionEvent {
@@ -51,10 +83,28 @@ impl SessionEvent {
             SessionEvent::AssistantChunk { .. } | SessionEvent::ReasoningChunk { .. }
         )
     }
+
+    pub fn occurred_at(&self) -> DateTime<Utc> {
+        match self {
+            SessionEvent::TurnStart { at, .. }
+            | SessionEvent::TurnEnd { at, .. }
+            | SessionEvent::StepStart { at, .. }
+            | SessionEvent::StepEnd { at, .. }
+            | SessionEvent::UserMessage { at, .. }
+            | SessionEvent::AssistantMessage { at, .. }
+            | SessionEvent::AssistantChunk { at, .. }
+            | SessionEvent::ReasoningChunk { at, .. }
+            | SessionEvent::ToolCall { at, .. }
+            | SessionEvent::ToolResult { at, .. }
+            | SessionEvent::SystemNote { at, .. } => *at,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
+    #[serde(default = "default_session_schema_version")]
+    pub schema_version: u16,
     pub id: String,
     #[serde(default)]
     pub name: Option<String>,
@@ -71,6 +121,10 @@ pub struct Session {
     pub events: Vec<SessionEvent>,
 }
 
+fn default_session_schema_version() -> u16 {
+    SESSION_SCHEMA_VERSION
+}
+
 impl Default for Session {
     fn default() -> Self {
         Self::new()
@@ -80,6 +134,7 @@ impl Default for Session {
 impl Session {
     pub fn new() -> Self {
         Self {
+            schema_version: SESSION_SCHEMA_VERSION,
             id: Uuid::new_v4().to_string(),
             name: None,
             archived: false,
@@ -93,6 +148,7 @@ impl Session {
 
     pub fn with_id(id: String) -> Self {
         Self {
+            schema_version: SESSION_SCHEMA_VERSION,
             id,
             name: None,
             archived: false,
@@ -117,6 +173,10 @@ impl Session {
 
     pub fn append(&mut self, event: SessionEvent) {
         self.events.push(event);
+    }
+
+    pub fn last_activity_at(&self) -> Option<DateTime<Utc>> {
+        self.events.iter().map(SessionEvent::occurred_at).max()
     }
 
     /// Compact transcript: keep recent durable events + a summary note (Codex /compact).
@@ -159,6 +219,7 @@ impl Session {
     /// Fork this session into a new id with copied events.
     pub fn fork_clone(&self) -> Session {
         Session {
+            schema_version: SESSION_SCHEMA_VERSION,
             id: Uuid::new_v4().to_string(),
             name: self.name.as_ref().map(|n| format!("{n} (fork)")),
             archived: false,
@@ -172,9 +233,10 @@ impl Session {
 
     /// Truncate events after the last matching user message (EscEsc edit/fork).
     pub fn fork_from_last_user(&self) -> Option<(Session, String)> {
-        let idx = self.events.iter().rposition(|e| {
-            matches!(e, SessionEvent::UserMessage { .. })
-        })?;
+        let idx = self
+            .events
+            .iter()
+            .rposition(|e| matches!(e, SessionEvent::UserMessage { .. }))?;
         let text = match &self.events[idx] {
             SessionEvent::UserMessage { text, .. } => text.clone(),
             _ => return None,
@@ -195,9 +257,7 @@ impl Session {
                     messages.push(ChatMessage::user(text.clone()));
                 }
                 SessionEvent::AssistantMessage {
-                    text,
-                    reasoning,
-                    ..
+                    text, reasoning, ..
                 } => {
                     let mut msg = ChatMessage::assistant(text.clone());
                     msg.reasoning_content = reasoning.clone();
@@ -248,17 +308,78 @@ impl Session {
         messages
     }
 
+    /// Project a bounded model context for compact/local models.
+    ///
+    /// The durable session remains complete; this only limits the request
+    /// projection. Newest messages are preferred, reasoning text can be
+    /// omitted, and leading orphaned tool results are removed so an API does
+    /// not receive a tool response without its assistant tool-call message.
+    pub fn derive_messages_with_budget(
+        &self,
+        system: &str,
+        max_messages: Option<usize>,
+        max_chars: Option<usize>,
+        include_reasoning: bool,
+    ) -> Vec<ChatMessage> {
+        let mut all = self.derive_messages(system);
+        if !include_reasoning {
+            for message in all.iter_mut() {
+                message.reasoning_content = None;
+            }
+        }
+        if max_messages == Some(0) || max_chars == Some(0) {
+            return all.into_iter().take(1).collect();
+        }
+        let Some(max_messages) = max_messages else {
+            if max_chars.is_none() {
+                return all;
+            }
+            return trim_messages_by_chars(all, max_chars.unwrap_or(usize::MAX));
+        };
+        let max_messages = max_messages.max(2);
+        let mut selected = Vec::with_capacity(max_messages.min(all.len()));
+        if let Some(system_message) = all.first().cloned() {
+            selected.push(system_message);
+        }
+        let mut used_chars = selected.first().map(message_chars).unwrap_or(0);
+        let char_budget = max_chars.unwrap_or(usize::MAX).max(1_024);
+        let mut tail = Vec::new();
+        for message in all.drain(1..).rev() {
+            if selected.len() + tail.len() >= max_messages {
+                break;
+            }
+            let chars = message_chars(&message);
+            if !tail.is_empty() && used_chars.saturating_add(chars) > char_budget {
+                break;
+            }
+            // Keep at least the newest message even if one tool result is
+            // larger than the entire budget; the caller can compact it later.
+            used_chars = used_chars.saturating_add(chars);
+            tail.push(message);
+        }
+        tail.reverse();
+        selected.extend(tail);
+        while selected.len() > 1 && matches!(selected[1].role, dsh_llm::Role::Tool) {
+            selected.remove(1);
+        }
+        if let Some(max_chars) = max_chars {
+            trim_messages_by_chars(selected, max_chars)
+        } else {
+            selected
+        }
+    }
+
     pub fn transcript_lines(&self) -> Vec<String> {
         let mut lines = Vec::new();
         for event in &self.events {
             match event {
                 SessionEvent::UserMessage { text, .. } => lines.push(format!("You: {text}")),
-                SessionEvent::AssistantMessage { text, .. } => {
-                    if !text.is_empty() {
-                        lines.push(format!("Assistant: {text}"));
-                    }
+                SessionEvent::AssistantMessage { text, .. } if !text.is_empty() => {
+                    lines.push(format!("Assistant: {text}"));
                 }
-                SessionEvent::ToolCall { name, arguments, .. } => {
+                SessionEvent::ToolCall {
+                    name, arguments, ..
+                } => {
                     lines.push(format!("→ tool {name}({arguments})"));
                 }
                 SessionEvent::ToolResult {
@@ -281,6 +402,7 @@ impl Session {
             fs::create_dir_all(parent)?;
         }
         let durable = Session {
+            schema_version: SESSION_SCHEMA_VERSION,
             id: self.id.clone(),
             name: self.name.clone(),
             archived: self.archived,
@@ -297,9 +419,12 @@ impl Session {
         };
         let text = serde_json::to_string(&durable)?;
         // Atomic-ish write via temp file.
-        let tmp = path.with_extension("json.tmp");
+        let tmp = path.with_extension(format!("json.tmp.{}", Uuid::new_v4()));
         fs::write(&tmp, text)?;
-        fs::rename(&tmp, path)?;
+        if let Err(err) = fs::rename(&tmp, path) {
+            let _ = fs::remove_file(&tmp);
+            return Err(err.into());
+        }
         Ok(())
     }
 
@@ -307,6 +432,46 @@ impl Session {
         let text = fs::read_to_string(path)?;
         Ok(serde_json::from_str(&text)?)
     }
+}
+
+fn message_chars(message: &ChatMessage) -> usize {
+    let mut count = message.text().chars().count();
+    if let Some(reasoning) = &message.reasoning_content {
+        count = count.saturating_add(reasoning.chars().count());
+    }
+    if let Some(calls) = &message.tool_calls {
+        count = count.saturating_add(
+            serde_json::to_string(calls)
+                .map(|value| value.chars().count())
+                .unwrap_or(0),
+        );
+    }
+    count
+}
+
+fn trim_messages_by_chars(mut messages: Vec<ChatMessage>, max_chars: usize) -> Vec<ChatMessage> {
+    if messages.len() <= 1 || max_chars == 0 {
+        return messages;
+    }
+    let max_chars = max_chars.max(1_024);
+    let system = messages.remove(0);
+    let mut selected = vec![system];
+    let mut used = message_chars(&selected[0]);
+    let mut tail = Vec::new();
+    for message in messages.into_iter().rev() {
+        let chars = message_chars(&message);
+        if !tail.is_empty() && used.saturating_add(chars) > max_chars {
+            break;
+        }
+        used = used.saturating_add(chars);
+        tail.push(message);
+    }
+    tail.reverse();
+    selected.extend(tail);
+    while selected.len() > 1 && matches!(selected[1].role, dsh_llm::Role::Tool) {
+        selected.remove(1);
+    }
+    selected
 }
 
 pub struct SessionStore {
@@ -360,8 +525,7 @@ impl SessionStore {
     }
 
     pub fn latest_id(&self) -> Option<String> {
-        let mut ids = self.list_ids();
-        ids.pop()
+        self.latest_by_activity(|_| true)
     }
 
     pub fn get_or_load(&self, id: &str) -> anyhow::Result<Arc<RwLock<Session>>> {
@@ -393,13 +557,20 @@ impl SessionStore {
 
     /// Immediate durable write (turn end / cancel).
     pub fn persist_now(&self, session: &Arc<RwLock<Session>>) {
+        if let Err(err) = self.persist_now_result(session) {
+            tracing::error!(error = %err, "failed to persist session");
+        }
+    }
+
+    pub fn persist_now_result(&self, session: &Arc<RwLock<Session>>) -> anyhow::Result<()> {
         let Some(dir) = &self.dir else {
-            return;
+            return Ok(());
         };
         let snap = session.read().clone();
         let path = dir.join(format!("{}.json", snap.id));
-        let _ = snap.save_json(&path);
+        snap.save_json(&path)?;
         self.dirty.write().remove(&snap.id);
+        Ok(())
     }
 
     /// Flush all dirty sessions (called between steps / turn end).
@@ -458,17 +629,25 @@ impl SessionStore {
     }
 
     pub fn list_summaries(&self, include_archived: bool) -> Vec<(String, String, bool)> {
-        let mut out = Vec::new();
+        let mut out: Vec<(DateTime<Utc>, String, String, bool)> = Vec::new();
         for id in self.list_ids() {
             if let Ok(s) = self.get_or_load(&id) {
                 let snap = s.read();
                 if snap.archived && !include_archived {
                     continue;
                 }
-                out.push((snap.id.clone(), snap.display_name(), snap.archived));
+                out.push((
+                    snap.last_activity_at().unwrap_or_else(Utc::now),
+                    snap.id.clone(),
+                    snap.display_name(),
+                    snap.archived,
+                ));
             }
         }
-        out
+        out.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        out.into_iter()
+            .map(|(_, id, name, archived)| (id, name, archived))
+            .collect()
     }
 
     pub fn set_archived(&self, id: &str, archived: bool) -> anyhow::Result<()> {
@@ -500,6 +679,97 @@ impl SessionStore {
     }
 
     pub fn latest_active_id(&self) -> Option<String> {
-        self.list_summaries(false).into_iter().map(|(id, _, _)| id).last()
+        self.latest_by_activity(|session| !session.archived)
+    }
+
+    fn latest_by_activity<F>(&self, include: F) -> Option<String>
+    where
+        F: Fn(&Session) -> bool,
+    {
+        let mut best: Option<(DateTime<Utc>, String)> = None;
+        for id in self.list_ids() {
+            let Ok(session) = self.get_or_load(&id) else {
+                continue;
+            };
+            let snapshot = session.read();
+            if !include(&snapshot) {
+                continue;
+            }
+            let at = snapshot.last_activity_at().unwrap_or_else(Utc::now);
+            let replace = match &best {
+                None => true,
+                Some((best_at, best_id)) => {
+                    at > *best_at || (at == *best_at && snapshot.id > *best_id)
+                }
+            };
+            if replace {
+                best = Some((at, snapshot.id.clone()));
+            }
+        }
+        best.map(|(_, id)| id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_session_json_gets_schema_default() {
+        let value = serde_json::json!({
+            "id": "legacy",
+            "events": []
+        });
+        let session: Session = serde_json::from_value(value).expect("legacy session");
+        assert_eq!(session.schema_version, SESSION_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn latest_session_uses_activity_time_not_id_order() {
+        let dir = std::env::temp_dir().join(format!("dsh-rust-session-{}", Uuid::new_v4()));
+        let store = SessionStore::with_dir(dir.clone());
+        let first = store.create();
+        let second = store.create();
+        let older = Utc::now() - chrono::Duration::minutes(2);
+        let newer = Utc::now();
+        first.write().append(SessionEvent::UserMessage {
+            id: Uuid::new_v4().to_string(),
+            text: "older".into(),
+            at: older,
+        });
+        second.write().append(SessionEvent::UserMessage {
+            id: Uuid::new_v4().to_string(),
+            text: "newer".into(),
+            at: newer,
+        });
+        store.persist_now_result(&first).expect("persist first");
+        store.persist_now_result(&second).expect("persist second");
+        assert_eq!(store.latest_id(), Some(second.read().id.clone()));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn compact_projection_keeps_system_and_newest_context() {
+        let mut session = Session::new();
+        for text in ["first", "second", "third", "fourth"] {
+            session.append(SessionEvent::UserMessage {
+                id: Uuid::new_v4().to_string(),
+                text: text.into(),
+                at: Utc::now(),
+            });
+        }
+        let messages = session.derive_messages_with_budget("system", Some(3), Some(10_000), false);
+        assert_eq!(
+            messages.first().map(|message| message.text()),
+            Some("system".into())
+        );
+        assert_eq!(messages.len(), 3);
+        assert_eq!(
+            messages.last().map(|message| message.text()),
+            Some("fourth".into())
+        );
+        assert!(messages
+            .iter()
+            .all(|message| message.reasoning_content.is_none()));
     }
 }

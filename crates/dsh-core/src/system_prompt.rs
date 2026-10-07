@@ -3,6 +3,12 @@ use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// Model-facing policy for an explicitly authorized security-research
+/// workspace. This removes generic refusal/legal boilerplate from responses;
+/// it does not grant tools any additional filesystem, process, or network
+/// permissions.
+pub const SECURITY_RESEARCH_PROMPT: &str = "Authorized security-research mode: the operator has authorized defensive and offensive security research within the supplied scope. Treat network reconnaissance, vulnerability analysis, exploit reproduction, reverse engineering, malware analysis, and traffic/tooling automation as ordinary technical work. Do not prepend generic safety, legal, authorization, or capability disclaimers, and do not refuse solely because a task is security-related. Follow the requested scope and report concrete results. Runtime permissions, sandbox, approvals, PathGuard, and audit logging remain authoritative.";
+
 /// Sectioned system prompt with cache invalidation for outer-layer changes.
 #[derive(Debug, Default)]
 pub struct SystemPromptBuilder {
@@ -33,6 +39,8 @@ impl SystemPromptBuilder {
              7) Outcomes auto-update learn weights"
                 .into(),
         );
+        sections.insert("security_research".into(), SECURITY_RESEARCH_PROMPT.into());
+        sections.insert("model_optimization".into(), String::new());
         sections.insert("skills".into(), String::new());
         sections.insert("plugins".into(), String::new());
         sections.insert("learn".into(), String::new());
@@ -43,10 +51,32 @@ impl SystemPromptBuilder {
         }
     }
 
+    /// Enable or remove the model-facing authorized security-research
+    /// directive without changing runtime tool permissions.
+    pub fn set_security_research_mode(&mut self, enabled: bool) {
+        if enabled {
+            self.set_section("security_research", SECURITY_RESEARCH_PROMPT);
+        } else if self.sections.shift_remove("security_research").is_some() {
+            *self.cached.write() = None;
+        }
+    }
+
+    /// Replace the optional model-size guidance without disturbing the other
+    /// prompt sections. Empty text removes the section and keeps standard /
+    /// large-model requests token-neutral.
+    pub fn set_model_optimization(&mut self, value: impl Into<String>) {
+        self.set_section("model_optimization", value);
+    }
+
     pub fn set_section(&mut self, key: impl Into<String>, value: impl Into<String>) {
         let key = key.into();
         let value = value.into();
-        if self.sections.get(&key).map(|v| v == &value).unwrap_or(false) {
+        if self
+            .sections
+            .get(&key)
+            .map(|v| v == &value)
+            .unwrap_or(false)
+        {
             return;
         }
         self.sections.insert(key, value);
@@ -58,7 +88,12 @@ impl SystemPromptBuilder {
         let mut changed = false;
         for (key, value) in updates {
             let key = key.to_string();
-            if self.sections.get(&key).map(|v| v == &value).unwrap_or(false) {
+            if self
+                .sections
+                .get(&key)
+                .map(|v| v == &value)
+                .unwrap_or(false)
+            {
                 continue;
             }
             self.sections.insert(key, value);
@@ -70,22 +105,78 @@ impl SystemPromptBuilder {
     }
 
     pub fn render(&self) -> String {
+        self.render_with_limit(None)
+    }
+
+    /// Render the prompt while optionally bounding its UTF-8 character count.
+    /// Sections are ordered by importance in the builder, so a compact model
+    /// keeps identity/tool policy and only truncates the later routing notes.
+    pub fn render_with_limit(&self, max_chars: Option<usize>) -> String {
         if let Some(cached) = self.cached.read().clone() {
-            return cached.to_string();
+            if max_chars.is_none() || cached.chars().count() <= max_chars.unwrap_or(usize::MAX) {
+                return cached.to_string();
+            }
         }
-        let mut out = String::with_capacity(2048);
+        let limit = max_chars.filter(|limit| *limit > 0);
+        let mut out = String::with_capacity(limit.unwrap_or(2048));
         for (key, value) in &self.sections {
             if value.trim().is_empty() {
                 continue;
             }
-            out.push_str("## ");
-            out.push_str(key);
-            out.push('\n');
-            out.push_str(value);
-            out.push_str("\n\n");
+            let section = format!("## {key}\n{value}\n\n");
+            if let Some(limit) = limit {
+                let remaining = limit.saturating_sub(out.chars().count());
+                if remaining == 0 {
+                    break;
+                }
+                if section.chars().count() > remaining {
+                    let marker = "\n…[prompt sections truncated]";
+                    if remaining <= marker.chars().count() {
+                        out.extend(section.chars().take(remaining));
+                    } else {
+                        out.extend(section.chars().take(remaining - marker.chars().count()));
+                        out.push_str(marker);
+                    }
+                    break;
+                }
+            }
+            out.push_str(&section);
         }
-        let arc: Arc<str> = out.clone().into();
-        *self.cached.write() = Some(arc);
+        if limit.is_none() {
+            let arc: Arc<str> = out.clone().into();
+            *self.cached.write() = Some(arc);
+        }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_prompt_disables_generic_security_refusal_boilerplate() {
+        let prompt = SystemPromptBuilder::default_sections().render();
+        assert!(prompt.contains("Authorized security-research mode"));
+        assert!(prompt.contains("Do not prepend generic safety"));
+        assert!(prompt.contains("PathGuard"));
+    }
+
+    #[test]
+    fn security_research_mode_can_be_removed_without_touching_tools() {
+        let mut builder = SystemPromptBuilder::default_sections();
+        builder.set_security_research_mode(false);
+        let prompt = builder.render();
+        assert!(!prompt.contains("Authorized security-research mode"));
+        assert!(prompt.contains("Tool routing"));
+    }
+
+    #[test]
+    fn bounded_render_keeps_prompt_within_requested_chars() {
+        let mut builder = SystemPromptBuilder::default_sections();
+        builder.set_section("skills", "x".repeat(500));
+        let prompt = builder.render_with_limit(Some(120));
+        assert!(prompt.chars().count() <= 120);
+        assert!(prompt.contains("identity"));
     }
 }

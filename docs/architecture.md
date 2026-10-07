@@ -13,6 +13,7 @@ Aligned with [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)
 | `llm/stream` → `assistant/chunk*` → `assistant/message` | Stream UI via live `AgentEvent`; durable `AssistantMessage` once assembled |
 | `tool/call*` → execute → `tool/result*` | Same durable events; persist debounced |
 | Capability seams (`fs`, LLM adapter) | `dsh-fs` PathGuard, `dsh-llm` DeepSeek V4 |
+| Durable app control / event cursor | `dsh-cli` app-server `events/read_after` + `events/wait`, `dsh-app-client::EventCursor` |
 
 **Model-visible means logged.** Chunks are live/UI fidelity only and are stripped from disk snapshots; the durable assistant message + tools reconstruct model history.
 
@@ -48,6 +49,11 @@ turn/start
 turn/end → persist_now
 ```
 
+Long-running consumers use the durable sequence cursor rather than keeping
+process-local state: `events/read_after` returns replayable batches,
+`events/wait` long-polls for the next batch, and `dsh events --follow` provides
+the local CLI equivalent. A restart resumes from the last delivered sequence.
+
 ## Latency / load controls (without slowing stream)
 
 | Hotspot | Mitigation |
@@ -78,10 +84,56 @@ Internal ticks, private NLM-style updates, dual sync latents, adaptive halt on c
 | Crate | Role |
 |---|---|
 | `dsh-core` | Session, agent loop, CTM, learn, system prompt |
-| `dsh-llm` | DeepSeek V4 streaming client |
+| `dsh-llm` | OpenAI-compatible streaming client and backend presets |
 | `dsh-tools` | Tool registry + pipeline (generation cache) |
 | `dsh-fs` | FS + PathGuard |
 | `dsh-skill` | Dual-format skills + router + DF cache |
 | `dsh-plugin` | Outer plugins + Rhai host + hot-reload |
 | `dsh-tui` | Ratatui UI (dirty redraw) |
 | `dsh-cli` | `dsh` binary |
+| `dsh-protocol` | Versioned task/run/checkpoint/event contracts |
+| `dsh-app-client` | Async JSON-RPC client over TCP/stdio with durable event cursor |
+
+`dsh-core::model_profile` adds a provider-independent `<70B` policy layer:
+model-size inference, bounded/compacted tool schemas, context projection,
+compact tool results, serialized tool calls, and per-request token/thinking
+overrides. `dsh-llm` keeps the same
+OpenAI-compatible wire contract for DeepSeek, Ollama, llama.cpp, LM Studio, vLLM,
+SGLang, LiteLLM, LocalAI, TGI, MLX-LM, and generic compatible servers. Ordered endpoint
+fallback and provider-specific request fields stay in `dsh-llm`, while the
+full tool schema remains in core for preflight validation; see
+`docs/small-models.md`.
+
+## Cloud artifacts and remote recovery
+
+Cloud artifacts are versioned, content-digested patch documents stored under
+the outer layer. The same `CloudProvider` boundary serves the local provider
+and `RemoteCloudProvider`; applying an artifact always goes through the local
+`PathGuard`, permission mode, and audit event log.
+
+Before applying, the local side compares the artifact's canonical workspace
+binding with the target workspace. A valid content digest alone does not
+authorize applying a patch to a different checkout; import it in that checkout
+first when using a remote provider.
+
+The app-server exposes `cloud/list`, `cloud/get`, and `cloud/import`. Remote
+clients resolve `cloud/get` by a restricted artifact id only, never by an
+arbitrary server filesystem path. `dsh cloud ... --server HOST:PORT` and
+`dsh apply ... --server HOST:PORT` use this provider boundary without moving
+the caller's workspace write authority to the server.
+
+`ReconnectingTcpAppServerClient` re-runs `initialize` after a transport drop
+and retries only idempotent reads (`ping`, task/event reads, approvals/tools
+lists, and cloud reads). Requests that can create work, resolve approval,
+import artifacts, or otherwise mutate state are surfaced after a failed
+transport instead of being blindly replayed. `EventCursor` advances only to
+the last delivered sequence, so a daemon can reconnect or restart without
+skipping durable events.
+
+## Authorized security-research mode
+
+The default model prompt treats in-scope security research as ordinary technical
+work and suppresses generic refusal/legal boilerplate. This is a prompt-level
+presentation setting only: permissions, approvals, sandbox, PathGuard, and the
+append-only audit log remain authoritative. Toggle it with
+`dsh config security-research on|off` or TUI `/security-research on|off`.

@@ -7,6 +7,7 @@ description = "Core kernel: session log, agent loop, system prompt (immutable at
 
 [dependencies]
 anyhow.workspace = true
+fs2 = "0.4"
 async-trait.workspace = true
 chrono.workspace = true
 indexmap.workspace = true
@@ -20,6 +21,7 @@ tracing.workspace = true
 uuid.workspace = true
 dirs.workspace = true
 dsh-llm.workspace = true
+dsh-protocol.workspace = true
 dsh-tools.workspace = true
 dsh-fs.workspace = true
 dsh-skill.workspace = true

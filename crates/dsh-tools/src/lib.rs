@@ -5,7 +5,8 @@ mod types;
 
 pub use registry::ToolRegistry;
 pub use types::{
-    ToolCall, ToolContext, ToolDefinition, ToolError, ToolHandler, ToolResult, ToolSchema,
+    validate_tool_arguments, ToolCall, ToolCapability, ToolConcurrency, ToolContext,
+    ToolDefinition, ToolError, ToolHandler, ToolMetadata, ToolResult, ToolRisk, ToolSchema,
 };
 
 use async_trait::async_trait;
@@ -31,7 +32,11 @@ impl DefaultPipeline {
 #[async_trait]
 impl ToolPipeline for DefaultPipeline {
     async fn execute(&self, call: &ToolCall, ctx: &ToolContext) -> ToolResult {
-        let Some(handler) = self.registry.get(&call.name) else {
+        let definition = match self.registry.preflight(call) {
+            Ok(definition) => definition,
+            Err(err) => return ToolResult::error(err.to_string()),
+        };
+        let Some(handler) = self.registry.get(&definition.name) else {
             return ToolResult::error(format!("unknown tool: {}", call.name));
         };
         match handler.call(call.arguments.clone(), ctx).await {

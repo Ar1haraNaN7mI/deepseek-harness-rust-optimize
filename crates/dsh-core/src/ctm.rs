@@ -367,7 +367,10 @@ impl ContinuousThought {
             .iter()
             .filter(|n| match kind {
                 SyncKind::Action => {
-                    matches!(n.kind, NeuronKind::Skill | NeuronKind::Plugin | NeuronKind::Meta)
+                    matches!(
+                        n.kind,
+                        NeuronKind::Skill | NeuronKind::Plugin | NeuronKind::Meta
+                    )
                 }
                 SyncKind::Output => !matches!(n.kind, NeuronKind::Meta),
             })
@@ -404,6 +407,7 @@ impl ContinuousThought {
         pairs
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn render_prompt(
         &self,
         ticks: &[ThoughtTick],
@@ -534,7 +538,10 @@ fn query_attention(query: &str) -> QueryAttn {
         .collect();
     QueryAttn {
         wants_search: contains_any(&lower, &["find", "search", "grep", "where", "locate"]),
-        wants_files: contains_any(&lower, &["file", "read", "edit", "patch", "refactor", "code"]),
+        wants_files: contains_any(
+            &lower,
+            &["file", "read", "edit", "patch", "refactor", "code"],
+        ),
         wants_shell: contains_any(&lower, &["run", "build", "test", "cargo", "npm", "shell"]),
         wants_web: contains_any(&lower, &["http", "url", "docs", "web", "fetch", "api"]),
         wants_plugin: contains_any(&lower, &["plugin", "extend", "outer"]),
@@ -550,7 +557,9 @@ fn attention_for(id: &str, kind: NeuronKind, q: &QueryAttn) -> f32 {
         NeuronKind::Builtin if id == "builtin.fs" && q.wants_files => a += 0.3,
         NeuronKind::Builtin if id == "builtin.shell" && q.wants_shell => a += 0.3,
         NeuronKind::Builtin if id == "builtin.web" && q.wants_web => a += 0.35,
-        NeuronKind::Builtin if id == "builtin.todo" && q.tokens.iter().any(|t| t == "plan" || t == "todo") => {
+        NeuronKind::Builtin
+            if id == "builtin.todo" && q.tokens.iter().any(|t| t == "plan" || t == "todo") =>
+        {
             a += 0.25
         }
         NeuronKind::Plugin if q.wants_plugin => a += 0.2,
@@ -575,18 +584,12 @@ fn tool_hits_neuron(tool: &str, id: &str, kind: NeuronKind) -> bool {
             .strip_prefix("plugin.")
             .map(|p| tool.starts_with(&format!("plugin.{p}.")))
             .unwrap_or(false),
-        NeuronKind::Skill => {
-            tool.starts_with("skill_") || tool.starts_with(&format!("skill_load"))
-        }
+        NeuronKind::Skill => tool.starts_with("skill_") || tool.starts_with("skill_load"),
         NeuronKind::Builtin => match id {
             "builtin.fs" => {
                 matches!(
                     tool,
-                    "read_file"
-                        | "write_file"
-                        | "edit_file"
-                        | "list_dir"
-                        | "apply_patch"
+                    "read_file" | "write_file" | "edit_file" | "list_dir" | "apply_patch"
                 )
             }
             "builtin.search" => matches!(tool, "grep" | "glob"),

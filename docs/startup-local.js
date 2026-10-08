@@ -15,15 +15,31 @@
       this.inventory = emptyInventory(); this.saving = false; this.saveMessage = '';
       this.token = ''; this._loadGeneration = 0; this._saveGeneration = 0;
       this._connectGeneration = 0; this._connecting = null;
+      this.access = { supported: false, enabled: false, unlocked: true };
+      this.unlocking = false; this.accessMessage = ''; this._unlockGeneration = 0;
     }
     emit() { this.onChange(this); }
     async failure(response, fallback) {
       let detail = '';
-      try { const body = await response.json(); detail = text(body.message) || text(body.error); } catch (_) { /* An HTML error is not an API response. */ }
+      try { const body = await response.json(); detail = text(body.message) || text(body.error?.message) || text(body.error); } catch (_) { /* An HTML error is not an API response. */ }
       return new Error(detail || `${fallback}（HTTP ${response.status}）`);
     }
+    get locked() { return this.access.enabled && !this.access.unlocked; }
+    validateAccess(result) {
+      if (typeof result.enabled !== 'boolean' || typeof result.unlocked !== 'boolean' || !text(result.token) || !text(result.profile?.username)) throw new Error('访问验证接口返回了无效资料');
+    }
+    acceptAccess(result) {
+      this.validateAccess(result);
+      this.access = { supported: true, enabled: result.enabled, unlocked: result.unlocked };
+      this.token = result.token;
+      this.profile = { ...this.profile, username: result.profile.username, badge_id: text(result.profile.badge_id) || 'DSH-0001' };
+      if (typeof result.sound === 'boolean') this.profile.sound = result.sound;
+    }
     connect(force = false) {
-      if (this._connecting) return this._connecting;
+      if (this._connecting) {
+        if (!force) return this._connecting;
+        this._profileAbort?.abort();
+      }
       if (!force && this.connection === 'local') return Promise.resolve(true);
       if (!force && this.connection === 'unavailable') return Promise.resolve(false);
       const generation = ++this._connectGeneration;
@@ -34,6 +50,20 @@
         const timer = setTimeout(() => controller.abort(), 8000);
         try {
           if (!this.request) throw new Error('本地接口不可用');
+          const access = await this.request('/api/access', { signal: controller.signal, cache: 'no-store', credentials: 'same-origin' });
+          if (generation !== this._connectGeneration) return false;
+          if (access.status === 404) {
+            // The official DSH add-on predates the Rust host's access lock.
+            this.access = { supported: false, enabled: false, unlocked: true };
+          } else {
+            if (!access.ok) throw await this.failure(access, '无法读取访问验证状态');
+            const status = await access.json();
+            if (generation !== this._connectGeneration) return false;
+            this.acceptAccess(status);
+            if (this.locked) {
+              this.connection = 'local'; this.connectionMessage = '已连接本地 DSH · 等待访问验证'; return true;
+            }
+          }
           const response = await this.request('/api/profile', { signal: controller.signal, cache: 'no-store', credentials: 'same-origin' });
           if (!response.ok) throw await this.failure(response, '本地接口不可用');
           const result = await response.json();
@@ -53,6 +83,35 @@
       })();
       return this._connecting;
     }
+    async unlock(password) {
+      if (this.unlocking) return false;
+      if (!this.locked) return true;
+      const generation = ++this._unlockGeneration;
+      const controller = new AbortController(); this._unlockAbort = controller;
+      this.unlocking = true; this.accessMessage = '正在验证访问密码…'; this.emit();
+      const timer = setTimeout(() => controller.abort(), 15000);
+      try {
+        const response = await this.request('/api/access/unlock', { method: 'POST', signal: controller.signal, credentials: 'same-origin', headers: { 'Content-Type': 'application/json', 'X-DSH-Token': this.token }, body: JSON.stringify({ password }) });
+        if (!response.ok) throw await this.failure(response, '访问密码验证失败');
+        const result = await response.json();
+        if (generation !== this._unlockGeneration) return false;
+        this.validateAccess(result);
+        if (!result.unlocked) throw new Error('访问尚未解锁');
+        // Re-read using the actual cookie, never trust the POST body alone.
+        if (!await this.connect(true) || this.locked) throw new Error('无法确认访问状态，请重试');
+        if (generation !== this._unlockGeneration) return false;
+        this.accessMessage = '验证通过 · 访问已授权'; return true;
+      } catch (error) {
+        if (generation === this._unlockGeneration) {
+          this.access = { ...this.access, unlocked: false };
+          this.accessMessage = error?.name === 'AbortError' ? '验证超时，请重试' : messageOf(error);
+        }
+        return false;
+      } finally {
+        clearTimeout(timer);
+        if (generation === this._unlockGeneration) { this.unlocking = false; this.emit(); }
+      }
+    }
     async save(username, badge_id) {
       username = text(username).trim(); badge_id = text(badge_id).trim();
       if (!username || !badge_id) { this.saveMessage = '用户名和编号不能为空'; this.emit(); return false; }
@@ -62,6 +121,7 @@
       const timer = setTimeout(() => controller.abort(), 10000);
       try {
         if (!await this.connect()) throw new Error('未连接本地 DSH，资料未保存');
+        if (this.locked) throw new Error('请先验证访问密码');
         if (generation !== this._saveGeneration) return false;
         const response = await this.request('/api/profile', { method: 'POST', signal: controller.signal, credentials: 'same-origin', headers: { 'Content-Type': 'application/json', 'X-DSH-Token': this.token }, body: JSON.stringify({ username, badge_id }) });
         if (!response.ok) throw await this.failure(response, '保存失败');
@@ -115,6 +175,7 @@
           if (current()) { this.inventory = emptyInventory('unavailable', '未读取真实数据 · 请用 dsh startup web 启动'); this.emit(); }
           return false;
         }
+        if (this.locked) throw new Error('请先验证访问密码，再读取本地能力');
         if (!current()) return false;
         const response = await this.request('/api/load', { method: 'POST', signal: controller.signal, cache: 'no-store', credentials: 'same-origin', headers: { 'X-DSH-Token': this.token } });
         if (!response.ok) throw await this.failure(response, '读取失败');
@@ -148,7 +209,8 @@
     }
     dispose() {
       this.cancelLoad(false); this._connectGeneration++; this._saveGeneration++;
-      this._profileAbort?.abort(); this._saveAbort?.abort(); this._connecting = null; this.saving = false;
+      this._unlockGeneration++; this._unlockAbort?.abort();
+      this._profileAbort?.abort(); this._saveAbort?.abort(); this._connecting = null; this.saving = false; this.unlocking = false;
     }
   }
   globalThis.DSHLocal = Object.freeze({ Client });

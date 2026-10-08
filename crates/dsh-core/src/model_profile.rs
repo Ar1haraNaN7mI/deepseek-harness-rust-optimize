@@ -614,6 +614,11 @@ fn intent_bonus(query: &str, tool_name: &str) -> i32 {
     let query = query.to_ascii_lowercase();
     let matches = |terms: &[&str]| terms.iter().any(|term| query.contains(term));
     let tool_matches = |names: &[&str]| names.contains(&tool_name);
+    if matches(&["电脑", "桌面", "窗口", "屏幕", "鼠标", "控件", "点击", "computer", "desktop", "window", "screen", "click"])
+        && tool_matches(&["computer_list_windows", "computer_observe", "computer_act"])
+    {
+        return 12;
+    }
     if matches(&["文件", "代码", "读取", "查看", "file", "code"])
         && tool_matches(&["read_file", "list_dir", "grep", "glob"])
     {

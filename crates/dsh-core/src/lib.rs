@@ -5,6 +5,7 @@ mod agent_loop;
 pub mod approvals;
 pub mod bg;
 pub mod builtin_tools;
+pub mod computer;
 mod config;
 pub mod credentials;
 pub mod ctm;
@@ -106,6 +107,7 @@ pub struct Runtime {
     pub mcp: RwLock<McpConfig>,
     pub hooks: RwLock<HooksConfig>,
     pub bg: Arc<BgTerminals>,
+    pub computer: Arc<computer::ComputerController>,
     pub approvals: Arc<ApprovalQueue>,
     /// Versioned append-only lifecycle events shared by all frontends.
     pub events: Arc<JsonlEventStore>,
@@ -185,6 +187,7 @@ impl Runtime {
         let features = load_features(&outer_home);
         let mcp = load_mcp(&outer_home);
         let hooks = load_hooks(&outer_home);
+        let computer = Arc::new(computer::ComputerController::new(outer_home.clone()));
 
         let runtime = Arc::new(Self {
             config,
@@ -206,6 +209,7 @@ impl Runtime {
             mcp: RwLock::new(mcp),
             hooks: RwLock::new(hooks),
             bg: Arc::new(BgTerminals::new()),
+            computer,
             approvals: Arc::new(ApprovalQueue::new()),
             events,
             event_notify,
@@ -232,6 +236,7 @@ impl Runtime {
         runtime.sync_personalization();
 
         runtime.sync_model_optimization();
+        runtime.sync_computer_tools(settings.computer_enabled);
 
         // Align permission mode with sandbox setting when sandbox was persisted.
         let _ = settings.sandbox;
@@ -303,14 +308,18 @@ impl Runtime {
         *self.permissions.write() = mode;
         let mut s = self.settings.write();
         s.permissions = mode;
+        s.computer_enabled = load_settings(&self.outer_home).computer_enabled;
         save_settings(&self.outer_home, &s)?;
+        self.sync_computer_tools(s.computer_enabled);
         Ok(())
     }
 
     pub fn set_approval(&self, policy: ApprovalPolicy) -> anyhow::Result<()> {
         let mut s = self.settings.write();
         s.approval = policy;
+        s.computer_enabled = load_settings(&self.outer_home).computer_enabled;
         save_settings(&self.outer_home, &s)?;
+        self.sync_computer_tools(s.computer_enabled);
         Ok(())
     }
 
@@ -319,14 +328,18 @@ impl Runtime {
         let mut s = self.settings.write();
         s.sandbox = mode;
         s.permissions = mode.to_permission();
+        s.computer_enabled = load_settings(&self.outer_home).computer_enabled;
         save_settings(&self.outer_home, &s)?;
+        self.sync_computer_tools(s.computer_enabled);
         Ok(())
     }
 
     pub fn persist_settings(&self) -> anyhow::Result<()> {
-        let s = self.settings.read();
+        let mut s = self.settings.write();
+        s.computer_enabled = load_settings(&self.outer_home).computer_enabled;
         save_settings(&self.outer_home, &s)?;
         self.apply_personalization(&s);
+        self.sync_computer_tools(s.computer_enabled);
         Ok(())
     }
 
@@ -335,6 +348,9 @@ impl Runtime {
     pub fn update_settings(&self, patch: SettingsPatch) -> Result<SessionSettings> {
         let mut settings = self.settings.write();
         let mut next = settings.clone();
+        if patch.computer_enabled.is_none() {
+            next.computer_enabled = load_settings(&self.outer_home).computer_enabled;
+        }
         patch.apply(&mut next)?;
         save_settings(&self.outer_home, &next)?;
         if let Some(model) = &next.model {
@@ -350,6 +366,7 @@ impl Runtime {
             .set_security_research_mode(next.security_research_mode);
         self.apply_personalization(&next);
         *settings = next.clone();
+        self.sync_computer_tools(next.computer_enabled);
         Ok(next)
     }
 

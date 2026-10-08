@@ -81,6 +81,16 @@ async fn limited_json(mut response: reqwest::Response) -> Result<Value> {
 
 pub(crate) async fn probe(client: &Client, authority: &str) -> Result<ExistingService> {
     let base = format!("http://{authority}");
+    let discovery = client.get(format!("{base}/api/harness/discovery")).send().await?;
+    if discovery.status() == StatusCode::OK {
+        let value = limited_json(discovery).await?;
+        anyhow::ensure!(value["service"] == "dsh-harness" && value["protocol_version"] == 2 && value["can_shutdown"] == true, "无法验证已有 Harness 服务");
+        let instance_id = value["instance_id"].as_str().filter(|id| uuid::Uuid::parse_str(id).is_ok()).context("invalid Harness instance")?.to_owned();
+        let token = crate::web_access::read_control(authority, &instance_id)?;
+        let workspace = value["workspace"].as_str().context("Harness workspace is missing")?.to_owned();
+        return Ok(ExistingService { workspace, token, instance_id: Some(instance_id) });
+    }
+    anyhow::ensure!(discovery.status() == StatusCode::NOT_FOUND, "无法验证该端口上的 Harness 服务");
     let response = client
         .get(format!("{base}/api/harness/bootstrap"))
         .send()

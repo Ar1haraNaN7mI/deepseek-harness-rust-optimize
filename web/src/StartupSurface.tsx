@@ -7,11 +7,13 @@ export function StartupSurface({
   playing,
   generation,
   onFinish,
+  onUnlock,
   children,
 }: {
   playing: boolean;
   generation: number;
   onFinish: (reason: FinishReason) => void;
+  onUnlock?: () => void;
   children: ReactNode;
 }) {
   const [preferences] = useUiPreferences();
@@ -25,6 +27,7 @@ export function StartupSurface({
         enabled={playing}
         startupUrl={preferences.reducedMotion === "reduce" ? "/startup-preview.html?motion=reduce" : "/startup-preview.html"}
         onFinish={onFinish}
+        onUnlock={onUnlock}
       >
         {null}
       </StartupGate>

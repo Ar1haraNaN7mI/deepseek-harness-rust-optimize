@@ -20,6 +20,8 @@
   globalThis.DSHEmbed = Object.freeze({
     get embedded() { return target !== null; },
     ready() { send('ready'); },
+    // The parent rechecks its own backend cookie before opening the workbench.
+    unlocked() { if (!finished) send('unlocked'); },
     finish(reason) {
       if (!target || finished || !['complete', 'skip'].includes(reason)) return false;
       finished = true;

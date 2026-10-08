@@ -63,10 +63,12 @@ impl ToolRegistry {
 
     /// Resolve and validate a call before any policy prompt or side effect.
     pub fn preflight(&self, call: &ToolCall) -> Result<ToolDefinition, ToolError> {
-        let Some(definition) = self.definition(&call.name) else {
+        let Some(handler) = self.get(&call.name) else {
             return Err(ToolError::Message(format!("unknown tool: {}", call.name)));
         };
+        let definition = handler.definition();
         validate_tool_arguments(&definition, &call.arguments)?;
+        handler.validate_arguments(&call.arguments)?;
         Ok(definition)
     }
 

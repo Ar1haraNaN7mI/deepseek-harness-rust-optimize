@@ -89,3 +89,13 @@ test('only matching iframe completion closes the native overlay', async () => {
   complete(event); assert.equal(removed, true); assert.equal(remembered, true);
   assert.equal(background.inert, false); assert.equal(alreadyInert.inert, true);
 });
+
+test('optional Rust access checks stay inside the startup namespace on official DSH', async () => {
+  const { runInNewContext } = await import('node:vm');
+  const calls = [];
+  const window = { fetch: async (input) => { calls.push(input); return { status: 404 }; } };
+  runInNewContext(readFileSync(new URL('./bridge.mjs', import.meta.url), 'utf8'), { window, document: { addEventListener() {} } });
+  await window.fetch('/api/access');
+  await window.fetch('/api/profile');
+  assert.deepEqual(calls, ['/__dsh_startup/api/access', '/__dsh_startup/api/profile']);
+});

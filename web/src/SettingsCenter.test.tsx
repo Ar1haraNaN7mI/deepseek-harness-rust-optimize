@@ -19,6 +19,7 @@ vi.mock("./api", async (original) => ({
   rpc: vi.fn(),
   post: vi.fn(),
   bootstrap: vi.fn(),
+  accessStatus: vi.fn(),
 }));
 vi.mock("./Emblem", () => ({ Emblem: () => <span>DSH</span> }));
 vi.mock("./ModelServiceSettings", () => ({
@@ -33,6 +34,9 @@ vi.mock("./WorkspaceSettings", () => ({
   WorkspaceSettings: ({ token, section }: { token: string; section: string }) => (
     <div data-token={token}>DSH 本机 {section}</div>
   ),
+}));
+vi.mock("./ComputerSettings", () => ({
+  ComputerSettings: ({ token }: { token: string }) => <div data-token={token}>DSH 电脑操作</div>,
 }));
 
 const session = {
@@ -150,6 +154,7 @@ beforeEach(() => {
     baseRpc(method),
   );
   vi.mocked(api.bootstrap).mockResolvedValue(data);
+  vi.mocked(api.accessStatus).mockResolvedValue({ enabled: false, unlocked: true, token: data.token, profile: data.profile, startup: data.startup });
 });
 afterEach(() => {
   cleanup();
@@ -206,7 +211,7 @@ describe("Settings center", () => {
     expect(names).toEqual([
       "通用", "外观", "通知", "个人资料", "执行权限", "模型服务", "已归档聊天",
       "语音", "存储", "个性化", "宠物", "键盘", "用量", "数据控制", "插件与 Skills",
-      "本机工作区", "DSH 任务", "代码审查", "启动动画",
+      "本机工作区", "电脑操作", "DSH 任务", "代码审查", "启动动画",
     ]);
     for (const name of names) {
       category(name!);
@@ -215,6 +220,8 @@ describe("Settings center", () => {
     expect(screen.queryByRole("link")).toBeNull();
     category("本机工作区");
     expect(screen.getByText("DSH 本机 workspace").getAttribute("data-token")).toBe("local-token");
+    category("电脑操作");
+    expect(screen.getByText("DSH 电脑操作").getAttribute("data-token")).toBe("local-token");
     category("DSH 任务");
     expect(screen.getByText("DSH 本机 tasks")).toBeTruthy();
     category("代码审查");
@@ -293,7 +300,7 @@ describe("Settings center", () => {
     );
     await ready();
     category("个人资料");
-    fireEvent.change(screen.getByLabelText("显示名称"), {
+    fireEvent.change(screen.getByLabelText("访问身份"), {
       target: { value: "New operator" },
     });
     fireEvent.click(screen.getByRole("button", { name: "保存资料" }));
@@ -301,7 +308,7 @@ describe("Settings center", () => {
       "textContent",
       "disk write failed",
     );
-    expect((screen.getByLabelText("显示名称") as HTMLInputElement).value).toBe(
+    expect((screen.getByLabelText("访问身份") as HTMLInputElement).value).toBe(
       "New operator",
     );
     expect(state.setData).not.toHaveBeenCalled();

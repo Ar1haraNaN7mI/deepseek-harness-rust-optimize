@@ -63,6 +63,7 @@ function createHarness(options = {}) {
   let generatedNode = 0;
   async function request(url, init = {}) {
     requests.push({ url, ...init });
+    if (url.startsWith('/api/access')) return options.accessFetch ? options.accessFetch(url, init) : jsonResponse({ message: 'Not found' }, 404);
     if (options.fetch) return options.fetch(url, init);
     if (url === '/api/profile') return jsonResponse(init.method === 'POST' ? JSON.parse(init.body) : profileFixture);
     if (url === '/api/load') { const stream = ndjsonStream(); stream.event(inventoryFixture); stream.close(); return stream.response; }
@@ -550,7 +551,115 @@ async function main() {
   invalidEmbed.element('skip').emit('click'); assert.equal(invalidEmbed.messages.length, 0, 'invalid parent origins disable the bridge');
   const standalone = createHarness({ search: embedSearch }); standalone.element('skip').emit('click');
   assert.equal(standalone.messages.length, 0, 'query parameters cannot make a standalone page send messages');
-  console.log('PASS: startup browser lifecycle, real inventory, voice synchronization, and embedded ready/complete/skip handshake with cleanup.');
+  // A real access lock is independent of playback, seeking and skip controls.
+  let unlocked = false, passwordAttempts = 0;
+  const accessStatus = () => ({ enabled: true, unlocked, token: profileFixture.token, sound: false, profile: { username: profileFixture.username, badge_id: profileFixture.badge_id } });
+  const locked = createHarness({ embedded: true, search: embedSearch, accessFetch: async (url, init) => {
+    if (url === '/api/access/unlock') {
+      passwordAttempts++;
+      assert.equal(init.headers['X-DSH-Token'], profileFixture.token);
+      assert.equal(init.credentials, 'same-origin');
+      if (JSON.parse(init.body).password !== 'only-a-test-password') return jsonResponse({ error: { code: 'incorrect_password', message: '访问密码不正确' } }, 401);
+      unlocked = true;
+    }
+    return jsonResponse(accessStatus());
+  } });
+  await settle();
+  assert.equal(locked.requests.filter(item => item.url === '/api/profile').length, 0, 'a locked preview reads only the public identity');
+  assert.equal(locked.element('cardName').textContent, 'CatShark');
+  assert.equal(locked.element('accessEntry').hidden, false);
+  assert.equal(locked.element('sound').getAttribute('aria-pressed'), 'false', 'public access status respects silent mode before unlocking');
+  assert.equal(locked.element('saveIdentity').disabled, true);
+  locked.element('seek').value = '11.4'; locked.element('seek').emit('input');
+  assert.equal(locked.drawStates.at(-1).phase, 2, 'seeking cannot skip past password verification');
+  locked.tap(); await settle(); locked.frame(6000);
+  assert.equal(locked.drawStates.at(-1).phase, 2, 'continuous playback must hold at the identity boundary');
+  assert.equal(locked.requests.filter(item => item.url === '/api/load').length, 0);
+  locked.element('skip').emit('click');
+  assert.equal(locked.messages.length, 1, 'the film cannot signal completion while access is locked');
+  assert.equal(locked.document.activeElement, locked.element('accessPassword'));
+  locked.element('accessPassword').value = 'incorrect-test-password'; locked.element('accessForm').emit('submit');
+  await settle();
+  assert.equal(locked.element('accessPassword').value, '', 'password text is cleared after submission');
+  assert.match(locked.element('accessMessage').textContent, /访问密码不正确/);
+  assert.equal(locked.messages.length, 1);
+  locked.element('accessPassword').value = 'only-a-test-password'; locked.element('accessForm').emit('submit');
+  await settle(); await settle();
+  assert.equal(passwordAttempts, 2);
+  assert.equal(locked.element('accessEntry').hidden, true);
+  assert.equal(locked.messages.at(-1).message.type, 'unlocked');
+  assert.ok(locked.requests.filter(item => item.url === '/api/access').length >= 2, 'the successful response must be rechecked with the actual cookie');
+  assert.equal(locked.element('saveIdentity').disabled, false);
+  locked.frame(9500); await settle();
+  assert.equal(locked.requests.filter(item => item.url === '/api/load').length, 1, 'real inventory starts only after successful verification');
+
+  const noCookie = createHarness({ accessFetch: async (url) => jsonResponse({ ...accessStatus(), unlocked: url.endsWith('/unlock') }) });
+  await settle(); noCookie.element('accessPassword').value = 'only-a-test-password'; noCookie.element('accessForm').emit('submit'); await settle(); await settle();
+  assert.equal(noCookie.element('accessEntry').hidden, false, 'a POST success without an accepted cookie is not an unlocked session');
+  assert.match(noCookie.element('accessMessage').textContent, /无法确认访问状态/);
+
+  // Keep the actual phase boundary running while cookie verification waits.
+  // A POST success cannot temporarily hide the form or initiate real discovery.
+  let finishCookieCheck, cookieReads = 0;
+  const delayedCookie = createHarness({ accessFetch: async (url) => {
+    if (url === '/api/access/unlock') return jsonResponse({ ...accessStatus(), unlocked: true });
+    if (++cookieReads === 1) return jsonResponse({ ...accessStatus(), unlocked: false });
+    return new Promise(resolve => { finishCookieCheck = resolve; });
+  } });
+  await settle(); delayedCookie.element('seek').value = '5.9'; delayedCookie.element('seek').emit('input');
+  delayedCookie.tap(); await settle(); delayedCookie.frame(4001);
+  assert.equal(delayedCookie.drawStates.at(-1).phase, 2);
+  delayedCookie.element('accessPassword').value = 'only-a-test-password'; delayedCookie.element('accessForm').emit('submit');
+  await settle(); delayedCookie.frame(8001);
+  assert.equal(delayedCookie.element('accessEntry').hidden, false, 'the input remains visible while cookie verification is pending');
+  assert.equal(delayedCookie.element('accessSubmit').disabled, true);
+  assert.equal(delayedCookie.drawStates.at(-1).phase, 2, 'a pending cookie check cannot release the identity chapter');
+  assert.equal(delayedCookie.requests.filter(item => item.url === '/api/load').length, 0, 'no real inventory request may start during cookie verification');
+  finishCookieCheck(jsonResponse({ ...accessStatus(), unlocked: false })); await settle(); await settle();
+  assert.equal(delayedCookie.element('accessEntry').hidden, false);
+  assert.match(delayedCookie.element('accessMessage').textContent, /无法确认访问状态/);
+
+  // A manual reconnect begun before the password POST holds stale lock state.
+  // Forced verification must supersede it, and its late result must be ignored.
+  let finishOldConnect, contentionReads = 0;
+  const contention = createHarness({ accessFetch: async (url) => {
+    if (url === '/api/access/unlock') return jsonResponse({ ...accessStatus(), unlocked: true });
+    contentionReads++;
+    if (contentionReads === 2) return new Promise(resolve => { finishOldConnect = resolve; });
+    return jsonResponse({ ...accessStatus(), unlocked: contentionReads >= 3 });
+  } });
+  await settle(); contention.element('connectLocal').emit('click'); await settle();
+  const oldConnect = contention.requests.filter(item => item.url === '/api/access').at(-1);
+  contention.element('accessPassword').value = 'only-a-test-password'; contention.element('accessForm').emit('submit');
+  await settle(); await settle();
+  assert.equal(contentionReads, 3, 'verification must make a fresh GET rather than reuse the pre-unlock request');
+  assert.equal(oldConnect.signal.aborted, true, 'superseded manual reconnect must be aborted');
+  assert.equal(contention.element('accessEntry').hidden, true);
+  finishOldConnect(jsonResponse({ ...accessStatus(), unlocked: false })); await settle();
+  assert.equal(contention.element('accessEntry').hidden, true, 'a late stale GET cannot relock a verified session');
+  assert.equal(contention.element('saveIdentity').disabled, false);
+
+  let finishUnlockJson;
+  const disposedUnlock = createHarness({ embedded:true, search:embedSearch, accessFetch:async url => url.endsWith('/unlock')
+    ? {ok:true,status:200,json:()=>new Promise(resolve=>{finishUnlockJson=resolve;})}
+    : jsonResponse({...accessStatus(),unlocked:false}) });
+  await settle(); disposedUnlock.element('accessPassword').value='only-a-test-password'; disposedUnlock.element('accessForm').emit('submit');
+  await settle(); disposedUnlock.windowEvents.emit('pagehide');
+  const disposedPost=disposedUnlock.requests.find(item=>item.url==='/api/access/unlock');
+  assert.equal(disposedPost.signal.aborted,true,'leaving the page must abort a pending password request');
+  finishUnlockJson({...accessStatus(),unlocked:true}); await settle();
+  assert.equal(disposedUnlock.messages.filter(item=>item.message.type==='unlocked').length,0,'late parsed responses cannot authorize a disposed iframe');
+  assert.equal(disposedUnlock.requests.filter(item=>item.url==='/api/access').length,1,'a disposed unlock cannot start cookie verification');
+  assert.equal(disposedUnlock.requests.filter(item=>item.url==='/api/load').length,0);
+
+  const invalidUnlock = createHarness({accessFetch:async url=>jsonResponse(url.endsWith('/unlock')
+    ? {enabled:true,unlocked:true,profile:{username:'INVALID'}}
+    : {...accessStatus(),unlocked:false})});
+  await settle(); invalidUnlock.element('accessPassword').value='only-a-test-password'; invalidUnlock.element('accessForm').emit('submit'); await settle();
+  assert.equal(invalidUnlock.element('accessEntry').hidden,false,'malformed success responses cannot release the password gate');
+  assert.match(invalidUnlock.element('accessMessage').textContent,/无效资料/);
+  assert.equal(invalidUnlock.requests.filter(item=>item.url==='/api/profile').length,0);
+  console.log('PASS: startup lifecycle, real inventory, voice, access-password barriers and verified embedded handshake.');
 }
 
 main().catch(error => { console.error(error); process.exitCode = 1; });

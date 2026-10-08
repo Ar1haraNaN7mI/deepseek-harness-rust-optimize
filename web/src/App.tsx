@@ -14,7 +14,7 @@ import Markdown from "react-markdown";
 import { Emblem } from "./Emblem";
 import { Companion } from "./Companion";
 import { SettingsCenter } from "./SettingsCenter";
-import { useUiPreferences, useInterfaceEffects, shouldSend } from "./uiPreferences";
+import { useUiPreferences, shouldSend } from "./uiPreferences";
 import { unlockNotificationAudio } from "./notifications";
 import { useHarness } from "./useHarness";
 import type { Activity, Bootstrap, SessionEvent } from "./types";
@@ -227,7 +227,6 @@ export function App({
   const [catalog, setCatalog] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [preferences] = useUiPreferences();
-  useInterfaceEffects();
   const desktopReady = useRef(false);
   useEffect(() => {
     const desktop = window as Window & {

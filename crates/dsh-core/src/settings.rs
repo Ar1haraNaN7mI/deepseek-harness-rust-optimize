@@ -72,6 +72,9 @@ pub struct SessionSettings {
     /// independent and remain authoritative.
     #[serde(default = "default_true")]
     pub security_research_mode: bool,
+    /// Native computer tools are opt-in and shared by CLI, web and desktop.
+    #[serde(default)]
+    pub computer_enabled: bool,
 }
 
 impl Default for SessionSettings {
@@ -107,6 +110,7 @@ impl Default for SessionSettings {
             add_dirs: Vec::new(),
             bypass_hook_trust: false,
             security_research_mode: true,
+            computer_enabled: false,
         }
     }
 }
@@ -151,10 +155,14 @@ pub struct SettingsPatch {
     pub security_research_mode: Option<bool>,
     pub sidebar: Option<bool>,
     pub show_thinking: Option<bool>,
+    pub computer_enabled: Option<bool>,
 }
 
 impl SettingsPatch {
     pub(crate) fn apply(self, settings: &mut SessionSettings) -> Result<()> {
+        if let Some(enabled) = self.computer_enabled {
+            settings.computer_enabled = enabled;
+        }
         if let Some(enabled) = self.send_local_api_key {
             settings.send_local_api_key = Some(enabled);
         }

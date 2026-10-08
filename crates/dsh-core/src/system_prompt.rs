@@ -45,6 +45,7 @@ impl SystemPromptBuilder {
         // and recalled-memory sections when a small model caps the prompt.
         sections.insert("personality".into(), String::new());
         sections.insert("custom_instructions".into(), String::new());
+        sections.insert("computer".into(), String::new());
         sections.insert("skills".into(), String::new());
         sections.insert("plugins".into(), String::new());
         sections.insert("learn".into(), String::new());
@@ -190,12 +191,15 @@ mod tests {
         builder.set_model_optimization("Keep responses compact for this small model.");
         builder.set_section("personality", "Avoid emoji.");
         builder.set_section("custom_instructions", "Answer in the user's preferred language.");
+        builder.set_section("computer", "Verify background input with a fresh UIA/OCR observation.");
         builder.set_section("skills", "large routing notes ".repeat(2000));
         let prompt = builder.render_with_limit(Some(4000));
         assert!(prompt.chars().count() <= 4000);
         assert!(prompt.contains("Avoid emoji."));
         assert!(prompt.contains("Answer in the user's preferred language."));
+        assert!(prompt.contains("Verify background input with a fresh UIA/OCR observation."));
         assert!(prompt.find("## custom_instructions").unwrap() < prompt.find("## skills").unwrap());
+        assert!(prompt.find("## computer").unwrap() < prompt.find("## skills").unwrap());
         assert!(prompt.contains("[prompt sections truncated]"));
     }
 

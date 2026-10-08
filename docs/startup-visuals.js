@@ -191,6 +191,129 @@
         at+=length;
       });
     }
+    function outsidePlate(box,paint,pad=18) {
+      // New ornaments live outside the real, responsive reading surface. In
+      // particular, a fourth identity row must not meet an old fixed-size ring.
+      ctx.save();ctx.beginPath();ctx.rect(-W/2,-H/2,W,H);
+      if(box)ctx.rect(box.left-pad,box.top-pad,box.right-box.left+pad*2,box.bottom-box.top+pad*2);
+      ctx.clip('evenodd');paint();ctx.restore();
+    }
+    function hatchPlate(x,y,w,h,amount=1,direction=1) {
+      if(w<=0||h<=0||amount<=0)return;
+      ctx.save();ctx.beginPath();ctx.rect(x,y,w,h);ctx.clip();
+      rect(x,y,w,h,C.ink,.026*amount);
+      for(let i=-h;i<w+h;i+=13)line(x+i,y,x+i+direction*h,y+h,C.ink,.18*amount,.75);
+      ctx.restore();
+    }
+    function draftingRails(strength=1) {
+      // A single registration grid persists through the cuts: the same inset,
+      // optical weights and 13-unit hatch pitch tie each chapter together.
+      const lock=reduced||waiting?1:ease(part(p,.025,.38));
+      const outer=W/2-42,inner=Math.min(W*.40,570),y1=wy(.18),y2=wy(.82);
+      for(const side of [-1,1]){
+        const x=side*outer,run=(outer-inner)*lock;
+        for(const [y,dir] of [[y1,1],[y2,-1]]){
+          line(x,y,x-side*run,y,C.soft,.43*strength,.8);
+          line(x,y,x,y+dir*61*lock,C.ink,.45*strength,1.4);
+          rect(x-side*4,y+dir*8,3,15,C.accent,.8*strength*lock);
+          for(let i=0;i<7;i++)line(x-side*(13+i*9),y,x-side*(13+i*9),y+dir*(i%3===0?9:4),C.soft,.42*strength*lock,.75);
+        }
+        if(W>1250){
+          const path=[[x,wy(.33)],[x-side*18,wy(.33)],[x-side*18,wy(.67)],[x,wy(.67)]];
+          trace(path,lock,0,C.soft,.28*strength,.8);
+          const travel=reduced?.5:fract(ambient*.31+side*.25);
+          rect(x-side*20-2,mix(wy(.36),wy(.64),travel),4,20,C.accent,.58*strength);
+        }
+      }
+      const length=Math.min(180,W*.17)*lock;
+      for(const side of [-1,1]){
+        const x=side*(W*.32),y=wy(.21);
+        hatchPlate(x-(side>0?length:0),y,length,16,.60*strength,side);
+        line(x,y+22,x-side*length,y+22,C.ink,.38*strength,.8);
+      }
+    }
+    function sealMechanism(x,y,s,q,strength=1) {
+      // Three timed concentric assemblies replace a generic perpetual spinner.
+      // They share the exact seal origin, but never change its triangle guide.
+      const locked=reduced||waiting,arrive=locked?1:ease(part(q,0,.32));
+      const etch=locked?1:ease(part(q,.09,.49)),settle=locked?1:ease(part(q,.36,.72));
+      const radius=154*s,turn=locked?0:(1-arrive)*1.5;
+      ctx.save();ctx.translate(x,y+28.38*s);
+      ctx.beginPath();ctx.rect(-W,-H,W*2,H*2);ctx.rect(-160,110*s-28.38*s,320,H);ctx.clip('evenodd');
+      for(let layer=0;layer<3;layer++){
+        const r=radius+layer*17+(1-arrive)*(120+layer*65);
+        for(let sector=0;sector<3;sector++){
+          const a=-Math.PI/2+sector*TAU/3+turn*(layer%2?-1:1)+layer*.13;
+          const span=(.34+layer*.15)*etch;
+          arc(0,0,r,a-span,a+span,layer===1?C.accent:C.soft,strength*(layer===1?.70:.37)*(1-settle*.38),layer===1?4.5:1);
+          if(layer===2)for(let tick=0;tick<9;tick++){
+            const theta=a-.31+tick*.078;
+            line(Math.cos(theta)*(r+9),Math.sin(theta)*(r+9),Math.cos(theta)*(r+9+(tick%4===0?11:4)),Math.sin(theta)*(r+9+(tick%4===0?11:4)),C.soft,strength*.48*etch,.85);
+          }
+        }
+      }
+      for(let sector=0;sector<3;sector++){
+        const a=-Math.PI/2+sector*TAU/3,r=radius+70+(1-settle)*160;
+        ctx.save();ctx.rotate(a);
+        line(r,-17,r+27,-17,C.ink,strength*.55*etch,1.2);
+        line(r,17,r+27,17,C.ink,strength*.55*etch,1.2);
+        rect(r+9,-7,9,14,C.accent,strength*.75*etch);
+        ctx.restore();
+      }
+      ctx.restore();
+    }
+    function identityAperture() {
+      const box=identityBox||{left:-240,right:240,top:wy(.49),bottom:wy(.73)};
+      const settle=reduced||waiting?1:ease(part(p,.04,.53));
+      outsidePlate(box,()=>{
+        const cy=wy(.47),r=Math.min(W*.425,H*.425),rotation=(1-settle)*1.4;
+        ctx.save();ctx.translate(px,cy+py);
+        for(let sector=0;sector<6;sector++){
+          const a=sector*TAU/6+rotation-.13;
+          const ri=r+45+(1-settle)*105,ro=ri+20;
+          const points=[];
+          for(let j=0;j<=8;j++){const t=a+j*.045;points.push([Math.cos(t)*ro,Math.sin(t)*ro]);}
+          for(let j=8;j>=0;j--){const t=a+j*.045;points.push([Math.cos(t)*ri,Math.sin(t)*ri]);}
+          poly(points,sector%3===0?C.accent:C.ink,sector%3===0?.27:.11);
+          const scan=reduced?1:ease(part(p,sector*.025,.47+sector*.025));
+          arc(0,0,ri-4,a,a+.36*scan,C.ink,.45,1);
+        }
+        ctx.restore();
+        const extension=Math.min(110,Math.max(24,(W-(box.right-box.left))*.13));
+        for(const side of [-1,1]){
+          const edge=side<0?box.left:box.right,x=edge+side*(18+(1-settle)*160);
+          const y=box.top-28;
+          const route=[[edge,y],[x+side*extension*.4,y],[x+side*extension,y-37],[x+side*extension,y-87]];
+          trace(route,settle,0,C.ink,.50,1.2);
+          const runner=reduced?1:fract(ambient*.58+side*.25);
+          trace(route,runner,Math.max(0,runner-.16),C.accent,.85,3);
+          hatchPlate(Math.min(x,x+side*extension),box.bottom+20,extension,14,.65,side);
+          line(x,box.bottom+43,x+side*extension,box.bottom+43,C.ink,.40,.8);
+        }
+      });
+    }
+    function inventoryCircuits(box,complete) {
+      const active=inventory.status==='loading',settle=reduced||waiting?1:ease(part(p,.03,.4));
+      // Branch endpoints are derived only from actual entries. Empty or failed
+      // discovery leaves empty trunks; the carrier appears only while reading.
+      outsidePlate(box,()=>{
+        for(const [side,entries] of [[-1,inventory.skills],[1,inventory.plugins]]){
+          const edge=side<0?box.left:box.right,rail=edge+side*30;
+          const room=Math.max(14,Math.min(65,W/2-Math.abs(rail)-24));
+          const path=[[edge,box.top-30],[rail+side*room,box.top-30],[rail+side*room,box.bottom+30],[edge,box.bottom+30]];
+          trace(path,settle,0,C.soft,.48,.8);
+          if(active&&!reduced){const t=fract(ambient*.65+(side>0?.35:0));trace(path,t,Math.max(0,t-.22),C.accent,.83,3);}
+          const count=Math.min(8,Array.isArray(entries)?entries.length:0);
+          for(let i=0;i<count;i++){
+            const y=mix(box.top+25,box.bottom-25,(i+.5)/count),x=rail+side*room;
+            const branch=[[x,y-12],[x-side*12,y],[rail,y]];
+            trace(branch,settle,0,C.ink,complete?.62:.37,1);
+            rect(rail-2.5,y-2.5,5,5,complete?C.accent:C.ink,complete?.8:.5);
+          }
+          hatchPlate(Math.min(edge,edge+side*100),box.top-61,100,11,.48,side);
+        }
+      },10);
+    }
     function deltaConstruction(x,y,q,scale=1) {
       const rest=waiting||reduced,arrival=rest?1:ease(part(q,0,.40));
       // The seal's SVG origin is its bounding-box midpoint, not the triangle's
@@ -263,6 +386,7 @@
     function blackIntro() {
       const q=waiting||reduced?1:p,assembly=part(q,0,.35),stamp=ease(part(q,.18,.44));
       const cy=wy(.40),s=1.70*pulse*(waiting||reduced?1:1.22-.22*ease(part(p,0,.48)));
+      draftingRails(.65);sealMechanism(px,cy+py,s,q,.8);
       deltaConstruction(px,cy+py,q,s);archiveMargins(.8);
       // The seal is the hero. The un-stretched signature has a clear subordinate role.
       emblem(px,cy+py,s,assembly,1,C.ink,1);
@@ -284,20 +408,22 @@
     }
     function permission() {
       paper();
-      archiveMargins();
+      archiveMargins();draftingRails(.8);
       const show=ease(part(p,0,.42));
+      sealMechanism(px,wy(.60)+py,.80*pulse,p,.66);
       deltaConstruction(px,wy(.60)+py,p,.80*pulse);
       emblem(px,wy(.60)+py,.80*pulse,part(p,0,.44),1,C.ink,.95);
       const y=wy(.72);for(let i=0;i<13;i++)rect(-73+i*12,y,5,1.8,C.ink,i<Math.floor(13*show)?.8:.18);
       scan(.55);flightLines(.38);shutters();
     }
-    function verification() {paper();archiveMargins();reticle(.94);registration(wy(.47));dataFall(.42);flightLines(.3);shutters();}
+    function verification() {paper();draftingRails(.8);archiveMargins();identityAperture();reticle(.94);registration(wy(.47));dataFall(.42);flightLines(.3);shutters();}
     function capabilityField(complete=false) {
       paper();
-      archiveMargins(.75);
+      archiveMargins(.75);draftingRails(.8);
       // The moving cuts are decoration, not progress. The host overlays the
       // complete, immediately updated server inventory in these two columns.
       const top=inventoryBox?.top??wy(.36),bottom=inventoryBox?.bottom??wy(.86),left=inventoryBox?.left??wx(.105),right=inventoryBox?.right??wx(.895);
+      inventoryCircuits({top,bottom,left,right},complete);
       // The DOM owns column borders (including the single-column breakpoint).
       // Canvas adds only outside ornaments, so zoom cannot create double rules.
       if(!inventoryBox)line(0,top+18,0,bottom-35,C.line,.65,1);
@@ -342,8 +468,9 @@
     function readComplete() {capabilityField(true);}
     function welcome() {
       paper();
-      archiveMargins();
+      archiveMargins();draftingRails(.9);
       const enter=ease(part(p,.015,.24)),cy=wy(.425),s=1.42*(reduced?1:1+.18*(1-ease(part(p,0,.35))));
+      sealMechanism(px*.4,cy+py*.4,s,p,.9);
       deltaConstruction(px*.4,cy+py*.4,p,s);
       if(p<.25)reticle((1-part(p,0,.25))*.8,.4);
       text('WELCOME TO',0,cy-190+(1-enter)*-45,18,C.ink,enter,7);
@@ -398,9 +525,19 @@
       }
     }
     function shutters() {
-      if(reduced||waiting||p>.16)return;
-      const t=ease(part(p,0,.16));ctx.save();ctx.transform(1,0,-.32,1,0,0);
-      for(const side of [-1,1]){const x=side*(W*.29+t*W*.58);rect(x-W*.18,-H*.55,W*.36,H*1.1,C.ink,(1-t)*.17);rect(x-W*.18,-H*.55,5,H*1.1,C.accent,(1-t)*.7);}
+      if(reduced||waiting||p>.29)return;
+      // Three independently timed flat cutters open before the type settles.
+      // Their matching hatch/edge marks echo the static registration plates.
+      ctx.save();ctx.transform(1,0,-.32,1,0,0);
+      for(let layer=0;layer<3;layer++){
+        const t=ease(part(p,layer*.025,.16+layer*.055));
+        for(const side of [-1,1]){
+          const x=side*(W*(.19+layer*.13)+t*W*.65),w=W*(.20-layer*.045);
+          rect(x-w/2,-H*.55,w,H*1.1,C.ink,(1-t)*(.14-layer*.025));
+          rect(x-w/2,-H*.55,layer===0?7:2,H*1.1,layer===1?C.ink:C.accent,(1-t)*.68);
+          for(let i=0;i<8;i++)line(x-w/2+8,-H*.45+i*H*.13,x-w/2+26,-H*.45+i*H*.13,C.ink,(1-t)*.65,1.2);
+        }
+      }
       ctx.restore();
     }
     function clickResponse() {

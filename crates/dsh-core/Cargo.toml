@@ -7,6 +7,8 @@ description = "Core kernel: session log, agent loop, system prompt (immutable at
 
 [dependencies]
 anyhow.workspace = true
+base64 = "0.22.1"
+dsh-computer.workspace = true
 fs2 = "0.4"
 async-trait.workspace = true
 chrono.workspace = true

@@ -419,6 +419,11 @@ pub enum ToolError {
 #[async_trait]
 pub trait ToolHandler: Send + Sync {
     fn definition(&self) -> ToolDefinition;
+    /// Optional semantic checks performed after JSON Schema validation and
+    /// before a caller requests approval or executes side effects.
+    fn validate_arguments(&self, _arguments: &Value) -> Result<(), ToolError> {
+        Ok(())
+    }
     async fn call(&self, args: Value, ctx: &ToolContext) -> Result<String, ToolError>;
 }
 

@@ -1,7 +1,7 @@
 /* Runs only in the startup iframe. Keep native routes away from official APIs. */
 (() => {
   const request = window.fetch.bind(window);
-  window.fetch = (input, init) => request(typeof input === 'string' && (['/api/profile', '/api/load'].includes(input) || input.startsWith('/assets/voice/')) ? '/__dsh_startup' + input : input, init);
+  window.fetch = (input, init) => request(typeof input === 'string' && (['/api/profile', '/api/load', '/api/access'].includes(input) || input.startsWith('/api/access/') || input.startsWith('/assets/voice/')) ? '/__dsh_startup' + input : input, init);
   document.addEventListener('DOMContentLoaded', () => {
     document.documentElement.dataset.runtime = 'native';
     const badge = document.querySelector('.brand-bottom em');

@@ -415,6 +415,7 @@ async fn handle_request(
                 "eventsWait": true,
                 "approvals": true,
                 "tools": true,
+                "computer": true,
                 "agent": true,
                 "cloud": true,
                 "llm": true,
@@ -673,6 +674,25 @@ async fn handle_request(
             Ok(json!({"request_id": request_id, "allow": allow}))
         }
         "tools/list" => Ok(json!({"tools": runtime.tools.definitions()})),
+        "computer/status" => Ok(runtime.computer_status()),
+        "computer/setEnabled" => {
+            let enabled=params.get("enabled").and_then(Value::as_bool)
+                .ok_or_else(||RpcFailure::invalid_params("enabled must be boolean"))?;
+            runtime.set_computer_enabled(enabled).map_err(|error|RpcFailure::invalid_params(error.to_string()))
+        }
+        "computer/windows" => {
+            let (_cancel,rx)=tokio::sync::watch::channel(false);
+            runtime.computer.windows(rx).await.map_err(|error|RpcFailure::internal(error.to_string()))
+        }
+        "computer/observe" => {
+            let window_id=required_string(&params,"window_id")?;
+            let (_cancel,rx)=tokio::sync::watch::channel(false);
+            runtime.computer.observe(&window_id,true,rx).await.map_err(|error|RpcFailure::internal(error.to_string()))
+        }
+        "computer/act" => {
+            let (_cancel,rx)=tokio::sync::watch::channel(false);
+            runtime.computer_operator_action(params,rx).await.map_err(|error|RpcFailure::invalid_params(error.to_string()))
+        }
         "cloud/list" => {
             let artifacts = cloud::list_artifacts(&runtime.outer_home)
                 .map_err(|err| RpcFailure::internal(err.to_string()))?;
@@ -1121,6 +1141,29 @@ mod tests {
             required_string(&json!({"id": "task-1"}), "id").unwrap(),
             "task-1"
         );
+    }
+
+    #[tokio::test]
+    async fn computer_rpc_is_opt_in_and_rejects_unvalidated_operator_actions() {
+        let (runtime,root)=test_runtime("computer");
+        let status=handle_request(runtime.clone(),"computer/status",json!({})).await.unwrap();
+        assert_eq!(status["enabled"],false);assert_eq!(status["tools"],json!([]));
+        assert!(handle_request(runtime.clone(),"computer/windows",json!({})).await.is_err());
+        assert!(handle_request(runtime.clone(),"computer/setEnabled",json!({"enabled":"yes"})).await.is_err());
+        assert!(handle_request(runtime.clone(),"computer/act",json!({"action":"click","x":0})).await.is_err());
+        assert!(runtime.approvals.pending().is_empty());
+        if status["supported"]==true {
+            handle_request(runtime.clone(),"computer/setEnabled",json!({"enabled":true})).await.unwrap();
+            assert!(dsh_core::load_settings(&runtime.outer_home).computer_enabled);
+            assert!(runtime.tools.get("computer_act").is_some());
+            runtime.set_permissions(dsh_core::PermissionMode::ReadOnly).unwrap();
+            let id=Uuid::new_v4().to_string();
+            let result=handle_request(runtime.clone(),"computer/act",json!({"action":"key","window_id":id,"snapshot_id":id,"node_id":"n0","key":"ENTER"})).await.unwrap_err();
+            assert!(result.message.contains("read-only"));
+            handle_request(runtime.clone(),"computer/setEnabled",json!({"enabled":false})).await.unwrap();
+            assert!(runtime.tools.get("computer_act").is_none());
+        }
+        drop(runtime);std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

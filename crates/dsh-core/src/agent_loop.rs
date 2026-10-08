@@ -530,6 +530,7 @@ async fn run_turn_inner(
             Some(&run_id),
         );
 
+        runtime.computer_status();
         let system_limit = model_policy
             .context_chars
             .map(|chars| (chars / 3).max(2_048));

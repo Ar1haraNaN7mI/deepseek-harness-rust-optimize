@@ -1,5 +1,6 @@
 mod app_server;
 mod cloud;
+mod computer_control;
 mod desktop_launch;
 mod harness_settings;
 mod model_service;
@@ -8,6 +9,7 @@ mod workspace_settings;
 mod mcp_server;
 mod startup_inventory;
 mod startup_web;
+mod web_access;
 mod web_launch;
 mod web_legacy;
 
@@ -55,6 +57,7 @@ dsh-rust is a two-layer coding agent for hosted and local OpenAI-compatible mode
   dsh --startup       play startup, then enter the interactive TUI
   dsh web             serve the local Harness web app
   dsh app             open the native Windows desktop app
+  dsh computer        configure or inspect native computer-use capability
 
 Inside the TUI, type /help for formatted slash-command help.
 Global flags: -m/--model, -s/--sandbox, -a/--ask-for-approval, -c/--config-override,
@@ -165,6 +168,11 @@ impl Cli {
 
 #[derive(Subcommand, Debug, Clone)]
 enum Commands {
+    /// Native computer use shared with web and desktop (opt-in; Windows)
+    Computer {
+        #[command(subcommand)]
+        action: ComputerCmd,
+    },
     /// Preview the startup animation without creating a session or starting agents
     Startup {
         #[command(subcommand)]
@@ -678,6 +686,26 @@ fn main() -> Result<()> {
     result
 }
 
+#[derive(Subcommand, Debug, Clone)]
+enum ComputerCmd {
+    /// Show native support, enabled state and model-facing tools
+    Status,
+    /// Persistently enable native computer tools
+    Enable,
+    /// Disable native computer tools and cancel this runtime's pending actions
+    Disable,
+    /// List actual visible native windows
+    Windows,
+    /// Read a window's accessibility tree and save its PNG preview
+    Observe { window_id: String },
+    /// Keep one native service alive; read JSON actions from stdin, emit JSON results
+    ///
+    /// Start with {"action":"list_windows"}, then {"action":"snapshot","window_id":"..."}.
+    /// Interactions use the returned window_id, snapshot_id and node_id within 60 seconds.
+    /// Snapshots belong to this process; separate one-shot invocations cannot reuse them.
+    Session,
+}
+
 fn desktop_entry_point() -> bool {
     std::env::current_exe().ok().and_then(|path| path.file_stem().map(|name| name.to_string_lossy().into_owned()))
         .is_some_and(|name| name.eq_ignore_ascii_case("dsh-desktop"))
@@ -742,6 +770,11 @@ async fn run(cli: Cli) -> Result<()> {
     let config_path = cli.config.clone();
 
     match cli.command.clone() {
+        Some(Commands::Computer {action}) => {
+            let boot=boot_tui(&workspace,config_path.as_ref(),&cli)?;
+            apply_cli_overrides(&boot.runtime,&cli)?;
+            computer_control::run(boot.runtime,action).await?;
+        }
         Some(Commands::Startup {
             action,
             theme,

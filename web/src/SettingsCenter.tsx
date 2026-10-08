@@ -40,6 +40,8 @@ import { bootstrap, errorText, isAbort, post, rpc } from "./api";
 import { ModelServiceSettings } from "./ModelServiceSettings";
 import { ExtensionSettings } from "./ExtensionSettings";
 import { WorkspaceSettings } from "./WorkspaceSettings";
+import { AccessPasswordSettings } from "./AccessPasswordSettings";
+import { ComputerSettings } from "./ComputerSettings";
 import {
   readPreferences,
   savePreferences,
@@ -155,7 +157,7 @@ const categories: Category[] = [
     label: "个人资料",
     english: "Profile",
     icon: PersonIcon,
-    keywords: "用户名 名称 操作员 编号 身份",
+    keywords: "用户名 名称 操作员 编号 身份 密码 访问 锁定",
   },
   {
     id: "security",
@@ -243,6 +245,13 @@ const categories: Category[] = [
     icon: DesktopIcon,
     keywords: "目录 Git 分支 状态 修改 补丁 应用",
     group: "开发工具",
+  },
+  {
+    id: "computer",
+    label: "电脑操作",
+    english: "Computer use",
+    icon: DesktopIcon,
+    keywords: "电脑 窗口 画面 截图 控件 鼠标 键盘 自动化 Windows",
   },
   {
     id: "tasks",
@@ -1086,6 +1095,7 @@ export function SettingsCenter({
         );
       case "profile":
         return (
+          <>
           <form
             onSubmit={async (event: FormEvent) => {
               event.preventDefault();
@@ -1114,7 +1124,7 @@ export function SettingsCenter({
             </div>
             <Section>
               <label className="sc-field">
-                显示名称
+                访问身份
                 <input
                   className="sc-input"
                   required
@@ -1136,7 +1146,7 @@ export function SettingsCenter({
                   disabled={blocked}
                 />
               </label>
-              <p className="sc-description">名称会出现在工作台和启动动画中。</p>
+              <p className="sc-description">访问身份和档案编号会同步到工作台与启动动画。</p>
               <div className="sc-form-actions">
                 <button
                   type="submit"
@@ -1148,6 +1158,8 @@ export function SettingsCenter({
               </div>
             </Section>
           </form>
+          {data && <AccessPasswordSettings token={data.token} />}
+          </>
         );
       case "security":
         return (
@@ -1834,6 +1846,8 @@ export function SettingsCenter({
       case "tasks":
       case "code-review":
         return data ? <WorkspaceSettings token={data.token} section={current.id === "code-review" ? "review" : current.id} onChanged={refreshNativeSettings} /> : null;
+      case "computer":
+        return data ? <ComputerSettings token={data.token} onChanged={refreshNativeSettings} /> : null;
       case "startup":
         return (
           <>

@@ -18,6 +18,8 @@ use tokio::{
 };
 
 struct Host {
+    access: Mutex<crate::web_access::Sessions>,
+    password_work: Semaphore,
     workspace: PathBuf,
     outer_home: PathBuf,
     roots: Vec<PathBuf>,
@@ -33,6 +35,7 @@ struct Host {
 
 struct HarnessService {
     instance_id: String,
+    control_token: String,
     shutdown: watch::Sender<bool>,
 }
 
@@ -40,6 +43,7 @@ impl HarnessService {
     fn new() -> Self {
         Self {
             instance_id: uuid::Uuid::new_v4().to_string(),
+            control_token: uuid::Uuid::new_v4().to_string(),
             shutdown: watch::channel(false).0,
         }
     }
@@ -59,6 +63,8 @@ pub async fn serve(
     println!("DSH local startup: http://{authority}/startup-preview.html");
     println!("Workspace: {}\nCtrl+C to stop. Skills/plugins are loaded only when the loading scene starts.", workspace.display());
     let host = Arc::new(Host {
+        access: Mutex::new(crate::web_access::Sessions::default()),
+        password_work: Semaphore::new(1),
         workspace,
         outer_home,
         roots,
@@ -93,6 +99,8 @@ pub async fn serve_harness(
         runtime.workspace_root.display()
     );
     let host = Arc::new(Host {
+        access: Mutex::new(crate::web_access::Sessions::default()),
+        password_work: Semaphore::new(1),
         workspace: runtime.workspace_root.clone(),
         outer_home: runtime.outer_home.clone(),
         roots: vec![],
@@ -167,6 +175,7 @@ fn resolve_harness_assets(
 }
 
 async fn accept_connections(listener: TcpListener, host: Arc<Host>) -> Result<()> {
+    let _control = host.service.as_ref().map(|service| crate::web_access::ControlRegistration::create(&host.authority, &service.instance_id, &service.control_token)).transpose()?;
     let permits = Arc::new(Semaphore::new(64));
     let mut shutdown = host.service.as_ref().map(|service| service.shutdown.subscribe());
     loop {
@@ -264,16 +273,23 @@ async fn read_request(socket: &mut TcpStream) -> Result<Request> {
 }
 
 async fn response(socket: &mut TcpStream, code: u16, kind: &str, body: &[u8]) -> Result<()> {
+    response_cookie(socket, code, kind, body, None).await
+}
+
+async fn response_cookie(socket: &mut TcpStream, code: u16, kind: &str, body: &[u8], cookie: Option<&str>) -> Result<()> {
     let reason = match code {
         200 => "OK",
         400 => "Bad Request",
+        401 => "Unauthorized",
         403 => "Forbidden",
         404 => "Not Found",
         409 => "Conflict",
+        429 => "Too Many Requests",
         503 => "Service Unavailable",
         _ => "Error",
     };
-    let head = format!("HTTP/1.1 {code} {reason}\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nCross-Origin-Resource-Policy: same-origin\r\nReferrer-Policy: no-referrer\r\nConnection: close\r\n\r\n", body.len());
+    let cookie = cookie.map(|value| format!("Set-Cookie: {value}\r\n")).unwrap_or_default();
+    let head = format!("HTTP/1.1 {code} {reason}\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nCross-Origin-Resource-Policy: same-origin\r\nReferrer-Policy: no-referrer\r\n{cookie}Connection: close\r\n\r\n", body.len());
     socket.write_all(head.as_bytes()).await?;
     socket.write_all(body).await?;
     socket.shutdown().await?;
@@ -317,7 +333,36 @@ fn allowed(request: &Request, host: &Host) -> bool {
     }
     let requires_token = request.method == "POST"
         || request.path.split('?').next() == Some("/api/harness/service");
-    !requires_token || request.headers.get("x-dsh-token") == Some(&host.token)
+    !requires_token || request.headers.get("x-dsh-token") == Some(&host.token) || control_request(request, host)
+}
+
+fn control_request(request: &Request, host: &Host) -> bool {
+    matches!(request.path.split('?').next(), Some("/api/harness/service" | "/api/harness/shutdown"))
+        && host.service.as_ref().is_some_and(|service| request.headers.get("x-dsh-token") == Some(&service.control_token))
+}
+
+fn cookie_name(host: &Host) -> String {
+    format!("dsh_access_{}", host.authority.rsplit(':').next().unwrap_or_default())
+}
+
+fn session_cookie<'a>(request: &'a Request, host: &Host) -> Option<&'a str> {
+    let name = cookie_name(host);
+    request.headers.get("cookie")?.split(';').filter_map(|part| part.trim().split_once('=')).find_map(|(key, value)| (key == name).then_some(value))
+}
+
+fn cookie_header(host: &Host, token: Option<&str>) -> String {
+    let age = if token.is_some() { "" } else { "; Max-Age=0" };
+    format!("{}={}; Path=/; HttpOnly; SameSite=Strict{age}", cookie_name(host), token.unwrap_or_default())
+}
+
+fn access_value(host: &Host, enabled: bool, unlocked: bool) -> Result<Value> {
+    let startup = host.runtime.as_ref().map(|runtime| &runtime.config.tui.startup);
+    Ok(json!({"enabled":enabled,"unlocked":unlocked,"token":host.token,"profile":load_startup_profile(&host.outer_home)?,"sound":host.sound,
+        "startup":{"enabled":startup.is_some_and(|value| value.enabled),"override_enabled":host.startup_override,"reduced_motion":startup.is_some_and(|value| value.reduced_motion),"sound":host.sound}}))
+}
+
+async fn access_locked(socket: &mut TcpStream) -> Result<()> {
+    json_response(socket, 401, json!({"error":{"code":"access_locked","message":"请先输入访问密码"}})).await
 }
 
 fn asset(path: &str) -> Option<(&'static str, &'static str)> {
@@ -550,7 +595,87 @@ async fn handle(mut socket: TcpStream, host: Arc<Host>) -> Result<()> {
         .await;
     }
     let path = request.path.split('?').next().unwrap_or(&request.path);
+    if path.starts_with("/api/") {
+        let hash = match crate::web_access::load(&host.outer_home) {
+            Ok(hash) => hash,
+            Err(_) => return json_response(&mut socket, 503, json!({"error":{"code":"access_unavailable","message":"无法读取本地访问设置"}})).await,
+        };
+        let cookie = session_cookie(&request, &host);
+        let unlocked = host.access.lock().await.unlocked(hash.as_deref(), cookie);
+        if request.method == "GET" && path == "/api/access" {
+            return json_response(&mut socket, 200, access_value(&host, hash.is_some(), unlocked)?).await;
+        }
+        if request.method == "POST" && path == "/api/access/lock" {
+            host.access.lock().await.revoke(cookie);
+            if unlocked {
+                if let Some(runtime) = &host.runtime { runtime.computer.hide_pointer(); }
+            }
+            return response_cookie(&mut socket, 200, "application/json; charset=utf-8", &serde_json::to_vec(&access_value(&host, hash.is_some(), hash.is_none())?)?, Some(&cookie_header(&host, None))).await;
+        }
+        if request.method == "POST" && matches!(path, "/api/access/unlock" | "/api/access/password") {
+            if path == "/api/access/password" && !unlocked {
+                return access_locked(&mut socket).await;
+            }
+            let payload: Value = match serde_json::from_slice(&request.body) {
+                Ok(payload) => payload,
+                Err(_) => return json_response(&mut socket, 400, json!({"error":{"message":"Invalid JSON request"}})).await,
+            };
+            let Some(password) = payload.get("password").and_then(Value::as_str).filter(|value| value.len() <= 512) else {
+                return json_response(&mut socket, 400, json!({"error":{"message":"password must be a string of at most 128 characters"}})).await;
+            };
+            let changing = path == "/api/access/password";
+            if changing && !password.is_empty() {
+                if let Err(error) = crate::web_access::validate_password(password) {
+                    return json_response(&mut socket, 400, json!({"error":{"message":error.to_string()}})).await;
+                }
+            }
+            let _work = match host.password_work.try_acquire() {
+                Ok(permit) if !host.access.lock().await.cooling_down() => permit,
+                _ => return json_response(&mut socket, 429, json!({"error":{"code":"access_retry","message":"请稍候一秒再试"}})).await,
+            };
+            let password = password.to_owned();
+            let current = payload.get("current_password").and_then(Value::as_str).unwrap_or_default().to_owned();
+            let previous = hash.clone();
+            let home = host.outer_home.clone();
+            let result = tokio::task::spawn_blocking(move || -> Result<Option<Option<String>>> {
+                let verify_password = if changing { &current } else { &password };
+                if previous.as_ref().is_some_and(|hash| !crate::web_access::verify(verify_password, hash)) { return Ok(None); }
+                if changing {
+                    let replacement = if password.is_empty() { None } else { Some(crate::web_access::hash(&password)?) };
+                    crate::web_access::save(&home, previous.as_deref(), replacement.clone())?;
+                    Ok(Some(replacement))
+                } else {
+                    // A concurrent password change cannot issue a session for an old password.
+                    anyhow::ensure!(crate::web_access::load(&home)? == previous, "访问设置已更新，请重试");
+                    Ok(Some(previous))
+                }
+            }).await?;
+            return match result {
+                Ok(Some(hash)) => {
+                    let token = host.access.lock().await.issue(hash.as_deref());
+                    response_cookie(&mut socket, 200, "application/json; charset=utf-8", &serde_json::to_vec(&access_value(&host, hash.is_some(), true)?)?, Some(&cookie_header(&host, Some(&token)))).await
+                }
+                Ok(None) => {
+                    host.access.lock().await.failure();
+                    json_response(&mut socket, 401, json!({"error":{"code":"invalid_password","message":"密码不正确"}})).await
+                }
+                Err(error) => json_response(&mut socket, 409, json!({"error":{"message":error.to_string()}})).await,
+            };
+        }
+        let discovery = request.method == "GET" && path == "/api/harness/discovery";
+        if !unlocked && !discovery && !control_request(&request, &host) {
+            return access_locked(&mut socket).await;
+        }
+    }
     match (request.method.as_str(), path) {
+        ("GET", "/api/harness/discovery") if host.runtime.is_some() && host.service.is_some() => {
+            let service = host.service.as_ref().unwrap();
+            json_response(&mut socket, 200, json!({
+                "service":"dsh-harness", "protocol_version":2,
+                "instance_id":service.instance_id, "workspace":host.workspace,
+                "can_shutdown":true,
+            })).await
+        }
         ("GET", "/api/harness/service") if host.runtime.is_some() && host.service.is_some() => {
             let service = host.service.as_ref().unwrap();
             json_response(&mut socket, 200, json!({
@@ -827,6 +952,8 @@ mod tests {
         std::fs::write(root.join("secret.txt"), "not a web asset").unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let host = Arc::new(Host {
+            access: Mutex::new(crate::web_access::Sessions::default()),
+            password_work: Semaphore::new(1),
             workspace: root.clone(),
             outer_home: runtime.outer_home.clone(),
             roots: vec![],
@@ -898,6 +1025,158 @@ mod tests {
         .await;
         assert_eq!(status, 200);
         value
+    }
+
+    async fn access_http(host: &Host, method: &str, path: &str, payload: Value, cookie: Option<&str>) -> (u16, Value, Option<String>) {
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let mut request = client.request(method.parse().unwrap(), format!("http://{}{path}", host.authority))
+            .header("Origin", format!("http://{}", host.authority)).header("X-DSH-Token", &host.token);
+        if let Some(cookie) = cookie { request = request.header("Cookie", cookie); }
+        if method == "POST" { request = request.json(&payload); }
+        let response = request.send().await.unwrap();
+        let status = response.status().as_u16();
+        let cookie = response.headers().get("set-cookie").map(|value| value.to_str().unwrap().to_owned());
+        (status, response.json().await.unwrap(), cookie)
+    }
+
+    #[tokio::test]
+    async fn real_access_gate_persists_verifies_rotates_locks_and_removes_password() {
+        let server = harness(None).await;
+        let host = &server.host;
+        save_startup_profile(&host.outer_home, &StartupProfile { username: "Operator fixture".into(), badge_id: "DSH-TEST".into() }).unwrap();
+        set_next_startup(&host.outer_home, true).unwrap();
+        let (status, access, _) = access_http(host, "GET", "/api/access", Value::Null, None).await;
+        assert_eq!(status, 200);
+        assert_eq!(access["enabled"], false);
+        assert_eq!(access["unlocked"], true);
+        assert_eq!(access["profile"]["badge_id"], "DSH-TEST");
+        assert_eq!(access_http(host, "POST", "/api/access/password", json!({"password":"short"}), None).await.0, 400);
+        let (status, access, cookie) = access_http(host, "POST", "/api/access/password", json!({"password":"Local-Pass-A1"}), None).await;
+        assert_eq!(status, 200);
+        assert_eq!(access["enabled"], true);
+        let header = cookie.unwrap();
+        assert!(header.contains("HttpOnly") && header.contains("SameSite=Strict"));
+        assert!(!header.contains("Domain="));
+        let first_cookie = header.split(';').next().unwrap().to_owned();
+        let saved = std::fs::read_to_string(host.outer_home.join("web-access.json")).unwrap();
+        assert!(!saved.contains("Local-Pass-A1"));
+        assert!(saved.contains("$argon2id$"));
+        assert!(!access.to_string().contains("argon2"));
+
+        for (method, path) in [
+            ("GET", "/api/harness/bootstrap?dsh-startup=off"), ("GET", "/api/profile"),
+            ("POST", "/api/profile"), ("POST", "/api/load"), ("POST", "/api/startup-next"),
+            ("POST", "/api/harness/rpc"), ("POST", "/api/access/password"),
+            ("GET", "/api/harness/service"), ("POST", "/api/harness/shutdown"),
+        ] {
+            let (status, error, _) = access_http(host, method, path, json!({}), None).await;
+            assert_eq!(status, 401, "{path}");
+            assert_eq!(error["error"]["code"], "access_locked");
+        }
+        let (_, locked, _) = access_http(host, "GET", "/api/access", Value::Null, None).await;
+        assert_eq!(locked["enabled"], true);
+        assert_eq!(locked["unlocked"], false);
+        assert!(locked.get("sessions").is_none() && locked.get("workspace").is_none());
+        assert_eq!(access_http(host, "POST", "/api/access/unlock", json!({"password":"incorrect"}), None).await.0, 401);
+        assert_eq!(access_http(host, "POST", "/api/access/unlock", json!({"password":"Local-Pass-A1"}), None).await.0, 429);
+        tokio::time::sleep(Duration::from_millis(1050)).await;
+        let (status, access, cookie) = access_http(host, "POST", "/api/access/unlock", json!({"password":"Local-Pass-A1"}), None).await;
+        assert_eq!(status, 200);
+        assert_eq!(access["unlocked"], true);
+        let cookie = cookie.unwrap().split(';').next().unwrap().to_owned();
+        assert_eq!(access_http(host, "GET", "/api/harness/bootstrap", Value::Null, Some(&cookie)).await.0, 200);
+        assert_eq!(access_http(host, "POST", "/api/profile", json!({"username":"Updated operator","badge_id":"DSH-NEW"}), Some(&cookie)).await.0, 200);
+        assert_eq!(load_startup_profile(&host.outer_home).unwrap().username, "Updated operator");
+        assert_eq!(access_http(host, "POST", "/api/access/password", json!({"current_password":"incorrect","password":"Local-Pass-B2"}), Some(&cookie)).await.0, 401);
+        tokio::time::sleep(Duration::from_millis(1050)).await;
+        let (status, _, rotated) = access_http(host, "POST", "/api/access/password", json!({"current_password":"Local-Pass-A1","password":"Local-Pass-B2"}), Some(&cookie)).await;
+        assert_eq!(status, 200);
+        let rotated = rotated.unwrap().split(';').next().unwrap().to_owned();
+        for revoked in [&first_cookie, &cookie] {
+            assert_eq!(access_http(host, "GET", "/api/harness/bootstrap", Value::Null, Some(revoked)).await.0, 401);
+        }
+        assert!(!crate::web_access::verify("Local-Pass-A1", &crate::web_access::load(&host.outer_home).unwrap().unwrap()));
+        assert_eq!(access_http(host, "POST", "/api/access/lock", json!({}), Some(&rotated)).await.1["unlocked"], false);
+        assert_eq!(access_http(host, "GET", "/api/profile", Value::Null, Some(&rotated)).await.0, 401);
+
+        // A restarted host reads the saved password and has no remembered browser sessions.
+        *host.access.lock().await = crate::web_access::Sessions::default();
+        assert_eq!(access_http(host, "GET", "/api/profile", Value::Null, Some(&rotated)).await.0, 401);
+        let (status, _, cookie) = access_http(host, "POST", "/api/access/unlock", json!({"password":"Local-Pass-B2"}), None).await;
+        assert_eq!(status, 200);
+        let cookie = cookie.unwrap().split(';').next().unwrap().to_owned();
+        let (status, access, _) = access_http(host, "POST", "/api/access/password", json!({"current_password":"Local-Pass-B2","password":""}), Some(&cookie)).await;
+        assert_eq!(status, 200);
+        assert_eq!(access["enabled"], false);
+        assert!(crate::web_access::load(&host.outer_home).unwrap().is_none());
+        assert_eq!(access_http(host, "GET", "/api/harness/bootstrap", Value::Null, None).await.0, 200);
+        // Access changes do not read or consume any terminal animation preference.
+        assert_eq!(peek_next_startup(&host.outer_home).unwrap(), Some(true));
+    }
+
+    #[tokio::test]
+    async fn locked_service_discovery_and_cli_shutdown_use_a_non_browser_secret() {
+        let server = harness(None).await;
+        let host = &server.host;
+        crate::web_access::save(&host.outer_home, None, Some(crate::web_access::hash("Local-Pass-A1").unwrap())).unwrap();
+        let client = crate::web_launch::client().unwrap();
+        let existing = crate::web_launch::probe(&client, &host.authority).await.unwrap();
+        assert_eq!(existing.workspace, host.workspace.to_string_lossy());
+        let (_, discovery) = http(host, "GET", "/api/harness/discovery", Value::Null, false).await;
+        assert!(discovery.get("token").is_none());
+        let secret = &host.service.as_ref().unwrap().control_token;
+        let (_, public) = http(host, "GET", "/api/access", Value::Null, false).await;
+        assert!(!public.to_string().contains(secret));
+        assert_eq!(http(host, "GET", "/api/harness/service", Value::Null, true).await.0, 401);
+        assert_eq!(http_with_token(host, "GET", "/api/harness/service", Value::Null, Some(secret)).await.0, 200);
+        // Even the management secret cannot read chat/session/profile APIs.
+        assert_eq!(http_with_token(host, "GET", "/api/harness/bootstrap", Value::Null, Some(secret)).await.0, 401);
+        let port = host.authority.rsplit(':').next().unwrap().parse().unwrap();
+        crate::web_launch::stop(&client, &host.authority, port, &existing).await.unwrap();
+        assert!(*host.service.as_ref().unwrap().shutdown.borrow());
+    }
+
+    #[tokio::test]
+    async fn standalone_preview_enforces_saved_access_and_corruption_fails_closed() {
+        let server = test_host(None, false).await;
+        let host = &server.host;
+        crate::web_access::save(&host.outer_home, None, Some(crate::web_access::hash("Preview-Pass-1").unwrap())).unwrap();
+        assert_eq!(http(host, "GET", "/api/profile", Value::Null, false).await.0, 401);
+        assert_eq!(http(host, "POST", "/api/load", json!({}), true).await.0, 401);
+        assert_eq!(http(host, "GET", "/startup-preview.html", Value::Null, false).await.0, 200);
+        std::fs::write(host.outer_home.join("web-access.json"), "corrupt").unwrap();
+        assert_eq!(http(host, "GET", "/api/profile", Value::Null, false).await.0, 503);
+        assert_eq!(http(host, "GET", "/api/access", Value::Null, false).await.0, 503);
+    }
+
+    #[tokio::test]
+    async fn password_change_in_another_host_revokes_old_sessions_and_cookies_are_port_scoped() {
+        let original = harness(None).await;
+        let host = &original.host;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let other = Arc::new(Host {
+            access: Mutex::new(crate::web_access::Sessions::default()), password_work: Semaphore::new(1),
+            workspace: host.workspace.clone(), outer_home: host.outer_home.clone(), roots: vec![],
+            authority: listener.local_addr().unwrap().to_string(), token: uuid::Uuid::new_v4().to_string(),
+            sound: false, inventory: Mutex::new(None), runtime: host.runtime.clone(), assets: host.assets.clone(),
+            startup_override: None, service: Some(HarnessService::new()),
+        });
+        let cloned = other.clone();
+        let task = tokio::spawn(async move { accept_connections(listener, cloned).await.unwrap(); });
+        let (status, _, cookie) = access_http(host, "POST", "/api/access/password", json!({"password":"Shared-Pass-A1"}), None).await;
+        assert_eq!(status, 200);
+        let cookie = cookie.unwrap().split(';').next().unwrap().to_owned();
+        assert_eq!(access_http(&other, "GET", "/api/profile", Value::Null, Some(&cookie)).await.0, 401);
+        let (status, access, other_cookie) = access_http(&other, "POST", "/api/access/unlock", json!({"password":"Shared-Pass-A1"}), None).await;
+        assert_eq!(status, 200);
+        assert_eq!(access["enabled"], true);
+        let other_cookie = other_cookie.unwrap().split(';').next().unwrap().to_owned();
+        assert_ne!(cookie.split('=').next(), other_cookie.split('=').next());
+        assert_eq!(access_http(&other, "POST", "/api/access/password", json!({"current_password":"Shared-Pass-A1","password":"Shared-Pass-B2"}), Some(&other_cookie)).await.0, 200);
+        assert_eq!(access_http(host, "GET", "/api/profile", Value::Null, Some(&cookie)).await.0, 401);
+        assert_eq!(access_http(host, "POST", "/api/access/unlock", json!({"password":"Shared-Pass-B2"}), None).await.0, 200);
+        task.abort();
+        let _ = task.await;
     }
 
     #[tokio::test]
@@ -1065,6 +1344,8 @@ mod tests {
         let runtime = server.host.runtime.as_ref().unwrap();
         for override_enabled in [None, Some(false), Some(true)] {
             let host = Host {
+                access: Mutex::new(crate::web_access::Sessions::default()),
+                password_work: Semaphore::new(1),
                 workspace: server.host.workspace.clone(),
                 outer_home: server.host.outer_home.clone(),
                 roots: vec![],
@@ -1253,6 +1534,8 @@ mod tests {
     #[test]
     fn local_requests_require_exact_host_origin_and_write_token() {
         let host = Host {
+            access: Mutex::new(crate::web_access::Sessions::default()),
+            password_work: Semaphore::new(1),
             workspace: PathBuf::new(),
             outer_home: PathBuf::new(),
             roots: vec![],

@@ -126,7 +126,18 @@ def main():
                 assert before["token"] == after["token"] and process.poll() is None
                 assert before["sessions"] == after["sessions"]
                 identity = request(url, "/api/harness/service", token=after["token"])
-                request(url, "/api/harness/shutdown", {"instance_id": identity["instance_id"]}, after["token"])
+                # Password protection must render a usable native entry without
+                # attempting private bootstrap or requiring a terminal prompt.
+                request(url, "/api/access/password", {"password": "Desktop-fixture-2026"}, after["token"])
+                locked = request(url, "/api/access")
+                assert locked["enabled"] and not locked["unlocked"]
+                _, protected = smoke(binary, workspace, "--port", port)
+                assert protected["frontend_ready"] and not protected["owned_service"]
+                assert request(url, "/api/access")["unlocked"] is False
+                control_path = Path(os.environ["LOCALAPPDATA"]) / "dsh-rust/web-services" / f"{port}.json"
+                control = json.loads(control_path.read_text(encoding="utf-8"))
+                assert control["instance_id"] == identity["instance_id"]
+                request(url, "/api/harness/shutdown", {"instance_id": identity["instance_id"]}, control["token"])
                 process.wait(timeout=5)
             finally:
                 if process.poll() is None:
@@ -134,7 +145,8 @@ def main():
                     process.wait(timeout=5)
         print(json.dumps({"native_window": "passed", "react_bootstrap": "passed",
                           "owned_service_cleanup": "passed", "shared_service_preserved": "passed",
-                          "stable_origin_on_reopen": "passed", "second_launch_focuses_primary": "passed"}))
+                          "stable_origin_on_reopen": "passed", "second_launch_focuses_primary": "passed",
+                          "password_protected_native_entry": "passed"}))
 
 
 if __name__ == "__main__":

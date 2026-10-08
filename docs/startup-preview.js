@@ -6,7 +6,7 @@ if (!window.DSHBoot || !window.DSHVisuals || !window.DSHLocal || !window.DSHIden
 const sequence = new DSHBoot.Sequence();
 const {total,durations} = DSHBoot;
 const scoreDurations=[2.8,2.8,3.4,3.2,2.8,3];
-const ui = Object.fromEntries(['sound','theme','play','skip','settings','closeSettings','controlPanel','replay','interactive','speed','seek','currentTime','totalTime','phaseTitle','phaseEnglish','phaseNote','status','identityCard','identityName','identityId','cardName','cardId','identityLine','subtitleZh','subtitleEn','saveIdentity','profileStatus','connectionStatus','connectLocal','inventoryPanel','inventoryMessage','skillsCount','pluginsCount','skillsState','pluginsState','skillsList','pluginsList','inventoryIssues','cardMode','cardNameVisual','cardIdVisual','cardModeVisual'].map(id => [id,$(id)]));
+const ui = Object.fromEntries(['sound','theme','play','skip','settings','closeSettings','controlPanel','replay','interactive','speed','seek','currentTime','totalTime','phaseTitle','phaseEnglish','phaseNote','status','identityCard','identityName','identityId','cardName','cardId','identityLine','subtitleZh','subtitleEn','saveIdentity','profileStatus','connectionStatus','connectLocal','inventoryPanel','inventoryMessage','skillsCount','pluginsCount','skillsState','pluginsState','skillsList','pluginsList','inventoryIssues','cardMode','cardNameVisual','cardIdVisual','cardModeVisual','accessForm','accessEntry','accessPassword','accessSubmit','accessState','accessMessage'].map(id => [id,$(id)]));
 const identityView=new DSHIdentity.View(['cardName','cardId','cardMode'].map(id=>({value:ui[id],visual:ui[id+'Visual']})));
 const textMotion=new DSHText.Stage(document),inventoryRows={skills:new Map(),plugins:new Map()};
 const setText=(node,value,options={})=>textMotion.set(node,value,options);
@@ -39,8 +39,8 @@ let narratedPhase=-1;
 const cancelVoice=()=>{narratedPhase=-1;voice()?.cancel?.();};
 const narrate=()=>{if(narratedPhase===sequence.phase)return;narratedPhase=sequence.phase;voice()?.phase?.(sequence.phase,{username:ui.identityName.value.trim()||local.profile.username,inventory:local.inventory,connection:local.connection,inventoryMode:local.profile.inventory_mode});};
 const loadFinished=()=>['complete','error','unavailable'].includes(local.inventory.status);
-function barriers(){for(let i=0;i<6;i++){if((i===3&&!loadFinished())||(i===sequence.phase&&voice()?.busy))sequence.hold(i);else sequence.release(i);}}
-function beginLocalLoad(){if(sequence.phase===3&&sequence.playing&&['idle','cancelled'].includes(local.inventory.status))void local.load();}
+function barriers(){for(let i=0;i<6;i++){if((i===2&&local.locked)||(i===3&&!loadFinished())||(i===sequence.phase&&voice()?.busy))sequence.hold(i);else sequence.release(i);}}
+function beginLocalLoad(){if(!local.locked&&sequence.phase===3&&sequence.playing&&['idle','cancelled'].includes(local.inventory.status))void local.load();}
 ui.seek.max=String(total);ui.totalTime.textContent=total.toFixed(2);
   function stopAudio() {
     for (const source of audioSources) { try { source.stop(); } catch (_) { /* Already ended. */ } }
@@ -132,6 +132,7 @@ function revealTitle(showCard){
  if(showCard)enter(ui.identityCard,[{opacity:0,clipPath:'inset(0 0 100%)'},{opacity:1,clipPath:'inset(0)'}],{duration:230,delay:45});
 }
 function renderLocal(){
+ if(local.locked&&sequence.phase>2){generation++;starting=false;sequence.jump(2);phaseAge=0;manualPause=false;stopAudio();cancelVoice();}
  if(!soundInitialized&&local.connection==='local'){
   soundInitialized=true;
   if(!soundTouched){muted=local.profile.sound===false;syncSound();}
@@ -143,7 +144,13 @@ function renderLocal(){
  ui.connectionStatus.textContent=local.connectionMessage;
  setText($('runtimeBadge'),local.profile.runtime==='native'?'NATIVE':'RUST',{kind:'roll',scope:'global'});
  ui.connectLocal.disabled=local.connection==='connecting';
- ui.saveIdentity.disabled=local.saving;
+ ui.saveIdentity.disabled=local.saving||local.locked;
+ ui.identityName.disabled=local.locked;ui.identityId.disabled=local.locked;
+ ui.accessEntry.hidden=!local.locked;ui.accessState.hidden=local.locked;
+ ui.accessPassword.disabled=local.unlocking;ui.accessSubmit.disabled=local.unlocking;
+ ui.identityCard.setAttribute('data-access',local.locked?'locked':local.access.enabled?'verified':'open');
+ setText(ui.accessState,local.connection!=='local'?'LOCAL HOST REQUIRED':local.access.enabled?'ACCESS VERIFIED':local.access.supported?'PASSWORD NOT SET':'PREVIEW ONLY',{kind:'type',delay:.33});
+ ui.accessMessage.textContent=local.unlocking?'正在验证访问密码…':local.accessMessage||(local.locked?'输入密码以读取本地能力并进入 DSH。':local.access.enabled?'访问已授权 · 本次访问已解锁':local.connection==='local'&&local.access.supported?'可进入设置 → 个人资料，设置访问密码。':'');
  ui.profileStatus.textContent=local.saving?local.saveMessage:local.saveMessage.startsWith('保存失败')?local.saveMessage:profileDirty?'尚未保存 · 仅预览':local.saveMessage||(local.connection==='local'?'资料已从本地读取':'未连接本地，无法持久保存');
  ui.profileStatus.setAttribute('data-state',local.saveMessage.startsWith('保存失败')?'error':profileDirty?'draft':'saved');
  updateIdentity();
@@ -183,6 +190,7 @@ function renderLocal(){
 }
 function phaseCopy(){
  const data=local.inventory,normal=phases[sequence.phase];
+ if(sequence.phase===2&&local.locked)return ['访问身份确认','IDENTITY / AWAITING CLEARANCE','输入访问密码，开启本地能力档案。'];
  if(sequence.phase===1)return local.connection==='local'?['本地连接已建立','LOCAL WORKSPACE CONNECTED','准备读取当前工作区的能力档案。']:['离线演出','LOCAL HOST NOT CONNECTED','未读取真实数据 · 请用 dsh startup web 启动。'];
  if(sequence.phase===3||sequence.phase===4){
   if(data.status==='complete'){
@@ -204,6 +212,7 @@ function renderUI(){
   signature=state;
   document.body.classList.toggle('on-black',sequence.phase===0);document.body.classList.toggle('finale',sequence.phase===5);
   document.body.classList.toggle('inventory-phase',sequence.phase===3||sequence.phase===4);
+  document.body.classList.toggle('identity-phase',sequence.phase===2);
   ui.identityCard.hidden=sequence.phase!==2;ui.inventoryPanel.hidden=sequence.phase!==3&&sequence.phase!==4;
   const titleChanged=ui.phaseTitle.textContent!==p[0],phaseChanged=visiblePhase!==sequence.phase;
   if(titleChanged){phaseAge=0;textMotion.begin(sequence.phase,manualPause?sequence.elapsed:Math.max(sequence.elapsed,phaseAge),ambientTime,reducedMotion.matches,manualPause);}
@@ -250,8 +259,8 @@ async function start(){
 function pause(message='演出已暂停。点按画面继续。'){generation++;starting=false;sequence.pause();manualPause=true;stopAudio();cancelVoice();local.cancelLoad(false);refresh();announce(message);}
 function restart(playNow=false){generation++;starting=false;stopAudio();cancelVoice();sequence.restart();phaseAge=0;manualPause=false;ambientTime=0;impulse=.6;local.cancelLoad();refresh();if(playNow||!sequence.interactive)start();else announce('已回到序章。点按任意位置开始。');}
 function activate(){impulse=1;if(sequence.playing){clickSound();refresh();return;}if(sequence.completed)restart(true);else start();}
-function jump(phase){generation++;starting=false;stopAudio();cancelVoice();sequence.jump(phase);phaseAge=0;manualPause=false;impulse=.65;local.cancelLoad();refresh();announce('已切换到'+phases[phase][0]+'。点按画面播放。');}
-function skip(){generation++;starting=false;stopAudio();cancelVoice();sequence.seek(total);phaseAge=0;manualPause=false;local.cancelLoad(false);refresh();announce('已跳过启动演出。');finishEmbedded('skip');}
+function jump(phase){if(local.locked&&phase>2)phase=2;generation++;starting=false;stopAudio();cancelVoice();sequence.jump(phase);phaseAge=0;manualPause=false;impulse=.65;local.cancelLoad();refresh();announce('已切换到'+phases[phase][0]+'。点按画面播放。');}
+function skip(){if(local.locked){jump(2);ui.accessPassword.focus({preventScroll:true});announce('请先验证访问密码。');return;}generation++;starting=false;stopAudio();cancelVoice();sequence.seek(total);phaseAge=0;manualPause=false;local.cancelLoad(false);refresh();announce('已跳过启动演出。');finishEmbedded('skip');}
 function finishEmbedded(reason){
  if(!window.DSHEmbed?.embedded||embeddedEnded)return embeddedEnded;
  embeddedEnded=true;generation++;starting=false;sequence.pause();stopAudio();cancelVoice();
@@ -264,7 +273,7 @@ function syncSound(){voice()?.setMuted?.(muted);ui.sound.textContent=muted?'声�
 function toggleSound(){if(audioUnavailable&&!voice())return;soundTouched=true;muted=!muted;syncSound();if(!muted){const current=generation;ensureAudio().then(ready=>{if(ready&&current===generation&&sequence.playing)scorePhase();});}}
 function settings(open){ui.controlPanel.hidden=!open;ui.settings.setAttribute('aria-expanded',String(open));ui.settings.setAttribute('aria-label',open?'关闭动画设置':'打开动画设置');if(open)enter(ui.controlPanel,[{clipPath:'inset(0 0 100%)'},{clipPath:'inset(0)'}],{duration:300});(open?ui.closeSettings:ui.settings).focus({preventScroll:true});}
 function point(event){const r=stage.getBoundingClientRect();pointer={x:Math.max(0,Math.min(1,(event.clientX-r.left)/r.width)),y:Math.max(0,Math.min(1,(event.clientY-r.top)/r.height))};}
-stage.addEventListener('pointerdown',e=>{if(e.button!==0||pointerDown||e.target.closest('.inventory-list,.inventory-issues'))return;point(e);pointerDown={id:e.pointerId,x:e.clientX,y:e.clientY,lastX:e.clientX,moved:false};stage.setPointerCapture(e.pointerId);stage.focus({preventScroll:true});});
+stage.addEventListener('pointerdown',e=>{if(e.button!==0||pointerDown||e.target.closest('.inventory-list,.inventory-issues,#accessForm'))return;point(e);pointerDown={id:e.pointerId,x:e.clientX,y:e.clientY,lastX:e.clientX,moved:false};stage.setPointerCapture(e.pointerId);stage.focus({preventScroll:true});});
 stage.addEventListener('pointermove',e=>{point(e);if(pointerDown&&e.pointerId===pointerDown.id){if(Math.hypot(e.clientX-pointerDown.x,e.clientY-pointerDown.y)>6)pointerDown.moved=true;drag+=(e.clientX-pointerDown.lastX)/Math.max(1,width)*Math.PI*2;pointerDown.lastX=e.clientX;stage.classList.toggle('dragging',pointerDown.moved);}if(reducedMotion.matches)drawScene();});
 stage.addEventListener('pointerup',e=>{if(!pointerDown||e.pointerId!==pointerDown.id)return;const moved=pointerDown.moved;pointerDown=null;stage.classList.remove('dragging');if(stage.hasPointerCapture(e.pointerId))stage.releasePointerCapture(e.pointerId);if(!moved)activate();else{impulse=.45;refresh();}});
 stage.addEventListener('pointercancel',()=>{pointerDown=null;stage.classList.remove('dragging');});
@@ -276,11 +285,12 @@ ui.theme.addEventListener('click',()=>{light=!light;document.documentElement.dat
 ui.settings.addEventListener('click',()=>settings(ui.controlPanel.hidden));ui.closeSettings.addEventListener('click',()=>settings(false));
 ui.interactive.addEventListener('click',()=>{sequence.interactive=!sequence.interactive;refresh();announce(sequence.interactive?'已启用三个确认节点。':'已切换为连续播放。');});
 ui.speed.addEventListener('change',()=>{speed=Number(ui.speed.value);lastFrame=performance.now();if(sequence.playing)scorePhase();});
-ui.seek.addEventListener('input',()=>{const t=Number(ui.seek.value);generation++;starting=false;stopAudio();cancelVoice();sequence.seek(t);manualPause=true;phaseAge=sequence.elapsed;local.cancelLoad();refresh();});
+ui.seek.addEventListener('input',()=>{let t=Number(ui.seek.value);if(local.locked&&t>=durations[0]+durations[1]+durations[2])t=durations[0]+durations[1];generation++;starting=false;stopAudio();cancelVoice();sequence.seek(t);manualPause=true;phaseAge=sequence.elapsed;local.cancelLoad();refresh();});
 chapters.forEach((c,i)=>c.addEventListener('click',()=>jump(i)));
 document.addEventListener('keydown',e=>{
  if(e.isComposing||e.keyCode===229)return;
  if(e.altKey||e.ctrlKey||e.metaKey)return;
+ if(e.target.closest('#accessForm'))return;
  if(e.repeat){if(e.key==='Enter'||e.key===' ')e.preventDefault();return;}
  if(e.key==='Escape'){e.preventDefault();if(!ui.controlPanel.hidden)settings(false);else skip();return;}
  if(e.target.closest('input,select,textarea,[contenteditable]'))return;
@@ -302,6 +312,16 @@ function updateIdentity(){
 }
 function editIdentity(){profileDirty=true;draftRevision++;local.saveMessage='';updateIdentity();renderLocal();}
 ui.identityName.addEventListener('input',editIdentity);ui.identityId.addEventListener('input',editIdentity);
+ui.accessForm.addEventListener('submit',async event=>{
+ event.preventDefault();if(!local.locked||local.unlocking)return;
+ const password=ui.accessPassword.value;
+ if(!password){ui.accessMessage.textContent='请输入访问密码。';ui.accessPassword.focus({preventScroll:true});return;}
+ ui.accessPassword.value='';
+ const current=generation,unlocked=await local.unlock(password);
+ if(embeddedEnded)return;
+ if(unlocked){window.DSHEmbed?.unlocked();impulse=1;barriers();if(current===generation&&sequence.phase===2&&!sequence.playing)void start();refresh();announce('访问验证通过。');}
+ else{ui.accessPassword.focus({preventScroll:true});announce(local.accessMessage);}
+});
 ui.saveIdentity.addEventListener('click',async()=>{const revision=draftRevision;const saved=await local.save(ui.identityName.value,ui.identityId.value);if(saved&&revision===draftRevision){profileDirty=false;ui.identityName.value=local.profile.username;ui.identityId.value=local.profile.badge_id;updateIdentity();}renderLocal();announce(local.saveMessage);});
 ui.connectLocal.addEventListener('click',async()=>{const connected=await local.connect(true);if(connected&&sequence.phase===3&&!sequence.completed){local.cancelLoad();beginLocalLoad();}renderLocal();refresh();});
 new ResizeObserver(resize).observe(pane);window.addEventListener('resize',resize);

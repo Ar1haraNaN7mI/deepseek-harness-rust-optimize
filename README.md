@@ -56,6 +56,39 @@ dsh-desktop --startup                   # 无控制台入口，也支持全局�
 
 首次默认尝试端口 8770；已有相同工作区的 DSH 服务时直接复用，其他工作区或其他程序占用时自动选择空闲端口，并记住该工作区的端口以保留界面偏好。同一工作区再次启动会聚焦现有窗口。显式 `--port` 不会自动改用其他端口。关闭桌面窗口只回收本窗口创建的服务，复用的网页服务仍然可用。外部链接在默认浏览器打开。桌面端的界面偏好保存在独立 WebView 用户目录，DSH 模型配置和会话仍与 CLI 共用。
 
+### 网页与桌面端的身份和访问密码
+
+进入工作台后，在 **设置 → 个人资料** 修改 **访问身份、档案编号、访问密码**。密码默认不设，首次可直接进入；设置后，动画的身份卡提供真实密码输入，验证通过才读取本地能力并进入工作台。关闭或跳过动画时使用同一套密码验证；设置中也可以立即锁定、修改或移除密码，修改和移除需要当前密码。
+
+访问密码为 8–128 个字符，Rust 后端只在当前 `outer_home/web-access.json` 保存带随机盐的 Argon2id 校验值，不返回密码或校验值。解锁会话最长 12 小时，服务重启或修改密码后需重新验证；浏览器与桌面 WebView 各自验证。访问身份和编号沿用 `startup-profile.json`。终端保持现有启动流程，不增加密码输入或登录步骤。
+
+此功能属于 Rust Harness 的本机网页／桌面入口。官方 DSH 的单独动画扩展继续沿用官方登录，不修改官方账号验证。
+
+### 原生电脑操作（Windows，三端共用）
+
+在 **设置 → 电脑操作** 开启后，可以选择真实窗口、读取控件和截图，并点击按钮、填写文本、发送按键或滚动。终端、网页和桌面端共用 Rust 的 Windows UI Automation / 输入后端，**不依赖安装 Codex、浏览器扩展或额外的自动化服务**。此功能默认关闭，开启状态保存在当前 `outer_home/settings.toml`。
+
+```powershell
+dsh computer status                 # 查看是否启用、平台支持和可用工具
+dsh computer enable                 # 为后续终端和当前配置启用
+dsh computer windows                # 列出可见窗口及 window_id
+dsh computer observe <window_id>    # 读取真实控件，返回本机截图路径
+dsh computer session                # 持续 JSON 控制会话，保留观察与操作上下文
+dsh computer disable                # 停止接受新的电脑操作
+```
+
+在普通 DSH 对话中，可要求“读取窗口列表，查看指定窗口并填写其中的文本框”。模型会使用 `computer_list_windows`、`computer_observe` 和 `computer_act`；操作沿用已有审批策略，`read-only` 模式禁止点击或输入。网页和桌面端的手动按钮直接执行你选择的操作。每次动作需要指定窗口和当前观察编号；观察最多保留 60 秒，执行一次动作后需要重新观察，窗口移动、控件变化或目标关闭时会返回真实错误。
+
+DSH 在实际桌面上显示独立的透明、鼠标穿透光标层，只移动自己的箭头，不移动系统鼠标或主动切换前台。操作后 5 秒隐藏，关闭功能、取消或锁定入口时立即隐藏。设置中的预览用于核对画面，不是唯一的操作表面。优先通过 UI Automation 读取真实控件并按控件编号操作，本地 Windows OCR 只补充截图中的文字与位置。
+
+当前模型读取的是**真实的可访问性文字树与本地 OCR 的文字、坐标**；截图供你核对，不伪装成模型视觉输入。OCR 使用 Windows 本机识别引擎，无需额外多模态 API Key；引擎或语言不可用时会说明原因，保留已有控件观察。识别在已遮挡密码区域的截图上进行。截图保存在 `outer_home/computer/screenshots`，只保留最近 20 张由此功能生成的图片。
+
+后台输入优先使用已验证的标准 Win32 按钮／编辑控件消息，其他目标可使用窗口定向坐标消息。消息发送成功不等于应用业务动作完成：模型需要重新观察并核对结果；拒绝后台输入、自绘游戏或受保护窗口不保证可操作。不支持时返回真实原因，不自动切换为控制你的鼠标。Windows 权限更高的窗口、最小化窗口和无法截图的表面也会显示明确错误。
+
+开发联调可运行 `dsh computer session`，逐行发送 `{"action":"list_windows"}`，再用返回的真实编号发送 `{"action":"snapshot","window_id":"…"}`。后续 `invoke`、`set_value`、`click`、`type_text`、`key`、`scroll` 都需要该会话内的 `window_id` 和 `snapshot_id`；控件调用、文本输入、按键和滚动还需 `node_id`。坐标使用窗口内的物理像素。坐标点击自绘区域后，只有观察结果实际返回 `input_target.node_id: "background"` 才能向该目标发送文本、按键或滚动；投递结果标为 `unverified`，须重新观察确认。滚动值为 -10 到 10 的非零滚轮步数，正值向上。不支持任意位置的系统鼠标或全局快捷键注入。关闭设置会注销本实例的模型工具并取消排队操作；其他已运行的 DSH 实例会在下一次操作前检查已保存的关闭状态，工具列表在查询状态、更新设置或进入下一模型步骤时刷新。
+
+当前版本尚未集成浏览器 DOM/CDP 适配或视觉模型。结构化控件与操作后的状态回读是主要依据；OCR 不保证识别所有图标或复杂画布，桌面独立光标也不等于目标软件一定接受后台操作。
+
 ### 蓝色大肥鱼
 
 在「设置 → 宠物」选择 **DeepSeek 大肥鱼**。网页和桌面端直接使用 [deepseek-fat-fish-codex-pet](https://github.com/gmskywalker/deepseek-fat-fish-codex-pet) 的原始精灵图集与帧布局，提供待机、工作、等待确认、完成与出错动作；点击或键盘激活会回应，减少动态效果时保持静态帧。旧的猫咪开启偏好自动迁移到大肥鱼，原本关闭则继续关闭。
@@ -82,6 +115,7 @@ cargo run -p dsh-cli -- --startup
 | 代码审查 | `dsh review --uncommitted` |
 | 诊断环境 | `dsh doctor` |
 | 启动动画预览 | `dsh startup` |
+| Windows 电脑操作 | `dsh computer enable` 后在对话中指定目标窗口 |
 
 TUI 里常用：
 
@@ -96,7 +130,7 @@ TUI 里常用：
 
 内置原创电影式启动序列：**厂牌唤醒 → 本地连接 → 个人档案 → 技能与插件清单 → 加载结果 → 欢迎进入 DSH**。原创 DELTA CIRCUIT 平面徽章以三角形为主体：左侧 D 字轨、底部 S 折线与右侧 H 连接共同形成轮廓，内部保留小型 DSH 刻字和三层扫描线。分件飞入、高速环扫、平面扫描与档案展开保持扁平风格。高清版没有底部控制栏，按 C 或点右上角省略号打开设置。
 
-这一版以 [RhineLabUI](https://github.com/LBEILC/RhineLabUI) 的档案解密和扫描节奏为视觉研究参考，重新编排原创的斜切遮罩、巨幅环形标尺、分层快切与部门徽章组装。启动画面中的标题、字标、提示、字幕、档案与真实清单统一使用固定文字单元内的滚动、逐字显现、乱码锁定和遮挡条撤回；参考源码与时间采样实现见 [`docs/startup-text.js`](docs/startup-text.js)。徽章轮廓共用同一个中心和缩放，橙色角标直接跟随实际卡片边框，适配窗口尺寸与缩放。中文采用随包提供的工业排版与 Noto Sans SC 字体子集，字体及许可证位于 [`docs/assets/fonts`](docs/assets/fonts)。动画没有复用参考项目的图形或采样音频，支持减少动态效果设置。
+这一版以 [RhineLabUI](https://github.com/LBEILC/RhineLabUI) 的档案解密和扫描节奏为视觉研究参考，重新编排原创的三层徽章刻度环、错拍锁块、六瓣平面光阑、校准导轨、斜线版纹与三组斜切转场。外围能力分支由实际返回的 Skills／Plugins 生成，只有读取中才出现流动载波。启动画面中的标题、字标、提示、字幕、档案与真实清单统一使用固定文字单元内的滚动、逐字显现、乱码锁定和遮挡条撤回；参考源码与时间采样实现见 [`docs/startup-text.js`](docs/startup-text.js)。徽章轮廓共用同一个中心和缩放，橙色角标直接跟随实际卡片边框，外围装饰避让实际身份卡，适配窗口尺寸与缩放。中文采用随包提供的工业排版与 Noto Sans SC 字体子集，字体及许可证位于 [`docs/assets/fonts`](docs/assets/fonts)。动画没有复用参考项目的图形或采样音频，支持减少动态效果设置。
 
 动画**默认关闭**。启用后在开场、个人档案、加载结果三个节点等待确认；等待时旋转环和扫描仍持续运动。确认后连续播放两幕，再到下一节点；终端最后自动进入对话，`dsh web` 的嵌入动画完成或跳过后进入真实 Harness，`dsh startup web` 独立预览停留在欢迎画面。基础演出为 **13.8 秒**；交互等待、真实读取和较长旁白会延长停留时间，不截断声音。终端独立预览可用 `--auto` 完整自动播放。
 
@@ -237,6 +271,7 @@ dsh-rust/
   Cargo.toml
   crates/
     dsh-core/      # session, events, agent-loop, system-prompt
+    dsh-computer/  # Windows UI Automation、窗口截图与原生输入
     dsh-llm/       # OpenAI-compatible streaming + tools
     dsh-tools/     # tool registry + pre/execute/post waterfall
     dsh-fs/        # fs + PathGuard
@@ -259,7 +294,7 @@ dsh-rust/
 
 ## 安装要求
 
-- Rust **1.75+**（推荐较新的 stable）
+- Rust 当前 stable（本次在 **1.95.0** 验证；依赖版本由 Cargo.lock 固定）
 - DeepSeek API Key（[开放平台](https://platform.deepseek.com/)）
 - 可选：Git（`/diff`、`dsh review` 会用到）
 
@@ -410,7 +445,7 @@ cargo build -p dsh-cli            # 仅编译
 cargo build -p dsh-cli --release  # 发布产物
 ```
 
-Workspace crates：`dsh-core` · `dsh-llm` · `dsh-tools` · `dsh-fs` · `dsh-skill` · `dsh-plugin` · `dsh-tui` · `dsh-protocol` · `dsh-app-client` · `dsh-cli`
+Workspace crates：`dsh-core` · `dsh-computer` · `dsh-llm` · `dsh-tools` · `dsh-fs` · `dsh-skill` · `dsh-plugin` · `dsh-tui` · `dsh-protocol` · `dsh-app-client` · `dsh-cli`
 
 ---
 

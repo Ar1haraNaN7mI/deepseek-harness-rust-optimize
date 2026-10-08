@@ -108,13 +108,15 @@ function render(width, height, state) {
 const inventory = { status: 'complete', skills: [{ name: 'real-review' }], plugins: [{ name: 'real-plugin' }], issues: [] };
 const base = { identity: 'CatShark / 星海', inventory, choice: 1, pointer: { x: 0.83, y: 0.17 }, drag: 0.7, impulse: 0.35 };
 const samples = [0, 0.001, 0.035, 0.16, 0.31, 0.42, 0.58, 0.82, 0.999, 1];
-let rendered = 0;
+let rendered = 0, maxCommands = 0;
 for (const [width, height] of [[1920, 1080], [390, 844]]) {
   for (const light of [true, false]) {
     for (let phase = 0; phase < phaseCount; phase++) {
       for (const progress of samples) {
         const state = { ...base, phase, progress, light, time: phase * 2.3 + progress, ambientTime: 13.7 + progress };
         const first = render(width, height, state), second = render(width, height, state);
+        maxCommands = Math.max(maxCommands, first.records.length);
+        assert.ok(first.records.length < 12000, 'layered animation exceeded its bounded canvas command budget');
         assert.equal(first.hash, second.hash, `nondeterministic draw: ${width}×${height}, phase ${phase}, progress ${progress}`);
         assert.ok(first.records.some(record => record.op === 'fillText'), 'every scene retains its typography');
         rendered++;
@@ -163,7 +165,7 @@ for (const [width, height, box] of [
   [1280, 720, { x: 430, y: 350, width: 420, height: 203 }],
   [390, 844, { x: 31, y: 354, width: 328, height: 222 }],
 ]) {
-  const rows = [0.25, 0.52, 0.82].map(offset => ({ y: box.y + box.height * offset - 14, height: 28 }));
+  const rows = [0.15, 0.38, 0.62, 0.85].map(offset => ({ y: box.y + box.height * offset - 14, height: 28 }));
   const state = { ...base, phase: 2, progress: 0, waiting: true, reducedMotion: true, layout: { identity: { ...box, rows } } };
   const { records } = render(width, height, state);
   for (const row of rows) {
@@ -186,6 +188,20 @@ for (const [width, height, box] of [
     return Math.abs(from[0] - centerX) < 1e-7 && Math.abs(to[0] - centerX) < 1e-7 && Math.abs(to[1] - from[1]) > box.height / 2;
   });
   assert.equal(verticalCenterRule, false, 'the canvas must not duplicate the DOM inventory column divider');
+}
+
+// The decorative circuit is a view of real discovery state. Adding real
+// entries changes its branches; only an in-progress read adds a moving carrier.
+// It must never write fake names, invented counts or successful status labels.
+const discoveryState = { ...base, phase: 3, progress: .61, ambientTime: 3.7, textAge: 2, impulse: 0 };
+const idleCircuit = render(1280,720,{...discoveryState,inventory:{status:'idle',skills:[],plugins:[],issues:[]}});
+const loadingCircuit = render(1280,720,{...discoveryState,inventory:{status:'loading',skills:[],plugins:[],issues:[]}});
+const populatedCircuit = render(1280,720,{...discoveryState,inventory});
+assert.notEqual(idleCircuit.hash,loadingCircuit.hash,'loading must visibly activate the carrier');
+assert.notEqual(idleCircuit.hash,populatedCircuit.hash,'discovered entries must visibly populate the circuit');
+for(const sample of [idleCircuit,loadingCircuit,populatedCircuit]) {
+  const copy=sample.records.filter(record=>record.op==='fillText').map(record=>record.args[0]).join('');
+  assert.ok(!/\d+\s*%|LOAD COMPLETE|SCAN SUCCESS/.test(copy),'ornaments must not fabricate discovery progress');
 }
 
 // The outline must enclose the actual authored seal, including its bottom
@@ -222,4 +238,4 @@ for (const [width, height] of [[0, 100], [100, 0], [-1, 100]]) {
   assert.equal(render(width, height, base).records.length, 0, 'hidden or empty canvas must not draw');
 }
 draw(null, 1920, 1080, base);
-console.log(`PASS: ${rendered} deterministic real-renderer samples; finite canvas geometry, balanced state, reduced-motion stability, readable gates, truthful inventory status, and measured layout alignment.`);
+console.log(`PASS: ${rendered} deterministic real-renderer samples; finite canvas geometry, balanced state, reduced-motion stability, readable gates, truthful inventory circuits, and four-row measured layout alignment. Peak commands: ${maxCommands}/12000.`);

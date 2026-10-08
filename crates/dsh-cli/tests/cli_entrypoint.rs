@@ -8,6 +8,7 @@ fn help_completion_and_conflicts_work_in_the_real_entrypoint() {
         (vec!["--help"], 0, "Usage:"),
         (vec!["startup", "--help"], 0, "--auto"),
         (vec!["web", "--help"], 0, "--assets"),
+        (vec!["computer", "--help"], 0, "session"),
         (vec!["completion", "bash"], 0, "complete"),
         (vec!["completion", "powershell"], 0, "Register-ArgumentCompleter"),
         (vec!["--startup", "tui", "--no-startup"], 2, "--no-startup"),

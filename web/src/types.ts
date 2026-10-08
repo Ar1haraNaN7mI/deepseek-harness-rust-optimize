@@ -1,4 +1,16 @@
 export type Profile = { username: string; badge_id: string };
+export type AccessStatus = {
+  enabled: boolean;
+  unlocked: boolean;
+  token: string;
+  profile: Profile;
+  startup: {
+    enabled: boolean;
+    override_enabled?: boolean | null;
+    reduced_motion: boolean;
+    sound: boolean;
+  };
+};
 export type Skill = {
   name: string;
   source: string;

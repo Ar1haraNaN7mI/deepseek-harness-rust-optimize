@@ -6,6 +6,7 @@ type Props = {
   enabled?: boolean;
   startupUrl?: string;
   onFinish?: (reason: FinishReason) => void;
+  onUnlock?: () => void;
   readyTimeoutMs?: number;
 };
 type Frame = { url: string; origin: string; channel: string };
@@ -16,11 +17,14 @@ export function StartupGate({
   enabled = false,
   startupUrl = "http://127.0.0.1:8769/startup-preview.html",
   onFinish,
+  onUnlock,
   readyTimeoutMs = 12000,
 }: Props) {
   const iframe = useRef<HTMLIFrameElement>(null);
   const callback = useRef(onFinish);
   callback.current = onFinish;
+  const unlockCallback = useRef(onUnlock);
+  unlockCallback.current = onUnlock;
   const finished = useRef(false);
   const [done, setDone] = useState(false);
   const [frame, setFrame] = useState<Frame>();
@@ -65,6 +69,7 @@ export function StartupGate({
         }
         if (data.type === "complete" || data.type === "skip")
           complete(data.type);
+        if (data.type === "unlocked") unlockCallback.current?.();
       };
       window.addEventListener("message", receive);
       timeout = setTimeout(() => {

@@ -338,6 +338,10 @@ fn asset(path: &str) -> Option<(&'static str, &'static str)> {
             "text/javascript; charset=utf-8",
             include_str!("../../../docs/startup-identity.js"),
         )),
+        "/startup-text.js" => Some((
+            "text/javascript; charset=utf-8",
+            include_str!("../../../docs/startup-text.js"),
+        )),
         "/startup-emblem.js" => Some((
             "text/javascript; charset=utf-8",
             include_str!("../../../docs/startup-emblem.js"),

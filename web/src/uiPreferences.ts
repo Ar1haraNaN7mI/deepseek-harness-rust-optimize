@@ -13,7 +13,7 @@ export type UiPreferences = {
   desktopNotifications: boolean;
   showThinking: boolean;
   showToolDetails: boolean;
-  pet: "none" | "cat";
+  pet: "none" | "fat-fish";
 };
 
 export const defaultUiPreferences: UiPreferences = {
@@ -34,11 +34,13 @@ export function sanitizeUiPreferences(input: unknown): UiPreferences {
   const choices = {
     theme: ["system", "light", "dark"], density: ["comfortable", "compact"],
     fontSize: ["small", "medium", "large"], sendKey: ["enter", "mod-enter"],
-    reducedMotion: ["system", "reduce"], pet: ["none", "cat"],
+    reducedMotion: ["system", "reduce"], pet: ["none", "fat-fish"],
   };
   for (const [name, options] of Object.entries(choices)) {
     if (options.includes(value[name] as string)) Object.assign(result, { [name]: value[name] });
   }
+  // Keep a previously enabled companion enabled after replacing the old cat.
+  if (value.pet === "cat") result.pet = "fat-fish";
   for (const name of ["notifyOnCompletion", "notifyOnApproval", "notificationSound", "desktopNotifications", "showThinking", "showToolDetails"] as const)
     if (typeof value[name] === "boolean") result[name] = value[name];
   if (typeof value.accent === "string" && /^#[\da-f]{6}$/i.test(value.accent)) result.accent = value.accent;

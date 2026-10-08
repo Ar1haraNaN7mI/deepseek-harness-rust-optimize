@@ -1,0 +1,5 @@
+# Raw RGBA pixels can contain newlines without NUL bytes; never normalize them.
+*.rgba binary
+# This upstream notice is preserved byte for byte, including Markdown hard breaks.
+web/public/pets/deepseek-fat-fish/UPSTREAM-README.md -text -whitespace
+web/public/pets/deepseek-fat-fish/pet.json -text -whitespace

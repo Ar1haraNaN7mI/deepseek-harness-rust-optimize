@@ -1,0 +1,33 @@
+{
+  "repository": "https://github.com/gmskywalker/deepseek-fat-fish-codex-pet",
+  "commit": "277403bcc97e4c23e612c84a27ac4ee81fab99d8",
+  "author": "gmskywalker",
+  "asset_modifications": "None: spritesheet.webp and pet.json are byte-for-byte upstream copies.",
+  "license_notice": "No standalone LICENSE is published upstream. Preserve UPSTREAM-README.md Fan Work Notice: unofficial, non-commercial, personal customization and technical learning. The artwork is not covered by this project code license.",
+  "files": {
+    "pet.json": "7cd54818f29fc94f19fa0c4d285984e5997cafa2c8cb2adf19206c6b2dadfec0",
+    "spritesheet.webp": "77a048aef03f310ef33ffd38916c9da3495851a100266dd6bfbdc25502dca6ed",
+    "UPSTREAM-README.md": "571d100a59ca62a898ab1a006a950b11b1e3c5ac21e9545be8a30f82553993dc"
+  },
+  "sprite": {
+    "width": 1536,
+    "height": 2288,
+    "columns": 8,
+    "rows": 11,
+    "cell_width": 192,
+    "cell_height": 208,
+    "row_frame_counts": [
+      7,
+      8,
+      8,
+      4,
+      5,
+      8,
+      6,
+      6,
+      6,
+      8,
+      8
+    ]
+  }
+}

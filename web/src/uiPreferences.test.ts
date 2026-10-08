@@ -5,6 +5,13 @@ import type { Envelope } from "./types";
 
 afterEach(() => { vi.restoreAllMocks(); resetUiPreferences(); });
 describe("persisted interface preferences", () => {
+  it("migrates an enabled legacy cat to the original fat fish without enabling a disabled pet", () => {
+    expect(sanitizeUiPreferences({ pet: "cat" }).pet).toBe("fat-fish");
+    expect(sanitizeUiPreferences({ pet: "none" }).pet).toBe("none");
+    expect(sanitizeUiPreferences({ pet: "unknown" }).pet).toBe("none");
+    updateUiPreferences({ pet: "fat-fish" });
+    expect(JSON.parse(localStorage.getItem("dsh.web.interface.v1")!).pet).toBe("fat-fish");
+  });
   it("rejects malformed imports while keeping valid settings", () => {
     expect(sanitizeUiPreferences({theme: "invalid", accent: "url(https://example.com)", sendKey: "mod-enter", notificationSound: "true"}))
       .toEqual({...defaultUiPreferences, sendKey: "mod-enter"});

@@ -56,7 +56,7 @@ def main():
             assert profile['sound'] is False, 'global --silent must apply to the web preview'
             assert b'startup-local.js' in request('/startup-preview.html').read()
             assert b'DSHVoice' in request('/startup-voice.js').read()
-            for asset in ['startup-preview.html', 'startup-preview.js', 'startup-local.js', 'startup-voice.js', 'startup-sequence.js', 'startup-identity.js', 'startup-visuals.js', 'startup-embed.js']:
+            for asset in ['startup-preview.html', 'startup-preview.js', 'startup-local.js', 'startup-voice.js', 'startup-sequence.js', 'startup-identity.js', 'startup-text.js', 'startup-visuals.js', 'startup-embed.js']:
                 assert request('/' + asset).read() == (Path('docs') / asset).read_bytes(), f'Embedded asset is stale: {asset}'
             font = request('/assets/fonts/dsh-industrial-sc.woff2?v=1')
             assert font.headers['Content-Type'] == 'font/woff2'

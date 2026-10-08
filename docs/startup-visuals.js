@@ -48,6 +48,9 @@
       return {left:(value.x-width/2)/unit,top:(value.y-height/2)/unit,right:(value.x+value.width-width/2)/unit,bottom:(value.y+value.height-height/2)/unit,rows:value.rows||[],columns:value.columns||[]};
     }
     const identityBox=measuredRect(state.layout?.identity),inventoryBox=measuredRect(state.layout?.inventory);
+    const lettering=window.DSHText||globalThis.DSHText;
+    const textAge=reduced?10:Number(state.textAge??(waiting?1.5:p*2.3));
+    let textOrder=0;
 
     function line(x1,y1,x2,y2,color=C.line,alpha=1,lw=1) {
       ctx.globalAlpha=clamp(alpha);ctx.strokeStyle=color;ctx.lineWidth=lw;ctx.beginPath();ctx.moveTo(x1,y1);ctx.lineTo(x2,y2);ctx.stroke();ctx.globalAlpha=1;
@@ -62,7 +65,21 @@
     function arc(x,y,r,a,b,color=C.ink,alpha=1,lw=1) {ctx.globalAlpha=clamp(alpha);ctx.strokeStyle=color;ctx.lineWidth=lw;ctx.beginPath();ctx.arc(x,y,r,a,b);ctx.stroke();ctx.globalAlpha=1;}
     function text(str,x,y,size=13,color=C.soft,alpha=1,spacing=0,align='center',weight=400,mono=false) {
       ctx.save();ctx.globalAlpha=clamp(alpha);ctx.fillStyle=color;ctx.textBaseline='middle';ctx.font=`${weight} ${size}px ${mono?'"Cascadia Code", "Consolas"':'"Bahnschrift", "Arial", "DSH Industrial SC", "Microsoft YaHei"'},sans-serif`;
-      if(spacing){const chars=[...str],full=chars.reduce((s,c)=>s+ctx.measureText(c).width,0)+(chars.length-1)*spacing;let at=align==='center'?x-full/2:align==='right'?x-full:x;chars.forEach(c=>{ctx.fillText(c,at,y);at+=ctx.measureText(c).width+spacing;});}
+      const chars=lettering?.characters(str)||[...str];
+      const cells=chars.map(c=>ctx.measureText(c).width+spacing);
+      const full=Math.max(0,cells.reduce((sum,n)=>sum+n,0)-spacing);
+      const left=align==='center'?x-full/2:align==='right'?x-full:x;
+      const kind=str==='DSH'?'type':size>=17?'roll':mono?'decode':'mask';
+      const ink=lettering?.sample(str,textAge,{kind,delay:Math.min(textOrder++*.018,.16),reducedMotion:reduced});
+      if(ink&&!ink.settled){
+        // The reveal moves ink, never its registration cell. Every glyph uses
+        // the final text's advance so scrambled capitals and CJK cannot jump.
+        ctx.beginPath();ctx.rect(left-1,y-size*.65,(full+2)*(kind==='type'?ink.reveal:1),size*1.35);ctx.clip();
+        ctx.textAlign='left';let at=left;
+        const visible=lettering.characters(ink.text);
+        visible.forEach((c,i)=>{ctx.fillText(c,at,y+ink.offset*size);at+=cells[i]||0;});
+        if(ink.cover>0){ctx.fillStyle=color;ctx.fillRect(left+full*(1-ink.cover),y-size*.52,full*ink.cover,size*1.04);}
+      }else if(spacing){ctx.textAlign='left';let at=left;chars.forEach((c,i)=>{ctx.fillText(c,at,y);at+=cells[i];});}
       else{ctx.textAlign=align;ctx.fillText(str,x,y);}ctx.restore();
     }
     function emblem(x,y,scale=1,assembly=1,fill=1,color=C.ink,alpha=1) {
@@ -174,19 +191,23 @@
         at+=length;
       });
     }
-    function deltaConstruction(cy,q,scale=1) {
+    function deltaConstruction(x,y,q,scale=1) {
       const rest=waiting||reduced,arrival=rest?1:ease(part(q,0,.40));
-      const r=(178+(1-arrival)*Math.max(W,H)*.62)*scale;
+      // The seal's SVG origin is its bounding-box midpoint, not the triangle's
+      // centroid. Share its exact pose and offset all three edges by one normal
+      // distance; an independent circumradius drifts above the bottom track.
+      const pad=10,center=28.38*scale;
+      const growth=1+(1-arrival)*Math.max(W,H)/(170.28*scale);
       const turn=rest?0:(1-arrival)*-.65;
-      ctx.save();ctx.translate(px,cy+py);ctx.rotate(turn);
-      const vertices=[[0,-r],[r*.866,r*.5],[-r*.866,r*.5]];
+      ctx.save();ctx.translate(x,y+center);ctx.rotate(turn);
+      const vertices=[[0,-113.52*scale-pad*2],[98.311*scale+Math.sqrt(3)*pad,56.76*scale+pad],[-98.311*scale-Math.sqrt(3)*pad,56.76*scale+pad]].map(([vx,vy])=>[vx*growth,vy*growth]);
       for(let i=0;i<3;i++){
         const points=[vertices[i],vertices[(i+1)%3],vertices[(i+2)%3],vertices[i]];
         const head=rest?1:ease(part(q,.035+i*.04,.36+i*.04));
         const tail=rest?0:ease(part(q,.42+i*.045,.79+i*.045));
         trace(points,head,tail,i===1?C.accent:C.soft,rest?.25:.7,i===1?3:1);
         const [x,y]=vertices[i],distance=rest?23:23+(1-arrival)*160;
-        const dx=x/r,dy=y/r;
+        const radius=Math.hypot(x,y),dx=x/radius,dy=y/radius;
         line(x+dx*10,y+dy*10,x+dx*distance,y+dy*distance,C.accent,.7,2);
         dot(x,y,2.5,C.accent,.8);
       }
@@ -211,10 +232,15 @@
         const {left,right,top,bottom,rows}=identityBox;
         const t=reduced||waiting?1:ease(part(p,0,.28));
         for(const side of [-1,1]){
-          const edge=side<0?left:right,x=edge+side*(18+(1-t)*170);
-          line(x,top-4,x,bottom+4,C.soft,.6*strength,.8);
-          line(x,top-4,edge+side*3,top-4,C.accent,.85*strength,2);
-          line(x,bottom+4,edge+side*3,bottom+4,C.accent,.85*strength,2);
+          const edge=side<0?left:right,x=edge+side*((1-t)*170);
+          // Brackets terminate on the measured border. The same physical
+          // corners are used at every DPR, zoom, font size and line wrap.
+          const arm=Math.min(23/unit,(right-left)*.10),rise=Math.min(15/unit,(bottom-top)*.18);
+          line(x,top,x,bottom,C.soft,.45*strength,.8);
+          line(x,top,x-side*arm,top,C.accent,.95*strength,3/unit);
+          line(x,top,x,top+rise,C.accent,.95*strength,3/unit);
+          line(x,bottom,x-side*arm,bottom,C.accent,.95*strength,3/unit);
+          line(x,bottom,x,bottom-rise,C.accent,.95*strength,3/unit);
           rows.forEach((row,i)=>{
             if(![row.y,row.height].every(Number.isFinite))return;
             const y=(row.y+row.height/2-height/2)/unit;
@@ -237,7 +263,7 @@
     function blackIntro() {
       const q=waiting||reduced?1:p,assembly=part(q,0,.35),stamp=ease(part(q,.18,.44));
       const cy=wy(.40),s=1.70*pulse*(waiting||reduced?1:1.22-.22*ease(part(p,0,.48)));
-      deltaConstruction(cy,q,1.13);archiveMargins(.8);
+      deltaConstruction(px,cy+py,q,s);archiveMargins(.8);
       // The seal is the hero. The un-stretched signature has a clear subordinate role.
       emblem(px,cy+py,s,assembly,1,C.ink,1);
       wordmark(0,cy+185,46,1.1,C.ink,stamp);
@@ -260,7 +286,7 @@
       paper();
       archiveMargins();
       const show=ease(part(p,0,.42));
-      deltaConstruction(wy(.60),p,.67);
+      deltaConstruction(px,wy(.60)+py,p,.80*pulse);
       emblem(px,wy(.60)+py,.80*pulse,part(p,0,.44),1,C.ink,.95);
       const y=wy(.72);for(let i=0;i<13;i++)rect(-73+i*12,y,5,1.8,C.ink,i<Math.floor(13*show)?.8:.18);
       scan(.55);flightLines(.38);shutters();
@@ -286,7 +312,7 @@
       // This is a decorative frame: no invented percentages or load entries.
       const release=reduced||waiting?1:part(p,0,.42);
       for(let i=0;i<3;i++){
-        const pad=10+i*8,points=[[left-pad,bottom+24],[left-pad,top-32-pad],[right+pad,top-32-pad],[right+pad,bottom+24]];
+        const pad=(6+i*5)/unit,points=[[left-pad,bottom+pad],[left-pad,top-pad],[right+pad,top-pad],[right+pad,bottom+pad]];
         trace(points,ease(part(release,i*.055,.58+i*.055)),ease(part(release,.52+i*.06,1)),i===1?C.accent:C.ink,.65,i===1?3:1);
       }
       if(!reduced){
@@ -318,7 +344,7 @@
       paper();
       archiveMargins();
       const enter=ease(part(p,.015,.24)),cy=wy(.425),s=1.42*(reduced?1:1+.18*(1-ease(part(p,0,.35))));
-      deltaConstruction(cy,p,1.04);
+      deltaConstruction(px*.4,cy+py*.4,p,s);
       if(p<.25)reticle((1-part(p,0,.25))*.8,.4);
       text('WELCOME TO',0,cy-190+(1-enter)*-45,18,C.ink,enter,7);
       emblem(px*.4,cy+py*.4,s,part(p,0,.32),1,C.ink,1);

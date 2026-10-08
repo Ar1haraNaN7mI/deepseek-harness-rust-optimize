@@ -12,6 +12,7 @@ import {
 } from "@radix-ui/react-icons";
 import Markdown from "react-markdown";
 import { Emblem } from "./Emblem";
+import { Companion } from "./Companion";
 import { SettingsCenter } from "./SettingsCenter";
 import { useUiPreferences, useInterfaceEffects, shouldSend } from "./uiPreferences";
 import { unlockNotificationAudio } from "./notifications";
@@ -22,15 +23,6 @@ const labelSession = (name: string | null, id: string) =>
   name || `会话 ${id.slice(0, 8)}`;
 function Reasoning({ text }: { text: string }) {
   return <details className="reasoning"><summary>模型思考</summary><pre>{text}</pre></details>;
-}
-function Companion({ working }: { working: boolean }) {
-  return <div className={`companion ${working ? "working" : ""}`} role="img" aria-label={working ? "猫咪正在陪你工作" : "猫咪正在休息"}>
-    <svg viewBox="0 0 100 66" aria-hidden="true">
-      <path className="cat-tail" d="M69 51c26 0 18-30 11-23" fill="none" stroke="currentColor" strokeWidth="7" strokeLinecap="round" />
-      <path d="M25 53V26L21 9l19 11q10-5 21 0L77 9l-4 20v24q-23 13-48 0Z" fill="currentColor" />
-      <g className="cat-face" fill="none" stroke="var(--paper)" strokeWidth="2.4" strokeLinecap="round"><path d="m34 38 6-2m19 0 6 2m-18 6 3 2 3-2"/><path d="m22 42 12 2m31 0 11-2"/></g>
-    </svg><span>{working ? "WITH YOU / WORKING" : "YOUR QUIET COMPANION"}</span>
-  </div>;
 }
 function ToolActivity({ item }: { item: Activity }) {
   const [preferences] = useUiPreferences();
@@ -236,6 +228,18 @@ export function App({
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [preferences] = useUiPreferences();
   useInterfaceEffects();
+  const desktopReady = useRef(false);
+  useEffect(() => {
+    const desktop = window as Window & {
+      __DSH_DESKTOP__?: boolean;
+      ipc?: { postMessage?: (message: string) => void };
+    };
+    if (!data || desktopReady.current || !desktop.__DSH_DESKTOP__ || typeof desktop.ipc?.postMessage !== "function") return;
+    // The native shell's smoke check waits for a real Harness bootstrap, not
+    // merely an HTML navigation. The message deliberately contains no data.
+    desktop.ipc.postMessage(JSON.stringify({ event: "dsh-ready", version: 1 }));
+    desktopReady.current = true;
+  }, [data]);
   const scroll = useRef<HTMLDivElement>(null);
   const follow = useRef(true);
   const composer = useRef<HTMLTextAreaElement>(null);
@@ -350,7 +354,7 @@ export function App({
           )}
         </nav>
         <div className="sidebar-bottom">
-          {preferences.pet === "cat" && <Companion working={!!live?.running} />}
+          {preferences.pet === "fat-fish" && <Companion key={currentId || "empty"} working={!!live?.running} waiting={currentApprovals.length > 0} outcome={live?.error ? "failed" : snapshot?.task_id === live?.taskId ? snapshot?.state : undefined} />}
           <div className="operator">
             <span className="operator-avatar">
               {data?.profile.username.slice(0, 1).toUpperCase() || "—"}

@@ -1,5 +1,6 @@
 mod app_server;
 mod cloud;
+mod desktop_launch;
 mod harness_settings;
 mod model_service;
 mod harness_extensions;
@@ -39,7 +40,7 @@ use tracing_subscriber::EnvFilter;
 #[derive(Parser, Debug)]
 #[command(
     name = "dsh",
-    about = "DSH — agent harness for hosted and local models (TUI + CLI + Web)",
+    about = "DSH — agent harness for hosted and local models (TUI + CLI + Web + Desktop)",
     long_about = "\
 dsh-rust is a two-layer coding agent for hosted and local OpenAI-compatible models.
 
@@ -53,6 +54,7 @@ dsh-rust is a two-layer coding agent for hosted and local OpenAI-compatible mode
   dsh startup         preview the terminal startup sequence
   dsh --startup       play startup, then enter the interactive TUI
   dsh web             serve the local Harness web app
+  dsh app             open the native Windows desktop app
 
 Inside the TUI, type /help for formatted slash-command help.
 Global flags: -m/--model, -s/--sandbox, -a/--ask-for-approval, -c/--config-override,
@@ -313,8 +315,18 @@ enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// Open desktop app (stub — use TUI)
-    App,
+    /// Open the native Windows desktop app with real Harness sessions and tools
+    App {
+        /// Prefer this port (default: reuse 8770 for this workspace or select a free port)
+        #[arg(long)]
+        port: Option<u16>,
+        /// Override frontend assets
+        #[arg(long)]
+        assets: Option<PathBuf>,
+        /// Open and close a real native window, reporting whether the page loaded
+        #[arg(long, hide = true)]
+        smoke_test: bool,
+    },
     /// Run the durable scheduler until Ctrl+C.
     Daemon {
         /// Status output interval in seconds.
@@ -657,6 +669,21 @@ async fn cloud_provider(outer_home: &Path, server: Option<&str>) -> Result<Box<d
 }
 
 fn main() -> Result<()> {
+    let result = cli_main();
+    if desktop_entry_point() {
+        if let Err(error) = &result {
+            dsh_desktop::show_error(&format!("{error:#}"));
+        }
+    }
+    result
+}
+
+fn desktop_entry_point() -> bool {
+    std::env::current_exe().ok().and_then(|path| path.file_stem().map(|name| name.to_string_lossy().into_owned()))
+        .is_some_and(|name| name.eq_ignore_ascii_case("dsh-desktop"))
+}
+
+fn cli_main() -> Result<()> {
     load_dotenv_files();
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse()?))
@@ -666,8 +693,21 @@ fn main() -> Result<()> {
 
     // Parse outside the async dispatcher so Clap's temporary command builders
     // do not share its large poll stack frame on the Windows main thread.
-    let cli = Cli::parse();
+    let mut arguments: Vec<_> = std::env::args_os().collect();
+    if desktop_entry_point() { arguments.insert(1, "app".into()); }
+    let cli = match Cli::try_parse_from(arguments) {
+        Ok(cli) => cli,
+        Err(error) if desktop_entry_point() => {
+            if matches!(error.kind(), clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion) {
+                dsh_desktop::show_message(&error.to_string());
+                return Ok(());
+            }
+            return Err(error.into());
+        }
+        Err(error) => error.exit(),
+    };
     if let Err(error) = cli.validate_startup_flags() {
+        if desktop_entry_point() { return Err(error.into()); }
         error.exit();
     }
     if let Some(ref cd) = cli.cd {
@@ -1138,23 +1178,8 @@ async fn run(cli: Cli) -> Result<()> {
             apply_cli_overrides(&boot.runtime, &cli)?;
             run_daemon(boot.runtime, interval, json).await?;
         }
-        Some(Commands::App) => {
-            let boot = boot_tui(&workspace, config_path.as_ref(), &cli)?;
-            apply_cli_overrides(&boot.runtime, &cli)?;
-            let opts = TuiOptions {
-                startup_enabled: cli.startup,
-                startup_disabled: cli.no_startup,
-                model: boot.runtime.llm.config().model.clone(),
-                cwd: workspace.display().to_string(),
-                show_thinking: boot.runtime.config.tui.show_thinking,
-                sidebar: boot.runtime.config.tui.sidebar,
-                skill_names: boot.skills.list().into_iter().map(|s| s.name).collect(),
-                plugin_names: plugin_ids(&boot.plugins),
-                session_id: None,
-                has_api_key: llm_ready(&boot.runtime),
-                initial_prompt: cli.prompt.clone(),
-            };
-            run_tui(boot.runtime, opts).await?;
+        Some(Commands::App { port, assets, smoke_test }) => {
+            desktop_launch::launch(&cli, &workspace, config_path.as_ref(), port, assets, smoke_test).await?;
         }
         Some(Commands::Daemon { interval, json }) => {
             let boot = boot_full(&workspace, config_path.as_ref())?;
@@ -2577,6 +2602,16 @@ mod startup_cli_tests {
         apply_startup_overrides(&mut config, &cli);
         assert!(config.tui.startup.enabled);
         assert!(!config.tui.startup.sound);
+    }
+
+    #[test]
+    fn desktop_command_accepts_global_startup_and_native_options() {
+        let cli = Cli::try_parse_from(["dsh", "app", "--startup", "--port", "0", "--assets", "web/dist"]).unwrap();
+        assert!(cli.startup);
+        assert!(matches!(cli.command, Some(Commands::App { port: Some(0), assets: Some(ref path), smoke_test: false }) if path == Path::new("web/dist")));
+        let cli = Cli::try_parse_from(["dsh", "app", "--smoke-test", "--no-startup"]).unwrap();
+        assert!(cli.no_startup);
+        assert!(matches!(cli.command, Some(Commands::App { port: None, assets: None, smoke_test: true })));
     }
 
     #[test]

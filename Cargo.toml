@@ -11,6 +11,7 @@ members = [
     "crates/dsh-skill",
     "crates/dsh-tui",
     "crates/dsh-cli",
+    "crates/dsh-desktop",
 ]
 default-members = ["crates/dsh-cli"]
 
@@ -61,6 +62,7 @@ dsh-fs = { path = "crates/dsh-fs" }
 dsh-plugin = { path = "crates/dsh-plugin" }
 dsh-skill = { path = "crates/dsh-skill" }
 dsh-tui = { path = "crates/dsh-tui" }
+dsh-desktop = { path = "crates/dsh-desktop" }
 
 [profile.release]
 lto = true

@@ -40,6 +40,14 @@
     C.accent=(light?['#c5793f','#29848e','#8a668e']:['#82bfd2','#81c1a7','#b59ad9'])[channel];
     const identity = String(state.identity || 'OPERATOR').trim().slice(0,28) || 'OPERATOR';
     const inventory=state.inventory||{status:'idle',skills:[],plugins:[],issues:[]};
+    // DOM and canvas share CSS-pixel measurements. Do not infer the plate's
+    // position from viewport percentages: Chinese wrapping and browser zoom
+    // change it independently of the illustration's design coordinates.
+    function measuredRect(value) {
+      if(!value||![value.x,value.y,value.width,value.height].every(Number.isFinite)||value.width<=0||value.height<=0)return null;
+      return {left:(value.x-width/2)/unit,top:(value.y-height/2)/unit,right:(value.x+value.width-width/2)/unit,bottom:(value.y+value.height-height/2)/unit,rows:value.rows||[],columns:value.columns||[]};
+    }
+    const identityBox=measuredRect(state.layout?.identity),inventoryBox=measuredRect(state.layout?.inventory);
 
     function line(x1,y1,x2,y2,color=C.line,alpha=1,lw=1) {
       ctx.globalAlpha=clamp(alpha);ctx.strokeStyle=color;ctx.lineWidth=lw;ctx.beginPath();ctx.moveTo(x1,y1);ctx.lineTo(x2,y2);ctx.stroke();ctx.globalAlpha=1;
@@ -53,7 +61,7 @@
     function dot(x,y,r,color=C.ink,alpha=1) {ctx.globalAlpha=clamp(alpha);ctx.fillStyle=color;ctx.beginPath();ctx.arc(x,y,r,0,TAU);ctx.fill();ctx.globalAlpha=1;}
     function arc(x,y,r,a,b,color=C.ink,alpha=1,lw=1) {ctx.globalAlpha=clamp(alpha);ctx.strokeStyle=color;ctx.lineWidth=lw;ctx.beginPath();ctx.arc(x,y,r,a,b);ctx.stroke();ctx.globalAlpha=1;}
     function text(str,x,y,size=13,color=C.soft,alpha=1,spacing=0,align='center',weight=400,mono=false) {
-      ctx.save();ctx.globalAlpha=clamp(alpha);ctx.fillStyle=color;ctx.textBaseline='middle';ctx.font=`${weight} ${size}px ${mono?'"Cascadia Code", "Consolas"':'"Bahnschrift", "Arial", "Microsoft YaHei"'},sans-serif`;
+      ctx.save();ctx.globalAlpha=clamp(alpha);ctx.fillStyle=color;ctx.textBaseline='middle';ctx.font=`${weight} ${size}px ${mono?'"Cascadia Code", "Consolas"':'"Bahnschrift", "Arial", "DSH Industrial SC", "Microsoft YaHei"'},sans-serif`;
       if(spacing){const chars=[...str],full=chars.reduce((s,c)=>s+ctx.measureText(c).width,0)+(chars.length-1)*spacing;let at=align==='center'?x-full/2:align==='right'?x-full:x;chars.forEach(c=>{ctx.fillText(c,at,y);at+=ctx.measureText(c).width+spacing;});}
       else{ctx.textAlign=align;ctx.fillText(str,x,y);}ctx.restore();
     }
@@ -113,31 +121,123 @@
       for(let i=0;i<=steps;i++){const a=rotation+length*i/steps,x=Math.cos(a)*radius,y=Math.sin(a)*radius;if(inGap(a)){down=false;continue;}if(down)ctx.lineTo(x,y);else{ctx.moveTo(x,y);down=true;}}ctx.stroke();ctx.globalAlpha=1;
     }
     function reticle(strength=1,contract=0) {
-      const kick=reduced||waiting?0:Math.sin(part(p,0,.25)*Math.PI)*(1-part(p,0,.25));
-      const cy=wy(.47),radius=Math.min(W*.425,H*.425)*(1-contract*.17+kick*.24);
+      // A viewport-sized aperture decelerates into the identity plate. The
+      // interactive gate always has a composed, readable resting pose.
+      const arrival=reduced||waiting?1:ease(part(p,0,.32));
+      const engraving=reduced||waiting?1:ease(part(p,.12,.48));
+      const locking=reduced||waiting?1:ease(part(p,.32,.66));
+      const cy=wy(.47),radius=Math.min(W*.425,H*.425)*(1-contract*.17+(1-arrival)*2.35);
+      const orbit=spin-(1-arrival)*TAU*1.35;
       ctx.save();ctx.translate(px,cy+py);
       // Lower opening remains fixed, while independently rotating bands and markers
       // pass behind it. Identity text and subtitles always retain clear space.
       brokenArc(radius,Math.PI*.76,Math.PI*1.48,C.ink,strength*.76,4.7);
       brokenArc(radius-14,0,TAU,C.soft,strength*.35,.8);
-      brokenArc(radius-29,spin*1.35+.4,Math.PI*1.4,C.ink,strength*.8,2.4);
-      brokenArc(radius-49,-spin*1.85-1.2,Math.PI*1.12,C.accent,strength*.9,5.5);
-      brokenArc(radius-62,-spin*1.85-.9,Math.PI*.48,C.accent,strength*.22,12);
+      brokenArc(radius-29,orbit*1.35+.4,Math.PI*1.4,C.ink,strength*.8,2.4);
+      brokenArc(radius-49,-orbit*1.85-1.2,Math.PI*(.08+1.04*engraving),C.accent,strength*.9,5.5);
+      brokenArc(radius-62,-orbit*1.85-.9,Math.PI*.48,C.accent,strength*.22,12);
       brokenArc(radius+17,-spin*.23,Math.PI*1.25,C.soft,strength*.31,.7);
       for(let i=0;i<84;i++){
+        if(i>Math.ceil(84*engraving))continue;
         const a=i*TAU/84+spin*.12;if(inGap(a))continue;const major=i%7===0,l=major?13:4;
         line(Math.cos(a)*(radius+25),Math.sin(a)*(radius+25),Math.cos(a)*(radius+25+l),Math.sin(a)*(radius+25+l),major?C.ink:C.soft,strength*(major?.62:.38),major?.9:.65);
       }
       for(let i=0;i<12;i++){
+        if(i>Math.ceil(12*locking))continue;
         const a=i*TAU/12-spin*.25;if(inGap(a))continue;const r=radius-30;
         dot(Math.cos(a)*r,Math.sin(a)*r,i%3===0?4.1:1.8,i%3===0?C.accent:C.ink,strength*(i%3===0?.88:.48));
       }
       [-1,1].forEach(side=>{const x=side*(radius-83);line(x,-20,x,-7,C.soft,strength*.35,.7);line(x,7,x,20,C.soft,strength*.35,.7);line(x,side<0?-20:20,x-side*9,side<0?-20:20,C.soft,strength*.35,.7);});
+      if(W>1350&&locking>.1){
+        // The three instrument captions carry DSH's actual responsibilities;
+        // they are fixed to the dial, not unrelated floating HUD fragments.
+        [['CONTEXT',-2.47],['INFERENCE',-Math.PI/2],['TOOLS',-.67]].forEach(([label,a],i)=>{
+          const r=radius+53,x=Math.cos(a)*r,y=Math.sin(a)*r;
+          ctx.save();ctx.translate(x,y);ctx.rotate(a+Math.PI/2);
+          text(label,0,0,9,C.soft,strength*locking*.8,1.8,'center',500,true);
+          rect(-9,10,18,1.5,i===1?C.accent:C.ink,strength*locking*.7);
+          ctx.restore();
+        });
+      }
       ctx.restore();
+    }
+    function trace(points,head,tail,color,alpha=1,lw=1) {
+      // Distance-normalized strokes keep the travelling head uniform even
+      // along unequal triangle sides. Both ends follow the same playhead.
+      const lengths=points.slice(1).map((point,i)=>Math.hypot(point[0]-points[i][0],point[1]-points[i][1]));
+      const total=lengths.reduce((sum,n)=>sum+n,0),start=clamp(tail)*total,end=clamp(head)*total;
+      let at=0;
+      lengths.forEach((length,i)=>{
+        const lo=Math.max(start,at),hi=Math.min(end,at+length);
+        if(hi>lo&&length>0){const a=(lo-at)/length,b=(hi-at)/length;
+          line(mix(points[i][0],points[i+1][0],a),mix(points[i][1],points[i+1][1],a),mix(points[i][0],points[i+1][0],b),mix(points[i][1],points[i+1][1],b),color,alpha,lw);}
+        at+=length;
+      });
+    }
+    function deltaConstruction(cy,q,scale=1) {
+      const rest=waiting||reduced,arrival=rest?1:ease(part(q,0,.40));
+      const r=(178+(1-arrival)*Math.max(W,H)*.62)*scale;
+      const turn=rest?0:(1-arrival)*-.65;
+      ctx.save();ctx.translate(px,cy+py);ctx.rotate(turn);
+      const vertices=[[0,-r],[r*.866,r*.5],[-r*.866,r*.5]];
+      for(let i=0;i<3;i++){
+        const points=[vertices[i],vertices[(i+1)%3],vertices[(i+2)%3],vertices[i]];
+        const head=rest?1:ease(part(q,.035+i*.04,.36+i*.04));
+        const tail=rest?0:ease(part(q,.42+i*.045,.79+i*.045));
+        trace(points,head,tail,i===1?C.accent:C.soft,rest?.25:.7,i===1?3:1);
+        const [x,y]=vertices[i],distance=rest?23:23+(1-arrival)*160;
+        const dx=x/r,dy=y/r;
+        line(x+dx*10,y+dy*10,x+dx*distance,y+dy*distance,C.accent,.7,2);
+        dot(x,y,2.5,C.accent,.8);
+      }
+      ctx.restore();
+    }
+    function archiveMargins(strength=1) {
+      // Oversized editorial type is cropped by the stage, kept outside the
+      // central reading corridor. All labels describe the visual system.
+      if(W<1250)return;
+      const offset=reduced?0:Math.sin(ambient*.22)*12;
+      for(const side of [-1,1]){
+        ctx.save();ctx.translate(side*(W/2-58),wy(.48)+side*offset);ctx.rotate(side<0?-Math.PI/2:Math.PI/2);
+        text(side<0?'DEEP DIVE':'HARNESS / DSH',0,0,74,C.ink,.055*strength,7,'center',700);
+        line(-230,-52,230,-52,C.ink,.28*strength,.8);
+        text(side<0?'LOCAL INTELLIGENCE / ACCESS PROTOCOL':'DEPARTMENT OF SYNTHETIC INTELLIGENCE',0,-70,10,C.soft,.65*strength,2,'center',400,true);
+        for(let i=0;i<45;i++)rect(-220+i*10,-46,i%5===0?3:1,i%5===0?12:5,C.ink,.4*strength);
+        ctx.restore();
+      }
+    }
+    function registration(cy,strength=1) {
+      if(identityBox){
+        const {left,right,top,bottom,rows}=identityBox;
+        const t=reduced||waiting?1:ease(part(p,0,.28));
+        for(const side of [-1,1]){
+          const edge=side<0?left:right,x=edge+side*(18+(1-t)*170);
+          line(x,top-4,x,bottom+4,C.soft,.6*strength,.8);
+          line(x,top-4,edge+side*3,top-4,C.accent,.85*strength,2);
+          line(x,bottom+4,edge+side*3,bottom+4,C.accent,.85*strength,2);
+          rows.forEach((row,i)=>{
+            if(![row.y,row.height].every(Number.isFinite))return;
+            const y=(row.y+row.height/2-height/2)/unit;
+            line(x,y,x+side*8,y,C.ink,.6*strength,1);
+            if(W>1200)text(String(i+1).padStart(2,'0'),x+side*23,y,9,C.soft,.6*strength,1,side<0?'right':'left',400,true);
+          });
+        }
+        return;
+      }
+      const space=Math.min(W*.39,490),travel=reduced||waiting?1:ease(part(p,0,.25));
+      for(const side of [-1,1]){
+        const x=side*(space+(1-travel)*W*.35),y=cy-190;
+        line(x,y,x-side*50,y,C.ink,.65*strength,2);
+        line(x,y,x,y+84,C.ink,.65*strength,2);
+        line(x,cy+148,x-side*33,cy+148,C.accent,.85*strength,4);
+        for(let i=0;i<6;i++)rect(x-side*(i*6+4),y+9,2,9+i%3*4,C.ink,.6*strength);
+        if(W>1100){text(side<0?'DSH / 02':'IDENTITY',x,cy+181,10,C.soft,.8*strength,1.2,side<0?'left':'right',400,true);}
+      }
     }
     function blackIntro() {
       const q=waiting||reduced?1:p,assembly=part(q,0,.35),stamp=ease(part(q,.18,.44));
       const cy=wy(.40),s=1.70*pulse*(waiting||reduced?1:1.22-.22*ease(part(p,0,.48)));
+      deltaConstruction(cy,q,1.13);archiveMargins(.8);
       // The seal is the hero. The un-stretched signature has a clear subordinate role.
       emblem(px,cy+py,s,assembly,1,C.ink,1);
       wordmark(0,cy+185,46,1.1,C.ink,stamp);
@@ -158,24 +258,36 @@
     }
     function permission() {
       paper();
+      archiveMargins();
       const show=ease(part(p,0,.42));
+      deltaConstruction(wy(.60),p,.67);
       emblem(px,wy(.60)+py,.80*pulse,part(p,0,.44),1,C.ink,.95);
       const y=wy(.72);for(let i=0;i<13;i++)rect(-73+i*12,y,5,1.8,C.ink,i<Math.floor(13*show)?.8:.18);
       scan(.55);flightLines(.38);shutters();
     }
-    function verification() {paper();reticle(.94);dataFall(.42);flightLines(.3);shutters();}
+    function verification() {paper();archiveMargins();reticle(.94);registration(wy(.47));dataFall(.42);flightLines(.3);shutters();}
     function capabilityField(complete=false) {
       paper();
+      archiveMargins(.75);
       // The moving cuts are decoration, not progress. The host overlays the
       // complete, immediately updated server inventory in these two columns.
-      const top=wy(.36),bottom=wy(.86),left=wx(.105),right=wx(.895);
-      line(0,top+18,0,bottom-35,C.line,.65,1);
+      const top=inventoryBox?.top??wy(.36),bottom=inventoryBox?.bottom??wy(.86),left=inventoryBox?.left??wx(.105),right=inventoryBox?.right??wx(.895);
+      // The DOM owns column borders (including the single-column breakpoint).
+      // Canvas adds only outside ornaments, so zoom cannot create double rules.
+      if(!inventoryBox)line(0,top+18,0,bottom-35,C.line,.65,1);
       for(const side of [-1,1]){
-        const x=side<0?left:right;
+        const x=(side<0?left:right)+side*12;
         line(x,top,x+side*18,top-26,C.ink,.6,2);
         line(x,bottom,x+side*18,bottom+26,C.ink,.6,2);
         rect(x-side*5,top+44,3,44,C.accent,.55);
         for(let i=0;i<8;i++)line(x+side*22,top+82+i*25,x+side*(i%3===0?32:26),top+82+i*25,C.soft,.36,.9);
+      }
+      // Three unsealing strokes race around the true inventory, then retract.
+      // This is a decorative frame: no invented percentages or load entries.
+      const release=reduced||waiting?1:part(p,0,.42);
+      for(let i=0;i<3;i++){
+        const pad=10+i*8,points=[[left-pad,bottom+24],[left-pad,top-32-pad],[right+pad,top-32-pad],[right+pad,bottom+24]];
+        trace(points,ease(part(release,i*.055,.58+i*.055)),ease(part(release,.52+i*.06,1)),i===1?C.accent:C.ink,.65,i===1?3:1);
       }
       if(!reduced){
         const sweep=fract(ambient*.72),x=mix(left-75,right+75,sweep);
@@ -195,14 +307,18 @@
       if(complete){
         const known=inventory.status==='complete',issue=inventory.issues.length>0;
         const label=known?(issue?'RESULT / CHECK ISSUES':'RESULT / LOCAL'): 'RESULT / NOT READ';
-        text(label,0,wy(.88),10,issue?C.accent:C.soft,.7,2);
+        // Bind the result stamp to the inventory, away from the independent
+        // centered subtitles. Percentage positioning overlapped at HD sizes.
+        text(label,left,bottom+22,9,issue?C.accent:C.soft,.7,1.4,'left');
       }
     }
     function requestRead() {capabilityField(false);}
     function readComplete() {capabilityField(true);}
     function welcome() {
       paper();
+      archiveMargins();
       const enter=ease(part(p,.015,.24)),cy=wy(.425),s=1.42*(reduced?1:1+.18*(1-ease(part(p,0,.35))));
+      deltaConstruction(cy,p,1.04);
       if(p<.25)reticle((1-part(p,0,.25))*.8,.4);
       text('WELCOME TO',0,cy-190+(1-enter)*-45,18,C.ink,enter,7);
       emblem(px*.4,cy+py*.4,s,part(p,0,.32),1,C.ink,1);
@@ -216,6 +332,18 @@
         if(p>.36&&p<.68){const t=part(p,.36,.68),a=Math.sin(t*Math.PI);streak(0,cy,W*1.5*ease(t),a);rect(-W/2,cy-2,W,4,C.ink,a*.45);}
       }
       flightLines(.7*(1-enter));shutters();
+      // Three broad ink cuts reveal the completed insignia. A single authored
+      // wipe replaces repeated flashes and leaves the final lock-up calm.
+      if(!reduced&&!waiting&&p<.31){
+        ctx.save();ctx.transform(1,0,-.46,1,0,0);
+        for(let i=0;i<3;i++){
+          const open=ease(part(p,.015+i*.035,.19+i*.055)),band=H/3;
+          const slide=-open*(W+H*.7);
+          rect(-W/2-H*.35+slide,-H/2+i*band,W+H*.7,band+1,C.ink,1);
+          rect(W/2+H*.35+slide-9,-H/2+i*band,5,band,C.accent,.9);
+        }
+        ctx.restore();
+      }
     }
     function chromaticSeal(x,y,s,amount) {
       if(reduced||amount<.1)return;

@@ -75,6 +75,8 @@ TUI 里常用：
 
 内置原创电影式启动序列：**厂牌唤醒 → 本地连接 → 个人档案 → 技能与插件清单 → 加载结果 → 欢迎进入 DSH**。原创 DELTA CIRCUIT 平面徽章以三角形为主体：左侧 D 字轨、底部 S 折线与右侧 H 连接共同形成轮廓，内部保留小型 DSH 刻字和三层扫描线。分件飞入、高速环扫、平面扫描与档案展开保持扁平风格。高清版没有底部控制栏，按 C 或点右上角省略号打开设置。
 
+这一版以 [RhineLabUI](https://github.com/LBEILC/RhineLabUI) 的档案解密和扫描节奏为视觉研究参考，重新编排原创的斜切遮罩、巨幅环形标尺、分层快切与部门徽章组装。访问身份、档案编号、资料来源三行从乱码锁定到真实资料；中文采用随包提供的工业排版与 Noto Sans SC 字体子集，字体及许可证位于 [`docs/assets/fonts`](docs/assets/fonts)。动画没有复用参考项目的图形或采样音频，支持减少动态效果设置。
+
 动画**默认关闭**。启用后在开场、个人档案、加载结果三个节点等待确认；等待时旋转环和扫描仍持续运动。确认后连续播放两幕，再到下一节点；终端最后自动进入对话，`dsh web` 的嵌入动画完成或跳过后进入真实 Harness，`dsh startup web` 独立预览停留在欢迎画面。基础演出为 **13.8 秒**；交互等待、真实读取和较长旁白会延长停留时间，不截断声音。终端独立预览可用 `--auto` 完整自动播放。
 
 编排参考 [dsh-startup-screen 的序列与确认机制](https://github.com/6shenhonghong9/dsh-startup-screen/blob/main/lib/splash.js)。本项目的字徽、图形部件及电子音效自行绘制和合成。旁白使用预先生成的固定英文录音，统一称呼 **OPERATOR**，只说明实际阶段，不念自定义用户名、变化的数量或逐项技能／插件名。动画等待每句播完；失败与部分失败使用独立的提示录音。运行时不调用系统 TTS，也无需加载语音模型。音频无法播放时仍保留画面和电子音效。
@@ -112,6 +114,39 @@ dsh --silent                             # 保留动画，关闭启动音
 `--startup` 只为本次交互启动启用动画，完成或按 Esc 跳过后进入会话；它也适用于 `tui`、`resume`、`fork`、`app` 和 `web`。`web` 在本机端口 8770 提供 Harness 页面，优先读取可执行文件所在安装目录的 `share/dsh/web`，没有安装资源时尝试当前目录的 `web/dist`；显式 `--assets` 始终优先，路径错误会直接报错。网页复用真实 Runtime、会话、技能与插件；`startup web` 仍是独立动画预览。非交互命令即使带 `--startup` 也不会播放动画。
 
 `startup next on|off` 保存一次性选择；只有下一次成功进入受支持终端的交互启动才会消费它。预览、网页、非交互命令、重定向输出或启动失败都不会消费。消费后恢复配置文件的长期设置；显式 `--startup` / `--no-startup` 优先于该选择，但本次合格的终端启动仍会消费它。两个旗标不能同时使用。多个 CLI 同时启动时，同一选择只会由一个进程取得。
+
+### 官方原生 DSH：单独安装动画
+
+如果使用的是 [DeepSeek 官方 Harness](https://github.com/deepseek-ai/deepseek-harness)，可只安装动画扩展，**不需要编译本 Rust 项目**。需要 Python 3.9+（仅打包安装时）和 **Node.js 22.19+（22.x）或 24+**。扩展固定使用已验证的官方 `@deepseek-ai/dsh@0.2.0-rc.2`，官方程序及依赖由 npm 一并安装。新命令叫 `dsh-native`，与现有官方／Rust 的 `dsh` 并存。
+
+当前功能位于 `codex/startup-native-motion` 分支，首次安装：
+
+```bash
+git clone --branch codex/startup-native-motion https://github.com/Ar1haraNaN7mI/deepseek-harness-rust-optimize.git
+cd deepseek-harness-rust-optimize
+python scripts/install_native_startup.py
+
+dsh-native startup profile --name CatShark
+dsh-native web --startup
+```
+
+安装后可以从任意项目目录运行。动画直接覆盖在官方网页上，结束／跳过后回到官方页面；不是另一个模拟的 Harness。其加载段向官方运行时借用**当前默认 Agent 预设的真实作用域**，读取该工作区的 Skills，以及实际运行中的主机和默认预设插件；不会创建会话或执行模型任务。官方登录 Cookie、跨域限制与本地写入令牌均保留。
+
+```bash
+dsh-native startup enabled on      # 长期启用，默认关闭
+dsh-native startup next on         # 下一次打开本机官方网页时播放
+dsh-native startup next off        # 下一次打开时跳过
+dsh-native web --no-startup         # 本次强制跳过
+dsh-native web --port 3081          # 官方网页参数原样传递
+```
+
+原生版的一次性选择在**启动成功后首次打开经过官方登录的本机网页**时消费；`--no-open` 等待手动打开，帮助、配置导出和非 Web 命令不消费。显式开关优先，但也消费该次选择。配置独立保存在 `$DSH_HOME/startup-animation`（默认 `~/.dsh/startup-animation`），不修改 Rust 用户资料。完成／跳过后，同一浏览器标签页刷新不会重复演出。
+
+更新：在同一分支 `git pull` 后再次运行 `python scripts/install_native_startup.py`。卸载：`npm uninstall --global @dsh-rust/native-startup`，现有 `dsh` 及用户数据保留。离线传递安装包：`python scripts/install_native_startup.py --pack-only` 会在 `target/native-startup-package` 生成含动画、英文音频、字体和许可证的 `.tgz`；其他电脑通过 `npm install --global <该文件路径>` 安装，首次仍需从 npm 获取官方依赖。`--prefix <目录>` 可指定隔离安装位置。
+
+**支持范围：官方 `web` / `--profile web`，仅本机浏览器。** 官方此版本没有提供 TUI 预设，因此原生扩展不虚构终端界面；本项目 Rust CLI 的终端演出仍使用 `dsh --startup`。Electron Desktop、远程托管和自定义原生预设不在此扩展范围内。完整安装、更新、卸载和接口说明见 [`integrations/native-startup/README.md`](integrations/native-startup/README.md)。
+
+### Rust 版长期设置
 
 长期设置放在 `config/default.toml`，也可以用 `--config <路径>` 读取自己的配置：
 

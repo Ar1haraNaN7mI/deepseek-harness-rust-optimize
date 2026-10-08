@@ -1,4 +1,4 @@
-/* Same-origin bridge to the Rust startup host. No simulated inventory or storage. */
+/* Same-origin bridge to a DSH startup host. No simulated inventory or storage. */
 (() => {
   'use strict';
   const messageOf = error => error instanceof Error ? error.message : String(error);
@@ -40,7 +40,7 @@
           if (result.mode !== 'local' || !text(result.token) || !text(result.username)) throw new Error('本地接口返回了无效资料');
           if (generation !== this._connectGeneration) return false;
           this.token = result.token;
-          this.profile = { username: result.username, badge_id: text(result.badge_id) || 'DSH-0001', workspace: text(result.workspace), sound: result.sound !== false, inventory_mode: result.inventory_mode === 'mounted' ? 'mounted' : 'discover' };
+          this.profile = { username: result.username, badge_id: text(result.badge_id) || 'DSH-0001', workspace: text(result.workspace), sound: result.sound !== false, runtime: result.runtime === 'native' ? 'native' : 'rust', inventory_mode: result.inventory_mode === 'mounted' ? 'mounted' : 'discover' };
           this.connection = 'local'; this.connectionMessage = '已连接本地 DSH'; return true;
         } catch (error) {
           if (generation !== this._connectGeneration) return false;
@@ -103,7 +103,7 @@
           this.inventory = { ...this.inventory, skills: [...items.skill.values()], plugins: [...items.plugin.values()], issues: [...issues.values()] };
         } else if (event.type === 'complete' && Array.isArray(event.skills) && Array.isArray(event.plugins) && Array.isArray(event.issues)) {
           const skills = event.skills.filter(item => item && text(item.name) && item.status === 'loaded').map(item => ({ name: item.name, source: text(item.source), status: 'loaded' }));
-          const plugins = event.plugins.filter(item => item && text(item.name) && item.status === 'loaded').map(item => ({ id: text(item.id), name: item.name, source: text(item.source), tool_count: Number.isFinite(item.tool_count) ? Math.max(0, item.tool_count) : 0, status: 'loaded' }));
+          const plugins = event.plugins.filter(item => item && text(item.name) && item.status === 'loaded').map(item => ({ id: text(item.id), name: item.name, source: text(item.source), tool_count: Number.isFinite(item.tool_count) ? Math.max(0, item.tool_count) : null, status: 'loaded' }));
           const reported = event.issues.filter(item => item && text(item.name)).map(item => ({ kind: text(item.kind), name: item.name, message: text(item.message) || '读取失败' }));
           this.inventory = { ...this.inventory, status: 'complete', message: reported.length ? '读取完成，部分项目需要检查' : '本地读取完成', skills, plugins, issues: reported, elapsed_ms: Number.isFinite(event.elapsed_ms) ? Math.max(0, event.elapsed_ms) : null };
         } else return;

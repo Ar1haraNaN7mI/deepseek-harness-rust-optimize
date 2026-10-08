@@ -96,6 +96,7 @@ fn action(key: KeyEvent) -> Action {
 struct Sequence {
     phase: usize,
     elapsed: f64,
+    phase_age: f64,
     ambient: f64,
     interactive: bool,
     playing: bool,
@@ -109,6 +110,7 @@ impl Sequence {
         Self {
             phase: 0,
             elapsed: 0.0,
+            phase_age: 0.0,
             ambient: 0.0,
             interactive,
             playing: !interactive,
@@ -123,6 +125,7 @@ impl Sequence {
     fn finish_phase(&mut self) {
         self.phase = (self.phase + 1).min(DURATIONS.len());
         self.elapsed = 0.0;
+        self.phase_age = 0.0;
         self.playing = !(self.interactive && matches!(self.phase, 0 | 2 | 4));
     }
     fn confirm(&mut self, origin: (f64, f64)) {
@@ -145,6 +148,7 @@ impl Sequence {
     fn tick(&mut self, dt: f64) {
         let dt = dt.max(0.0);
         self.ambient += dt;
+        self.phase_age += dt;
         self.pulse_age += dt;
         if self.phase >= DURATIONS.len() || self.waiting() {
             return;
@@ -157,6 +161,7 @@ impl Sequence {
                 break;
             }
             self.elapsed = remainder;
+            self.phase_age = remainder;
         }
     }
     fn tick_with_narration(&mut self, dt: f64, speaking: bool) {
@@ -166,6 +171,7 @@ impl Sequence {
             && self.elapsed + dt >= DURATIONS[self.phase]
         {
             self.ambient += dt.max(0.0);
+            self.phase_age += dt.max(0.0);
             self.pulse_age += dt.max(0.0);
             self.elapsed = DURATIONS[self.phase];
         } else {
@@ -378,6 +384,39 @@ fn display_text(value: &str, columns: usize) -> String {
         result = next;
     }
     result
+}
+
+/// Decorative decoding of the actual profile. Width is preserved even while
+/// Chinese characters are concealed, so surrounding labels never jump.
+fn decoded_profile(value: &str, columns: usize, age: f64, row: usize, still: bool) -> String {
+    let value = display_text(value, columns);
+    let progress = ((age - row as f64 * 0.12) / 0.62).clamp(0.0, 1.0);
+    if still || !progress.is_finite() || progress >= 1.0 {
+        return value;
+    }
+    const GLYPHS: &[u8] = b"0123456789/+=<>[]#";
+    let count = value.chars().count().max(1);
+    let frame = (age.max(0.0) * 24.0) as usize;
+    let mut output = String::new();
+    for (index, character) in value.chars().enumerate() {
+        let width = Line::from(character.to_string()).width();
+        if character.is_whitespace()
+            || width == 0
+            || progress >= (index + 1) as f64 / count as f64
+        {
+            output.push(character);
+        } else {
+            for column in 0..width {
+                let seed = frame
+                    .wrapping_mul(13)
+                    .wrapping_add(index.wrapping_mul(7))
+                    .wrapping_add(row.wrapping_mul(11))
+                    .wrapping_add(column.wrapping_mul(3));
+                output.push(GLYPHS[seed % GLYPHS.len()] as char);
+            }
+        }
+    }
+    output
 }
 
 fn scene_title(phase: usize, context: &StartupContext) -> &'static str {
@@ -1020,6 +1059,9 @@ fn draw_cinematic(
                 }
                 2 => {
                     // A flat technical identity plate: brackets, microtype and scan bars.
+                    // Gates pause the sequence, but decoding still settles so
+                    // the operator can read their profile before confirming.
+                    let decode_age = seq.phase_age.max(seq.elapsed);
                     let x = radius * (1.55 + (1.0 - entrance) * 0.6);
                     let y = radius * 0.78;
                     for side in [-1.0, 1.0] {
@@ -1031,7 +1073,10 @@ fn draw_cinematic(
                         -x + 6.0,
                         y - 4.0,
                         Span::styled(
-                            format!("OPERATOR / {}", display_text(&context.profile.username, 28)),
+                            format!(
+                                "OPERATOR / {}",
+                                decoded_profile(&context.profile.username, 28, decode_age, 0, still)
+                            ),
                             p.accent(),
                         ),
                     );
@@ -1040,8 +1085,9 @@ fn draw_cinematic(
                         -y - 5.0,
                         Span::styled(
                             format!(
-                                "ID {} / LOCAL PROFILE",
-                                display_text(&context.profile.badge_id, 24)
+                                "ID {} / {}",
+                                decoded_profile(&context.profile.badge_id, 24, decode_age, 1, still),
+                                decoded_profile("LOCAL PROFILE", 24, decode_age, 2, still)
                             ),
                             p.text().fg(p.dim),
                         ),
@@ -1342,6 +1388,68 @@ mod tests {
             assert!(fixed_voice(phase, &available).is_some());
         }
         assert!(fixed_voice(6, &available).is_none());
+    }
+
+    #[test]
+    fn profile_decoding_preserves_unicode_width_and_resolves_all_three_values() {
+        for (row, value, columns) in [
+            (0, "星海研究员 CatShark", 28),
+            (1, "部门-七 / DSH-0001", 24),
+            (2, "LOCAL PROFILE", 24),
+        ] {
+            let expected = display_text(value, columns);
+            assert_ne!(decoded_profile(value, columns, 0.0, row, false), expected);
+            for age in [0.0, 0.15, 0.35, 0.65, 0.9] {
+                let decoded = decoded_profile(value, columns, age, row, false);
+                assert_eq!(
+                    Line::from(decoded.as_str()).width(),
+                    Line::from(expected.as_str()).width()
+                );
+                assert_eq!(decoded, decoded_profile(value, columns, age, row, false));
+            }
+            assert_eq!(decoded_profile(value, columns, 0.9, row, false), expected);
+            assert_eq!(decoded_profile(value, columns, 0.0, row, true), expected);
+        }
+    }
+
+    #[test]
+    fn identity_decodes_at_a_gate_then_resets_for_the_next_phase() {
+        let context = StartupContext {
+            profile: StartupProfile {
+                username: "星海研究员".into(),
+                badge_id: "部门-七".into(),
+            },
+            ..Default::default()
+        };
+        let config = StartupSection::default();
+        let mut seq = Sequence {
+            phase: 2,
+            ..Sequence::new(true)
+        };
+        let mut terminal = Terminal::new(TestBackend::new(110, 34)).unwrap();
+        let before = terminal
+            .draw(|f| draw(f, &seq, &config, &context, true))
+            .unwrap();
+        assert!(!visible_text(before.buffer).contains("星海研究员"));
+        seq.tick(0.9);
+        assert_eq!(
+            seq.elapsed, 0.0,
+            "decoding must not release the interaction gate"
+        );
+        let after = terminal
+            .draw(|f| draw(f, &seq, &config, &context, true))
+            .unwrap();
+        let clear = visible_text(after.buffer).replace(' ', "");
+        for expected in ["星海研究员", "部门-七", "LOCALPROFILE"] {
+            assert!(clear.contains(expected), "missing decoded value: {expected}");
+        }
+        seq.confirm((0.5, 0.5));
+        seq.tick(DURATIONS[2] + 0.2);
+        assert_eq!(seq.phase, 3);
+        assert!((seq.phase_age - 0.2).abs() < 1e-9);
+        seq.tick(DURATIONS[3]);
+        assert_eq!(seq.phase, 4);
+        assert_eq!(seq.phase_age, 0.0);
     }
 
     #[test]

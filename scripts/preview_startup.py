@@ -57,14 +57,12 @@ CASES = {
     "interactive": (["--interactive", "--speed", "2.5"], [
         (0.3, "key", "2"), (0.5, "key", "\r"),
         (1.1, "key", "3"), (1.3, "key", "\r"),
-        # At 2.5x, the paired scenes last 1.56 / 2.24 / 1.72 seconds.
-        (2.5, "key", "\r"), (5.2, "key", "\r"),
+        # Later confirmations wait for actual gate text below. Cold startup
+        # and ConPTY throughput must not turn a confirmation into a pulse.
     ]),
     "mouse": (["--interactive", "--speed", "2.5"], [
         (0.5, "click", (2, 2)),
         (1.3, "click", (55, 16)),  # Pulse during playback, not an extra stage advance.
-        (2.5, "click", (108, 29)),
-        (5.2, "click", (55, 16)),
     ]),
     "resize": ([], [(0.4, "size", (18, 53)), (0.8, "size", (3, 8)), (1.2, "size", (32, 110)), (1.6, "key", "\x1b")]),
 }
@@ -91,6 +89,9 @@ def run_case(
     )
     start = time.monotonic()
     pending = list(scheduled)
+    gate_prompts = ["查看本机清单", "完成接入"] if name in ("interactive", "mouse") else []
+    confirmed_gates = 0
+    gate_tail = ""
     captured = []
     eof = False
     live_tail = ""
@@ -116,6 +117,16 @@ def run_case(
                 break
             if chunk:
                 captured.append(chunk)
+                if gate_prompts:
+                    gate_tail = (gate_tail + chunk)[-65536:]
+                    visible_gate = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", gate_tail)
+                    if gate_prompts[0] in visible_gate:
+                        gate_prompts.pop(0)
+                        action = ("key", "\r") if name == "interactive" else ("click", (108, 29) if confirmed_gates == 0 else (55, 16))
+                        pending.append((elapsed + 0.35, *action))
+                        pending.sort(key=lambda item: item[0])
+                        confirmed_gates += 1
+                        gate_tail = ""
                 if natural_completion and chat_after_seconds is None:
                     live_tail = (live_tail + chunk)[-65536:]
                     visible = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", live_tail)
@@ -161,6 +172,7 @@ def run_case(
     elif name == "complete":
         assert result["elapsed_seconds"] >= 5.0, result
     elif name in ("interactive", "mouse"):
+        assert confirmed_gates == 2, "Both real interaction gates must have appeared"
         assert result["elapsed_seconds"] >= 6.3, result
     elif name == "advance":
         assert result["elapsed_seconds"] < 3.5, result

@@ -166,7 +166,7 @@ function createHarness(options = {}) {
   sandbox.window = sandbox;
   sandbox.parent = options.embedded ? { postMessage(message, origin) { messages.push({ message, origin }); } } : sandbox;
   vm.createContext(sandbox);
-  for (const filename of ['startup-sequence.js', 'startup-local.js', 'startup-embed.js', 'startup-preview.js']) {
+  for (const filename of ['startup-sequence.js', 'startup-local.js', 'startup-identity.js', 'startup-embed.js', 'startup-preview.js']) {
     vm.runInContext(fs.readFileSync(path.join(__dirname, '../docs', filename), 'utf8'), sandbox, { filename });
   }
 
@@ -227,7 +227,7 @@ async function main() {
   assert.equal(delayed.drawStates.at(-1).phase, 2);
   assert.equal(delayed.drawStates.at(-1).waiting, true);
   assert.equal(delayed.element('currentTime').textContent, '03.90');
-  assert.ok(delayed.animations.some(animation => animation.id === 'phaseTitle' && animation.timing.duration === 250));
+  assert.ok(delayed.animations.some(animation => animation.id === 'phaseTitle' && animation.timing.duration === 240));
   assert.ok(delayed.animations.some(animation => animation.id === 'identityCard'), 'identity confirmation should reveal its card');
   const entryCount = delayed.animations.length;
   delayed.frame(4401);
@@ -253,6 +253,38 @@ async function main() {
   assert.equal(reduced.drawStates.at(-1).phase, 1);
   assert.equal(reduced.animations.length, 0, 'reduced motion must bypass all DOM entry animation');
   assert.equal(reduced.element('phaseEnglish').textContent, 'LOCAL WORKSPACE CONNECTED');
+
+  // The identity gate decrypts while awaiting the user, without changing its
+  // underlying data or exposing noisy letters to assistive technology.
+  const identity = createHarness(); await settle(); identity.tap(); await settle(); identity.frame(4001);
+  assert.equal(identity.drawStates.at(-1).phase, 2);
+  assert.equal(identity.drawStates.at(-1).waiting, true);
+  assert.equal(identity.element('cardName').textContent, 'CatShark');
+  const initialCipher = ['cardNameVisual', 'cardIdVisual', 'cardModeVisual'].map(id => identity.element(id).textContent);
+  assert.notEqual(initialCipher[0], 'CatShark');
+  identity.frame(4301);
+  assert.notEqual(identity.element('cardNameVisual').textContent, initialCipher[0]);
+  identity.frame(5301);
+  assert.equal(identity.element('cardNameVisual').textContent, 'CatShark');
+  assert.equal(identity.element('cardIdVisual').textContent, 'DSH-0001');
+  assert.equal(identity.element('cardModeVisual').textContent, 'LOCAL / SAVED');
+  identity.element('replay').emit('click'); identity.tap(); await settle(); identity.frame(9301);
+  assert.deepEqual(['cardNameVisual', 'cardIdVisual', 'cardModeVisual'].map(id => identity.element(id).textContent), initialCipher, 'replay must reproduce the same field cipher');
+  identity.element('seek').value = '4.1'; identity.element('seek').emit('input');
+  const seekCipher = identity.element('cardNameVisual').textContent;
+  identity.frame(12301);
+  assert.equal(identity.element('cardNameVisual').textContent, seekCipher, 'a paused seek must stay deterministic');
+  identity.element('seek').value = '5.5'; identity.element('seek').emit('input');
+  identity.element('identityName').value = '<猫🦈>';
+  identity.element('identityName').emit('input');
+  assert.equal(identity.element('cardName').textContent, '<猫🦈>');
+  assert.equal(identity.element('cardNameVisual').textContent, '<猫🦈>', 'live edits render literal true values once resolved');
+  assert.equal(identity.element('cardModeVisual').textContent, 'UNSAVED / PREVIEW');
+  reduced.element('seek').value = '3.9'; reduced.element('seek').emit('input');
+  assert.equal(reduced.element('cardNameVisual').textContent, 'CatShark', 'reduced motion reveals actual values immediately');
+  assert.equal(reduced.element('cardModeVisual').getAttribute('data-decoding'), 'false');
+  const nativeProfile = createHarness({ fetch: async () => jsonResponse({ ...profileFixture, runtime: 'native' }) }); await settle();
+  assert.equal(nativeProfile.element('runtimeBadge').textContent, 'NATIVE', 'official DSH adapters must not be labeled Rust');
 
   const host = createHarness();
   host.tap(); await settle();
@@ -353,6 +385,16 @@ async function main() {
   assert.match(live.element('phaseTitle').textContent, /部分项目需检查/);
   assert.match(live.element('phaseNote').textContent, /1 skills · 1 plugins · 7 tools/);
   assert.match(live.element('inventoryIssues').textContent, /unavailable-plugin.*Connection refused/);
+
+  // Native Loader entries do not expose per-plugin tool ownership. An absent
+  // count must remain unknown rather than claiming zero mounted tools.
+  const nativeInventory = ndjsonStream();
+  const nativeCatalog = createHarness({ fetch: async url => url === '/api/profile' ? jsonResponse({ ...profileFixture, runtime: 'native' }) : nativeInventory.response });
+  await settle(); nativeCatalog.element('seek').value = '6.1'; nativeCatalog.element('seek').emit('input'); nativeCatalog.tap(); await settle();
+  nativeInventory.event({ ...inventoryFixture, plugins: [{ id: 'official-tools', name: 'Official tools', status: 'loaded' }] });
+  nativeInventory.close(); await settle(); nativeCatalog.frame(5001);
+  assert.equal(nativeCatalog.drawStates.at(-1).inventory.plugins[0].tool_count, null);
+  assert.equal(nativeCatalog.element('phaseNote').textContent, '1 skills · 1 plugins');
 
   // A late response from an aborted load must never enter the replay or a new seek.
   const staleStream = ndjsonStream(), freshStream = ndjsonStream(); let streamIndex = 0;

@@ -334,6 +334,10 @@ fn asset(path: &str) -> Option<(&'static str, &'static str)> {
             "text/javascript; charset=utf-8",
             include_str!("../../../docs/startup-sequence.js"),
         )),
+        "/startup-identity.js" => Some((
+            "text/javascript; charset=utf-8",
+            include_str!("../../../docs/startup-identity.js"),
+        )),
         "/startup-emblem.js" => Some((
             "text/javascript; charset=utf-8",
             include_str!("../../../docs/startup-emblem.js"),
@@ -377,6 +381,20 @@ fn audio_asset(path: &str) -> Option<&'static [u8]> {
         }
         _ => return None,
     })
+}
+
+fn font_asset(path: &str) -> Option<(&'static str, &'static [u8])> {
+    match path.split('?').next().unwrap_or(path) {
+        "/assets/fonts/dsh-industrial-sc.woff2" => Some((
+            "font/woff2",
+            include_bytes!("../../../docs/assets/fonts/dsh-industrial-sc.woff2"),
+        )),
+        "/assets/fonts/OFL-NotoSansSC.txt" => Some((
+            "text/plain; charset=utf-8",
+            include_bytes!("../../../docs/assets/fonts/OFL-NotoSansSC.txt"),
+        )),
+        _ => None,
+    }
 }
 
 fn mounted_inventory(runtime: &Runtime) -> Value {
@@ -632,6 +650,7 @@ async fn handle(mut socket: TcpStream, host: Arc<Host>) -> Result<()> {
         ("GET", path) => {
             if path.starts_with("/api/") { return json_response(&mut socket, 404, json!({"error":"Not found"})).await; }
             if let Some(wav) = audio_asset(path) { return response(&mut socket, 200, "audio/wav", wav).await; }
+            if let Some((kind, bytes)) = font_asset(path) { return response(&mut socket, 200, kind, bytes).await; }
             if let Some(root) = &host.assets {
                 // The original startup resources remain embedded and available
                 // even when the React asset directory is overridden.

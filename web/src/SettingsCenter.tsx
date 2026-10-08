@@ -35,6 +35,7 @@ import {
   TrashIcon,
 } from "@radix-ui/react-icons";
 import { Emblem } from "./Emblem";
+import { Companion } from "./Companion";
 import { bootstrap, errorText, isAbort, post, rpc } from "./api";
 import { ModelServiceSettings } from "./ModelServiceSettings";
 import { ExtensionSettings } from "./ExtensionSettings";
@@ -204,7 +205,7 @@ const categories: Category[] = [
     label: "宠物",
     english: "Pets",
     icon: FaceIcon,
-    keywords: "猫 伙伴",
+    keywords: "DeepSeek 大肥鱼 桌宠 伙伴 动画",
   },
   {
     id: "keyboard",
@@ -1603,7 +1604,7 @@ export function SettingsCenter({
             <Section>
               <Row
                 title="工作台宠物"
-                description="显示一个陪伴当前工作区的小伙伴。"
+                description="待机、工作、等待确认和完成时显示对应动作，也可以点击打招呼。"
               >
                 <Select
                   label="工作台宠物"
@@ -1613,10 +1614,11 @@ export function SettingsCenter({
                   }
                   options={[
                     ["none", "关闭"],
-                    ["cat", "小猫"],
+                    ["fat-fish", "DeepSeek 大肥鱼"],
                   ]}
                 />
               </Row>
+              <div className="sc-pet-preview"><Companion working={false} preview /><p className="sc-description">使用原作者 gmskywalker 提供的蓝色大肥鱼动画图集。启用“减少动态效果”时，保留静态姿态与文字回应。</p><a href="https://github.com/gmskywalker/deepseek-fat-fish-codex-pet" target="_blank" rel="noreferrer noopener">查看原作与同人作品声明 ↗</a></div>
             </Section>
           </>
         );

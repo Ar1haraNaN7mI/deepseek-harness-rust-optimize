@@ -9,8 +9,8 @@ use std::{
 };
 use tokio::net::TcpListener;
 
-struct ExistingService {
-    workspace: String,
+pub(crate) struct ExistingService {
+    pub(crate) workspace: String,
     token: String,
     instance_id: Option<String>,
 }
@@ -59,7 +59,7 @@ pub fn launch_url(authority: &str, startup: Option<bool>) -> String {
     format!("http://{authority}/{suffix}")
 }
 
-fn client() -> Result<Client> {
+pub(crate) fn client() -> Result<Client> {
     Ok(Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
@@ -79,7 +79,7 @@ async fn limited_json(mut response: reqwest::Response) -> Result<Value> {
     Ok(serde_json::from_slice(&bytes).context("Local service did not return Harness JSON")?)
 }
 
-async fn probe(client: &Client, authority: &str) -> Result<ExistingService> {
+pub(crate) async fn probe(client: &Client, authority: &str) -> Result<ExistingService> {
     let base = format!("http://{authority}");
     let response = client
         .get(format!("{base}/api/harness/bootstrap"))
@@ -141,7 +141,7 @@ async fn probe(client: &Client, authority: &str) -> Result<ExistingService> {
     })
 }
 
-async fn stop(
+pub(crate) async fn stop(
     client: &Client,
     authority: &str,
     port: u16,

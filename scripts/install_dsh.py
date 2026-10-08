@@ -23,6 +23,7 @@ Tests: python -m unittest discover -s scripts -p test_install_dsh.py
 from __future__ import annotations
 
 import argparse
+import base64
 import ctypes
 import ntpath
 import os
@@ -212,10 +213,45 @@ def ensure_windows_path(
     return not persisted
 
 
+def create_desktop_shortcut(root: Path, workspace: Optional[Path] = None) -> None:
+    """Use the Windows known Desktop folder, including redirected desktops."""
+    if os.name != "nt":
+        raise RuntimeError("Desktop shortcuts currently support Windows only")
+    executable = root.resolve() / "bin" / "dsh-desktop.exe"
+    if not executable.is_file():
+        raise RuntimeError(f"Desktop executable was not installed: {executable}")
+    environment = dict(os.environ)
+    environment["DSH_SHORTCUT_EXECUTABLE"] = str(executable)
+    environment["DSH_SHORTCUT_WORKSPACE"] = str((workspace or Path.home()).resolve())
+    icon = root.resolve() / "share/dsh/dsh-desktop.ico"
+    icon.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(REPOSITORY / "docs/assets/dsh-desktop.ico", icon)
+    environment["DSH_SHORTCUT_ICON"] = str(icon)
+    source = """
+$ErrorActionPreference = 'Stop'
+$desktopFolder = [Environment]::GetFolderPath('Desktop')
+$shortcutPath = Join-Path $desktopFolder 'DSH Harness.lnk'
+$shortcutShell = New-Object -ComObject WScript.Shell
+$shortcut = $shortcutShell.CreateShortcut($shortcutPath)
+$shortcut.TargetPath = $env:DSH_SHORTCUT_EXECUTABLE
+$shortcut.WorkingDirectory = $env:DSH_SHORTCUT_WORKSPACE
+$shortcut.IconLocation = $env:DSH_SHORTCUT_ICON
+$shortcut.Description = 'DSH Harness — native desktop'
+$shortcut.Save()
+"""
+    # Environment values keep user paths out of the PowerShell source/quoting.
+    encoded = base64.b64encode(source.encode("utf-16le")).decode("ascii")
+    subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
+                   env=environment, check=True, creationflags=subprocess.CREATE_NO_WINDOW)
+    print("Created desktop shortcut: DSH Harness")
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--root", help="Install root; defaults to CARGO_HOME or ~/.cargo")
     parser.add_argument("--debug", action="store_true", help="Install a development build instead of the default release build")
+    parser.add_argument("--desktop-shortcut", action="store_true", help="Create a Windows desktop shortcut for the native app")
+    parser.add_argument("--desktop-workspace", type=Path, help="Shortcut working directory (default: your user home)")
     arguments = parser.parse_args(argv)
     try:
         root = install_root(arguments.root)
@@ -228,6 +264,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         bin_dir = root / "bin"
         print(f"\nInstalled binary: {bin_dir / ('dsh.exe' if os.name == 'nt' else 'dsh')}")
         print(f"Installed web:    {assets}")
+        print(f"Installed desktop: {bin_dir / ('dsh-desktop.exe' if os.name == 'nt' else 'dsh-desktop')}")
         if os.name == "nt":
             if ensure_windows_path(bin_dir):
                 print("Added the install bin directory to your user PATH. Open a new terminal to use it.")
@@ -238,7 +275,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if str(bin_dir) not in current_entries:
                 print("Add this line to your shell profile, then open a new terminal:")
                 print(f'  export PATH={shlex.quote(str(bin_dir))}:"$PATH"')
-        print("Next: run `dsh --help`, or run `dsh web` from the workspace you want to use.")
+        if arguments.desktop_shortcut:
+            create_desktop_shortcut(root, arguments.desktop_workspace)
+        print("Next: run `dsh app --startup` for the native Windows app, or `dsh web` for the browser.")
         return 0
     except (OSError, RuntimeError, subprocess.CalledProcessError) as error:
         print(f"Installation failed: {error}", file=sys.stderr)

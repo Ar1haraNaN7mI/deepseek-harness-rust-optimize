@@ -76,7 +76,7 @@ function createHarness(options = {}) {
         id,
         hidden: id === 'controlPanel',
         value: id === 'identityName' ? 'OPERATOR' : id === 'identityId' ? 'DSH-0001' : '',
-        textContent: '', style: {}, classList: classList(), attributes: new Map(),
+        textContent: '', style: { setProperty(name, value) { this[name] = value; } }, classList: classList(), attributes: new Map(),
         captures: new Set(),
         children: [],
         appendChild(child) { this.children.push(child); return child; },
@@ -166,7 +166,7 @@ function createHarness(options = {}) {
   sandbox.window = sandbox;
   sandbox.parent = options.embedded ? { postMessage(message, origin) { messages.push({ message, origin }); } } : sandbox;
   vm.createContext(sandbox);
-  for (const filename of ['startup-sequence.js', 'startup-local.js', 'startup-identity.js', 'startup-embed.js', 'startup-preview.js']) {
+  for (const filename of ['startup-sequence.js', 'startup-local.js', 'startup-identity.js', 'startup-text.js', 'startup-embed.js', 'startup-preview.js']) {
     vm.runInContext(fs.readFileSync(path.join(__dirname, '../docs', filename), 'utf8'), sandbox, { filename });
   }
 
@@ -209,6 +209,12 @@ async function main() {
   assert.equal(controls.drawStates.at(-1).waiting, true);
   assert.equal(controls.sources.length, 0, 'settings toggles must not play the sequence score');
 
+  const seeked = createHarness(); await settle();
+  seeked.element('seek').value = '5.4'; seeked.element('seek').emit('input');
+  assert.equal(seeked.element('phaseTitle').getAttribute('data-lettering'), 'settled', 'a paused seek 1.5s into identity must show resolved text');
+  seeked.element('seek').value = '4.1'; seeked.element('seek').emit('input');
+  assert.equal(seeked.element('phaseTitle').getAttribute('data-lettering'), 'roll', 'backward seeking must restore the lettering pose');
+
   const delayed = createHarness({ delayAudio: true });
   delayed.tap(); await settle();
   delayed.frame(450);
@@ -227,7 +233,7 @@ async function main() {
   assert.equal(delayed.drawStates.at(-1).phase, 2);
   assert.equal(delayed.drawStates.at(-1).waiting, true);
   assert.equal(delayed.element('currentTime').textContent, '03.90');
-  assert.ok(delayed.animations.some(animation => animation.id === 'phaseTitle' && animation.timing.duration === 240));
+  assert.equal(delayed.element('phaseTitle').getAttribute('data-lettering'), 'roll', 'phase titles must enter using the shared frame-driven rolling ink');
   assert.ok(delayed.animations.some(animation => animation.id === 'identityCard'), 'identity confirmation should reveal its card');
   const entryCount = delayed.animations.length;
   delayed.frame(4401);

@@ -8,7 +8,7 @@ const { createHash } = require('node:crypto');
 
 const sandbox = { window: {} };
 vm.createContext(sandbox);
-for (const name of ['startup-emblem.js', 'startup-visuals.js']) {
+for (const name of ['startup-emblem.js', 'startup-text.js', 'startup-visuals.js']) {
   vm.runInContext(fs.readFileSync(path.join(__dirname, '../docs', name), 'utf8'), sandbox, { filename: name });
 }
 const { draw, phaseCount } = sandbox.window.DSHVisuals;
@@ -172,6 +172,9 @@ for (const [width, height, box] of [
     assert.ok(aligned.some(record => screenPoint(record)[0] < box.x), 'left registration tick must follow the measured identity row');
     assert.ok(aligned.some(record => screenPoint(record)[0] > box.x + box.width), 'right registration tick must follow the measured identity row');
   }
+  for (const [x,y] of [[box.x,box.y],[box.x+box.width,box.y],[box.x,box.y+box.height],[box.x+box.width,box.y+box.height]]) {
+    assert.ok(records.some(record=>record.op==='moveTo'&&record.strokeStyle==='#29848e'&&Math.hypot(screenPoint(record)[0]-x,screenPoint(record)[1]-y)<1e-7), 'accent brackets must start on the actual measured card corners');
+  }
   const first = render(width, height, { ...state, phase: 3, layout: { inventory: box } });
   const later = render(width, height, { ...state, phase: 3, time: 99, ambientTime: 99, layout: { inventory: box } });
   assert.equal(first.hash, later.hash, 'measured inventory decorations must respect reduced motion');
@@ -183,6 +186,30 @@ for (const [width, height, box] of [
     return Math.abs(from[0] - centerX) < 1e-7 && Math.abs(to[0] - centerX) < 1e-7 && Math.abs(to[1] - from[1]) > box.height / 2;
   });
   assert.equal(verticalCenterRule, false, 'the canvas must not duplicate the DOM inventory column divider');
+}
+
+// The outline must enclose the actual authored seal, including its bottom
+// track, as pointer parallax and breathing scale change. Compare real drawn
+// polygons with real guide vertices rather than a second layout formula.
+for (const [width,height] of [[1920,1080],[947,730],[390,844]]) {
+  for (const ambientTime of [0,1.2,4]) {
+    const {records}=render(width,height,{...base,phase:0,waiting:true,ambientTime,textAge:2});
+    const vertices=records.filter(r=>r.op==='arc'&&r.args[2]===2.5).map(screenPoint);
+    assert.equal(vertices.length,3);
+    const seal=[];let path=[];
+    for(const record of records){
+      if(record.op==='beginPath')path=[];
+      if(record.op==='moveTo'||record.op==='lineTo')path.push(screenPoint(record));
+      if(record.op==='fill'&&record.args[0]==='evenodd')seal.push(...path);
+    }
+    assert.ok(seal.length>70,'test must measure the real seal contours');
+    const gaps=vertices.map((a,i)=>{
+      const b=vertices[(i+1)%3],dx=b[0]-a[0],dy=b[1]-a[1];
+      return Math.min(...seal.map(point=>(dx*(point[1]-a[1])-dy*(point[0]-a[0]))/Math.hypot(dx,dy)));
+    });
+    assert.ok(Math.min(...gaps)>0,'guide crossed into the seal');
+    assert.ok(Math.max(...gaps)-Math.min(...gaps)<.01,'triangle guide edge gaps must remain equal');
+  }
 }
 for (const phase of [2, 3]) {
   const state = { ...base, phase, progress: 0.5, reducedMotion: true };

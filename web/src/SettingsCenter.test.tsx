@@ -9,7 +9,7 @@ import {
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SettingsCenter } from "./SettingsCenter";
-import { resetUiPreferences } from "./uiPreferences";
+import { readUiPreferences, resetUiPreferences } from "./uiPreferences";
 import type { useHarness } from "./useHarness";
 import type { Bootstrap } from "./types";
 import * as api from "./api";
@@ -158,6 +158,18 @@ afterEach(() => {
 });
 
 describe("Settings center", () => {
+  it("selects the original fat fish and persists the optional pet preference", async () => {
+    render(<SettingsCenter harness={harness()} onReplay={vi.fn()} onOpenChange={vi.fn()} open />);
+    await ready();
+    category("宠物");
+    const pet = screen.getByLabelText("工作台宠物");
+    expect((pet as HTMLSelectElement).value).toBe("none");
+    fireEvent.change(pet, { target: { value: "fat-fish" } });
+    expect(readUiPreferences().pet).toBe("fat-fish");
+    expect(screen.getByRole("link", { name: "查看原作与同人作品声明 ↗" }).getAttribute("href")).toBe("https://github.com/gmskywalker/deepseek-fat-fish-codex-pet");
+    fireEvent.change(pet, { target: { value: "none" } });
+    expect(readUiPreferences().pet).toBe("none");
+  });
   it("closes and cancels a nested deletion confirmation when the outer settings closes", async () => {
     const props = {
       harness: harness(),

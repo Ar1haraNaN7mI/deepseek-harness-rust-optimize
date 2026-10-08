@@ -40,11 +40,20 @@
 :root[data-density="compact"] .session-link { padding-top: 8px; padding-bottom: 8px; }
 :root[data-density="compact"] .message { margin-top: 12px; margin-bottom: 18px; }
 :root[data-density="compact"] .composer textarea { min-height: 62px; }
-.companion { width: 110px; margin: 8px auto 16px; color: var(--blue); text-align: center; }
-.companion svg { width: 80px; height: 54px; }
-.companion span { display: block; font: 7px var(--mono); letter-spacing: .03em; color: var(--muted); white-space: nowrap; }
-.companion.working .cat-tail { transform-origin: 67px 51px; animation: companion-tail 1.5s ease-in-out infinite alternate; }
-@keyframes companion-tail { to { transform: rotate(-18deg); } }
+.companion { position: relative; width: 180px; margin: 0 auto 14px; color: var(--ink); text-align: center; }
+.companion-pet { display: block; padding: 0; margin: 0 auto; border: 0; border-radius: 18px; background: transparent; cursor: pointer; -webkit-tap-highlight-color: transparent; }
+.companion-pet:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+.companion-sprite { --pet-width: 120px; --pet-height: 130px; display: block; width: var(--pet-width); height: var(--pet-height); background-image: url("/pets/deepseek-fat-fish/spritesheet.webp"); background-repeat: no-repeat; background-size: calc(var(--pet-width) * 8) calc(var(--pet-height) * 11); background-position: 0 calc(var(--pet-height) * var(--pet-row) * -1); animation: fat-fish-frames var(--pet-duration) steps(var(--pet-frames)) infinite; }
+@keyframes fat-fish-frames { to { background-position-x: calc(var(--pet-width) * var(--pet-frames) * -1); } }
+.companion-caption b { display: block; font-size: 11px; font-weight: 600; }
+.companion-caption span { display: block; margin-top: 4px; color: var(--muted); font-size: 10px; }
+.companion-reply { position: absolute; bottom: calc(100% - 20px); left: 50%; transform: translateX(-50%); width: 188px; margin: 0; border: 1px solid var(--line); border-radius: 12px 12px 12px 3px; background: var(--surface); padding: 10px 12px; color: var(--ink); font-size: 11px; line-height: 1.65; box-shadow: 0 5px 20px #0000000c; pointer-events: none; z-index: 2; }
+.sc-pet-preview { margin-top: 18px; padding: 20px; border-radius: 12px; background: var(--sidebar); text-align: center; }
+.sc-pet-preview .companion { margin-bottom: 16px; }
+.sc-pet-preview > a { color: var(--blue); font-size: 12px; text-decoration: underline; text-underline-offset: 3px; }
+@media (max-height: 760px) { .sidebar .companion-sprite { --pet-width: 96px; --pet-height: 104px; } .sidebar .companion { margin-bottom: 9px; } }
+:root[data-motion="reduce"] .companion .companion-sprite { animation: none !important; background-position-x: 0 !important; }
+@media (prefers-reduced-motion: reduce) { .companion .companion-sprite { animation: none !important; background-position-x: 0 !important; } }
 .notification-stack { position: fixed; right: 24px; bottom: 24px; z-index: 40; display: grid; gap: 8px; max-width: min(360px, calc(100vw - 32px)); }
 .harness-notice { display: flex; gap: 16px; align-items: center; border: 1px solid var(--line); background: var(--surface); color: var(--ink); border-radius: 10px; padding: 12px 10px 12px 18px; box-shadow: 0 5px 24px #0001; }
 .harness-notice > button:first-child { padding: 0; background: none; border: 0; text-align: left; font-size: 13px; }

@@ -1,6 +1,6 @@
 # dsh-rust
 
-用 Rust 重写的 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 风格编程助手：**终端里就能对话、改代码、跑命令**，提供 CLI、终端界面和网页工作台，模型默认走 DeepSeek。
+用 Rust 重写的 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 风格编程助手：**终端里就能对话、改代码、跑命令**，提供 CLI、终端界面、网页工作台和 Windows 原生桌面端，模型默认走 DeepSeek。
 
 > 仓库：[`deepseek-harness-rust-optimize`](https://github.com/Ar1haraNaN7mI/deepseek-harness-rust-optimize)
 
@@ -27,6 +27,7 @@ dsh                        # 当前目录打开 TUI
 dsh --startup              # 播放启动动画后进入 TUI
 dsh startup next on        # 只在下一次交互启动播放
 dsh web --startup          # 当前目录启动网页 Harness
+dsh app --startup          # 当前目录打开 Rust 原生桌面窗口
 dsh -C "D:\projects\demo"  # 显式选择另一个工作区
 ```
 
@@ -40,6 +41,26 @@ dsh -C "D:\projects\demo"  # 显式选择另一个工作区
 
 
 更新时在源码仓库 `git pull` 后再次运行 `python scripts/install_dsh.py`。也可从任意目录使用安装脚本的绝对路径。`--root <目录>` 指定安装位置，`--debug` 安装调试版。
+
+### Windows 桌面端
+
+`dsh app` 使用 Rust 的 Tao 窗口与 Wry / WebView2 渲染真实 TSX Harness，安装器同时安装无控制台入口 `dsh-desktop.exe`。聊天、模型凭据、文件、技能、插件与权限操作复用 CLI 的真实 Runtime；启动动画、固定英文旁白和个人档案使用同一套资源。系统需要 Microsoft Edge WebView2 Runtime（通常已随 Windows / Edge 安装）。目前原生窗口支持 Windows，其他平台继续使用 `dsh web`。
+
+```powershell
+python scripts/install_dsh.py --desktop-shortcut --desktop-workspace "D:\projects\demo"
+dsh app --startup                       # 动画结束后进入桌面工作台
+dsh -C "D:\projects\demo" app          # 明确选择工作区
+dsh app --port 0                        # 使用空闲端口
+dsh-desktop --startup                   # 无控制台入口，也支持全局参数
+```
+
+首次默认尝试端口 8770；已有相同工作区的 DSH 服务时直接复用，其他工作区或其他程序占用时自动选择空闲端口，并记住该工作区的端口以保留界面偏好。同一工作区再次启动会聚焦现有窗口。显式 `--port` 不会自动改用其他端口。关闭桌面窗口只回收本窗口创建的服务，复用的网页服务仍然可用。外部链接在默认浏览器打开。桌面端的界面偏好保存在独立 WebView 用户目录，DSH 模型配置和会话仍与 CLI 共用。
+
+### 蓝色大肥鱼
+
+在「设置 → 宠物」选择 **DeepSeek 大肥鱼**。网页和桌面端直接使用 [deepseek-fat-fish-codex-pet](https://github.com/gmskywalker/deepseek-fat-fish-codex-pet) 的原始精灵图集与帧布局，提供待机、工作、等待确认、完成与出错动作；点击或键盘激活会回应，减少动态效果时保持静态帧。旧的猫咪开启偏好自动迁移到大肥鱼，原本关闭则继续关闭。
+
+原资源作者说明、固定版本和 SHA-256 位于 [`web/public/pets/deepseek-fat-fish`](web/public/pets/deepseek-fat-fish)。该资源保留上游的非官方同人声明，不将其重新标注为本项目的 MIT 资产。桌宠显示在工作台侧栏及设置预览中。
 
 开发者仍可在仓库根目录直接运行 Cargo：
 
@@ -75,7 +96,7 @@ TUI 里常用：
 
 内置原创电影式启动序列：**厂牌唤醒 → 本地连接 → 个人档案 → 技能与插件清单 → 加载结果 → 欢迎进入 DSH**。原创 DELTA CIRCUIT 平面徽章以三角形为主体：左侧 D 字轨、底部 S 折线与右侧 H 连接共同形成轮廓，内部保留小型 DSH 刻字和三层扫描线。分件飞入、高速环扫、平面扫描与档案展开保持扁平风格。高清版没有底部控制栏，按 C 或点右上角省略号打开设置。
 
-这一版以 [RhineLabUI](https://github.com/LBEILC/RhineLabUI) 的档案解密和扫描节奏为视觉研究参考，重新编排原创的斜切遮罩、巨幅环形标尺、分层快切与部门徽章组装。访问身份、档案编号、资料来源三行从乱码锁定到真实资料；中文采用随包提供的工业排版与 Noto Sans SC 字体子集，字体及许可证位于 [`docs/assets/fonts`](docs/assets/fonts)。动画没有复用参考项目的图形或采样音频，支持减少动态效果设置。
+这一版以 [RhineLabUI](https://github.com/LBEILC/RhineLabUI) 的档案解密和扫描节奏为视觉研究参考，重新编排原创的斜切遮罩、巨幅环形标尺、分层快切与部门徽章组装。启动画面中的标题、字标、提示、字幕、档案与真实清单统一使用固定文字单元内的滚动、逐字显现、乱码锁定和遮挡条撤回；参考源码与时间采样实现见 [`docs/startup-text.js`](docs/startup-text.js)。徽章轮廓共用同一个中心和缩放，橙色角标直接跟随实际卡片边框，适配窗口尺寸与缩放。中文采用随包提供的工业排版与 Noto Sans SC 字体子集，字体及许可证位于 [`docs/assets/fonts`](docs/assets/fonts)。动画没有复用参考项目的图形或采样音频，支持减少动态效果设置。
 
 动画**默认关闭**。启用后在开场、个人档案、加载结果三个节点等待确认；等待时旋转环和扫描仍持续运动。确认后连续播放两幕，再到下一节点；终端最后自动进入对话，`dsh web` 的嵌入动画完成或跳过后进入真实 Harness，`dsh startup web` 独立预览停留在欢迎画面。基础演出为 **13.8 秒**；交互等待、真实读取和较长旁白会延长停留时间，不截断声音。终端独立预览可用 `--auto` 完整自动播放。
 
@@ -119,10 +140,10 @@ dsh --silent                             # 保留动画，关闭启动音
 
 如果使用的是 [DeepSeek 官方 Harness](https://github.com/deepseek-ai/deepseek-harness)，可只安装动画扩展，**不需要编译本 Rust 项目**。需要 Python 3.9+（仅打包安装时）和 **Node.js 22.19+（22.x）或 24+**。扩展固定使用已验证的官方 `@deepseek-ai/dsh@0.2.0-rc.2`，官方程序及依赖由 npm 一并安装。新命令叫 `dsh-native`，与现有官方／Rust 的 `dsh` 并存。
 
-当前功能位于 `codex/startup-native-motion` 分支，首次安装：
+首次安装：
 
 ```bash
-git clone --branch codex/startup-native-motion https://github.com/Ar1haraNaN7mI/deepseek-harness-rust-optimize.git
+git clone https://github.com/Ar1haraNaN7mI/deepseek-harness-rust-optimize.git
 cd deepseek-harness-rust-optimize
 python scripts/install_native_startup.py
 

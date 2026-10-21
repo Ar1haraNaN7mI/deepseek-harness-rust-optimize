@@ -273,7 +273,13 @@ function renderLocal(){
   name.className='inventory-name dsh-lettering';name.title=item.name;
   source.className='inventory-source dsh-lettering';source.title=detail+(item.message?' · '+item.message:'');source.setAttribute('aria-label','来源：'+source.title);
   const delay=Math.min(.3,index*.032);
-  setText(name,sign+'  '+item.name,{kind:'roll',delay});setText(source,detail,{kind:'mask',delay:delay+.09});return row;
+  /* animate only text that actually changed. Re-running setText on every
+     inventory update replayed the whole staggered roll for every row - once when the items
+     streamed in and again when the final complete event landed. */
+  const nameText=sign+'  '+item.name;
+  if(nodes.nameText!==nameText){nodes.nameText=nameText;setText(name,nameText,{kind:'roll',delay});}
+  if(nodes.sourceText!==detail){nodes.sourceText=detail;setText(source,detail,{kind:'mask',delay:delay+.09});}
+  return row;
   });
   for(const [key,nodes] of cache)if(!seen.has(key)){textMotion.remove(nodes.name);textMotion.remove(nodes.source);cache.delete(key);}
   return result;

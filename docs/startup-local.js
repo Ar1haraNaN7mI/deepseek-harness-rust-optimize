@@ -20,7 +20,12 @@
       this.playbackVerified = false; this.previewOnly = false;
       this.unlocking = false; this.accessMessage = ''; this._unlockGeneration = 0;
     }
-    emit() { this.onChange(this); }
+    emit() {
+      // coalesce streamed inventory renders - one per frame, not one per item.
+      if (this._emitPending) return;
+      const run = () => { this._emitPending = 0; this.onChange(this); };
+      this._emitPending = (typeof requestAnimationFrame === 'function') ? requestAnimationFrame(run) : setTimeout(run, 16);
+    }
     async failure(response, fallback) {
       let detail = '';
       try { const body = await response.json(); detail = text(body.message) || text(body.error?.message) || text(body.error); } catch (_) { /* An HTML error is not an API response. */ }
@@ -150,7 +155,9 @@
         if (!await this.connect()) throw new Error('未连接本地 DSH，资料未保存');
         if (this.locked) throw new Error('请先验证访问密码');
         if (generation !== this._saveGeneration) return false;
-        const response = await this.request('/api/profile', { method: 'POST', signal: controller.signal, credentials: 'same-origin', headers: { 'Content-Type': 'application/json', 'X-DSH-Token': this.token }, body: JSON.stringify(update) });
+        let response = await this.request('/api/profile', { method: 'POST', signal: controller.signal, credentials: 'same-origin', headers: { 'Content-Type': 'application/json', 'X-DSH-Token': this.token }, body: JSON.stringify(update) });
+        // same stale-token recovery as load().
+        if (response.status === 403) { await this.connect(true); response = await this.request('/api/profile', { method: 'POST', signal: controller.signal, credentials: 'same-origin', headers: { 'Content-Type': 'application/json', 'X-DSH-Token': this.token }, body: JSON.stringify(update) }); }
         if (!response.ok) throw await this.failure(response, '保存失败');
         const result = await response.json();
         if (!text(result.username) || !text(result.badge_id)) throw new Error('保存接口未确认资料');
@@ -205,7 +212,10 @@
         }
         if (this.locked) throw new Error('请先验证访问密码，再读取本地能力');
         if (!current()) return false;
-        const response = await this.request('/api/load', { method: 'POST', signal: controller.signal, cache: 'no-store', credentials: 'same-origin', headers: { 'X-DSH-Token': this.token } });
+        let response = await this.request('/api/load', { method: 'POST', signal: controller.signal, cache: 'no-store', credentials: 'same-origin', headers: { 'X-DSH-Token': this.token } });
+        // a 403 means our token is stale (the host re-mounts the plugin on a
+        // profile edit and mints a new token). Refresh it and retry once.
+        if (response.status === 403) { await this.connect(true); if (current()) response = await this.request('/api/load', { method: 'POST', signal: controller.signal, cache: 'no-store', credentials: 'same-origin', headers: { 'X-DSH-Token': this.token } }); }
         if (!response.ok) throw await this.failure(response, '读取失败');
         if (!response.body?.getReader) throw new Error('浏览器无法读取实时数据流');
         const reader = response.body.getReader(), decoder = new TextDecoder(); let buffer = '';
